@@ -1,0 +1,508 @@
+# SmartEVSE 1 (smartevse-6374): sensor.smartevse_1_state, sensor.smartevse_1_evplugstate, select.smartevse_1_mode, sensor.smartevse_1_chargecurrent, sensor.smartevse_1_maxcurrent (read-only), number.smartevse_1_chargecurrentoverride (0-16A)
+# SmartEVSE 2 (smartevse-8717): sensor.smartevse_2_state, sensor.smartevse_2_evplugstate, select.smartevse_2_mode, sensor.smartevse_2_chargecurrent, sensor.smartevse_2_maxcurrent (read-only), number.smartevse_2_chargecurrentoverride (0-16A)
+# Shared enclosure, shared power line (max 16A total), one WLED module, two separate EV cables
+alias: SmartEVSE dual charger control
+description: "Controls two SmartEVSE devices in shared enclosure"
+triggers:
+  # SmartEVSE 1 state triggers
+  - id: evse_1_state
+    entity_id: sensor.smartevse_1_state
+    trigger: state
+  - id: plug_1_state
+    entity_id: sensor.smartevse_1_evplugstate
+    trigger: state
+  # SmartEVSE 2 state triggers
+  - id: evse_2_state
+    entity_id: sensor.smartevse_2_state
+    trigger: state
+  - id: plug_2_state
+    entity_id: sensor.smartevse_2_evplugstate
+    trigger: state
+  # Shared charge control triggers
+  - id: force_now_on
+    entity_id: input_boolean.force_charge_state
+    to: "on"
+    trigger: state
+  - id: force_price_on
+    entity_id: input_boolean.force_charge_with_acceptable_electricity_price_state
+    to: "on"
+    trigger: state
+  - id: force_timer_on
+    entity_id: input_boolean.force_charge_with_timer_state
+    to: "on"
+    trigger: state
+  - id: force_timer_off
+    entity_id: input_boolean.force_charge_with_timer_state
+    to: "off"
+    trigger: state
+  - id: schedule
+    entity_id: schedule.charge_schedule
+    trigger: state
+  - id: schedule_gate
+    entity_id: input_boolean.charging_schedule_state
+    trigger: state
+  - id: price
+    entity_id: sensor.real_electricity_price_current_price
+    trigger: state
+  - id: acceptable_price
+    entity_id: number.real_electricity_price_acceptable_price
+    trigger: state
+  - id: force_now_any
+    entity_id: input_boolean.force_charge_state
+    trigger: state
+  - id: force_price_any
+    entity_id: input_boolean.force_charge_with_acceptable_electricity_price_state
+    trigger: state
+  - id: ha_start
+    event: start
+    trigger: homeassistant
+  # Periodic trigger for dynamic current balancing (aligns with REST /currents scan_interval)
+  - id: current_balance_tick
+    trigger: time_pattern
+    seconds: "/10"
+conditions: []
+actions:
+  # ── Mutual exclusion of force charge modes (shared controls) ──
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: force_now_on
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id:
+                - >-
+                  input_boolean.force_charge_with_acceptable_electricity_price_state
+                - input_boolean.force_charge_with_timer_state
+      - conditions:
+          - condition: trigger
+            id: force_price_on
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id:
+                - input_boolean.force_charge_state
+                - input_boolean.force_charge_with_timer_state
+      - conditions:
+          - condition: trigger
+            id: force_timer_on
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id:
+                - input_boolean.force_charge_state
+                - >-
+                  input_boolean.force_charge_with_acceptable_electricity_price_state
+      - conditions:
+          - condition: trigger
+            id: ha_start
+          - condition: state
+            entity_id: input_boolean.force_charge_state
+            state: "on"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id:
+                - >-
+                  input_boolean.force_charge_with_acceptable_electricity_price_state
+                - input_boolean.force_charge_with_timer_state
+      - conditions:
+          - condition: trigger
+            id: ha_start
+          - condition: state
+            entity_id: input_boolean.force_charge_with_timer_state
+            state: "on"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.force_charge_with_timer_state
+
+  # ── SmartEVSE 1 mode control ──
+  - choose:
+      - conditions:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: sensor.smartevse_1_evplugstate
+                state: Connected
+        sequence:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: select.smartevse_1_mode
+                state: "Off"
+          - action: select.select_option
+            target:
+              entity_id: select.smartevse_1_mode
+            data:
+              option: "Off"
+      - conditions:
+          - condition: state
+            entity_id: sensor.smartevse_1_evplugstate
+            state: Connected
+          - condition: or
+            conditions:
+              - condition: state
+                entity_id: input_boolean.force_charge_state
+                state: "on"
+              - condition: and
+                conditions:
+                  - condition: state
+                    entity_id: input_boolean.charging_schedule_state
+                    state: "on"
+                  - condition: state
+                    entity_id: schedule.charge_schedule
+                    state: "on"
+              - condition: and
+                conditions:
+                  - condition: state
+                    entity_id: >-
+                      input_boolean.force_charge_with_acceptable_electricity_price_state
+                    state: "on"
+                  - condition: numeric_state
+                    entity_id: sensor.real_electricity_price_current_price
+                    below: number.real_electricity_price_acceptable_price
+              - condition: state
+                entity_id: input_boolean.force_charge_with_timer_state
+                state: "on"
+        sequence:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: select.smartevse_1_mode
+                state: Smart
+          - action: select.select_option
+            target:
+              entity_id: select.smartevse_1_mode
+            data:
+              option: Smart
+      - conditions:
+          - condition: state
+            entity_id: sensor.smartevse_1_evplugstate
+            state: Connected
+          - condition: not
+            conditions:
+              - condition: or
+                conditions:
+                  - condition: state
+                    entity_id: input_boolean.force_charge_state
+                    state: "on"
+                  - condition: and
+                    conditions:
+                      - condition: state
+                        entity_id: input_boolean.charging_schedule_state
+                        state: "on"
+                      - condition: state
+                        entity_id: schedule.charge_schedule
+                        state: "on"
+                  - condition: and
+                    conditions:
+                      - condition: state
+                        entity_id: >-
+                          input_boolean.force_charge_with_acceptable_electricity_price_state
+                        state: "on"
+                      - condition: numeric_state
+                        entity_id: sensor.real_electricity_price_current_price
+                        below: number.real_electricity_price_acceptable_price
+                  - condition: state
+                    entity_id: input_boolean.force_charge_with_timer_state
+                    state: "on"
+        sequence:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: select.smartevse_1_mode
+                state: "Off"
+          - action: select.select_option
+            target:
+              entity_id: select.smartevse_1_mode
+            data:
+              option: "Off"
+
+  # ── SmartEVSE 2 mode control ──
+  - choose:
+      - conditions:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: sensor.smartevse_2_evplugstate
+                state: Connected
+        sequence:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: select.smartevse_2_mode
+                state: "Off"
+          - action: select.select_option
+            target:
+              entity_id: select.smartevse_2_mode
+            data:
+              option: "Off"
+      - conditions:
+          - condition: state
+            entity_id: sensor.smartevse_2_evplugstate
+            state: Connected
+          - condition: or
+            conditions:
+              - condition: state
+                entity_id: input_boolean.force_charge_state
+                state: "on"
+              - condition: and
+                conditions:
+                  - condition: state
+                    entity_id: input_boolean.charging_schedule_state
+                    state: "on"
+                  - condition: state
+                    entity_id: schedule.charge_schedule
+                    state: "on"
+              - condition: and
+                conditions:
+                  - condition: state
+                    entity_id: >-
+                      input_boolean.force_charge_with_acceptable_electricity_price_state
+                    state: "on"
+                  - condition: numeric_state
+                    entity_id: sensor.real_electricity_price_current_price
+                    below: number.real_electricity_price_acceptable_price
+              - condition: state
+                entity_id: input_boolean.force_charge_with_timer_state
+                state: "on"
+        sequence:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: select.smartevse_2_mode
+                state: Smart
+          - action: select.select_option
+            target:
+              entity_id: select.smartevse_2_mode
+            data:
+              option: Smart
+      - conditions:
+          - condition: state
+            entity_id: sensor.smartevse_2_evplugstate
+            state: Connected
+          - condition: not
+            conditions:
+              - condition: or
+                conditions:
+                  - condition: state
+                    entity_id: input_boolean.force_charge_state
+                    state: "on"
+                  - condition: and
+                    conditions:
+                      - condition: state
+                        entity_id: input_boolean.charging_schedule_state
+                        state: "on"
+                      - condition: state
+                        entity_id: schedule.charge_schedule
+                        state: "on"
+                  - condition: and
+                    conditions:
+                      - condition: state
+                        entity_id: >-
+                          input_boolean.force_charge_with_acceptable_electricity_price_state
+                        state: "on"
+                      - condition: numeric_state
+                        entity_id: sensor.real_electricity_price_current_price
+                        below: number.real_electricity_price_acceptable_price
+                  - condition: state
+                    entity_id: input_boolean.force_charge_with_timer_state
+                    state: "on"
+        sequence:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: select.smartevse_2_mode
+                state: "Off"
+          - action: select.select_option
+            target:
+              entity_id: select.smartevse_2_mode
+            data:
+              option: "Off"
+
+  # ── Dynamic current balancing (shared 16A line) ──
+  # HA acts as central load balancer to prevent race condition between two
+  # independent SmartEVSE devices both reading the same mains current.
+  # Calculates house load (mains minus both EVSEs), determines available
+  # headroom, splits by configurable ratio, and sets maxcurrent on each device.
+  # When one EVSE is done charging (state: Charging Stopped / current < 1A),
+  # its share is given to the other EVSE.
+  # Smart mode on each device provides additional safety as a second layer.
+  - variables:
+      mains_l1: "{{ states('sensor.shelly_pro_3em_1_phase_a_current')|float(0) }}"
+      mains_l2: "{{ states('sensor.shelly_pro_3em_1_phase_b_current')|float(0) }}"
+      mains_l3: "{{ states('sensor.shelly_pro_3em_1_phase_c_current')|float(0) }}"
+      mains_peak: "{{ [mains_l1, mains_l2, mains_l3] | max }}"
+      evse1_current: "{{ states('sensor.smartevse_1_chargecurrent')|float(0) }}"
+      evse2_current: "{{ states('sensor.smartevse_2_chargecurrent')|float(0) }}"
+      evse1_connected: "{{ is_state('sensor.smartevse_1_evplugstate', 'Connected') }}"
+      evse2_connected: "{{ is_state('sensor.smartevse_2_evplugstate', 'Connected') }}"
+      evse1_state: "{{ states('sensor.smartevse_1_state') }}"
+      evse2_state: "{{ states('sensor.smartevse_2_state') }}"
+      # An EVSE is "actively charging" if it's connected AND drawing current
+      evse1_active: "{{ evse1_connected and evse1_current | float > 0.5 and evse1_state not in ['Charging Stopped', 'Stop Charging'] }}"
+      evse2_active: "{{ evse2_connected and evse2_current | float > 0.5 and evse2_state not in ['Charging Stopped', 'Stop Charging'] }}"
+      active_count: "{{ (evse1_active | int(0)) + (evse2_active | int(0)) }}"
+      house_load: "{{ [mains_peak - evse1_current - evse2_current, 0] | max }}"
+      available: "{{ [16 - house_load, 0] | max }}"
+      split_pct: "{{ states('input_number.charger_current_balance')|float(50) / 100 }}"
+      evse1_share: >-
+        {% if evse1_connected and evse2_connected %}
+          {% if evse1_active and evse2_active %}
+            {{ [[(available | float * split_pct | float) | round(0) | int, 6] | max, 16] | min }}
+          {% elif evse1_active and not evse2_active %}
+            {{ [[available | float | round(0) | int, 6] | max, 16] | min }}
+          {% elif not evse1_active and evse2_active %}
+            6
+          {% else %}
+            6
+          {% endif %}
+        {% elif evse1_connected %}
+          {{ [[available | float | round(0) | int, 6] | max, 16] | min }}
+        {% else %}
+          6
+        {% endif %}
+      evse2_share: >-
+        {% if evse1_connected and evse2_connected %}
+          {% if evse1_active and evse2_active %}
+            {{ [[(available | float * (1 - split_pct | float)) | round(0) | int, 6] | max, 16] | min }}
+          {% elif evse2_active and not evse1_active %}
+            {{ [[available | float | round(0) | int, 6] | max, 16] | min }}
+          {% elif not evse2_active and evse1_active %}
+            6
+          {% else %}
+            6
+          {% endif %}
+        {% elif evse2_connected %}
+          {{ [[available | float | round(0) | int, 6] | max, 16] | min }}
+        {% else %}
+          6
+        {% endif %}
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ evse1_connected }}"
+          - condition: template
+            value_template: >-
+              {{ states('number.smartevse_1_chargecurrentoverride')|int(0) != evse1_share | int }}
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: number.smartevse_1_chargecurrentoverride
+            data:
+              value: "{{ evse1_share | int }}"
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ evse2_connected }}"
+          - condition: template
+            value_template: >-
+              {{ states('number.smartevse_2_chargecurrentoverride')|int(0) != evse2_share | int }}
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: number.smartevse_2_chargecurrentoverride
+            data:
+              value: "{{ evse2_share | int }}"
+
+  # ── Reset force charge toggles only when BOTH chargers are unplugged ──
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ not is_state('sensor.smartevse_1_evplugstate', 'Connected') and
+                 not is_state('sensor.smartevse_2_evplugstate', 'Connected') }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id:
+                - input_boolean.force_charge_state
+                - >-
+                  input_boolean.force_charge_with_acceptable_electricity_price_state
+                - input_boolean.force_charge_with_timer_state
+
+  # ── WLED split-segment state (via HTTP API, no integration needed) ──
+  # WLED at 192.168.0.81: 105 LEDs split into two segments
+  #   Segment 0 (LEDs 0-52):  EVSE 1 (left side)
+  #   Segment 1 (LEDs 53-104): EVSE 2 (right side)
+  # Effects: 0=Solid, 2=Breathe, 3=Wipe, 28=Chase
+  # Presets saved on device: 1-5 (EVSE 1), 6-9 (EVSE 2), 10 (Both), 11 (Error)
+  - action: rest_command.wled_api
+    data:
+      payload: >-
+        {% set e1_plug = is_state('sensor.smartevse_1_evplugstate', 'Connected') %}
+        {% set e2_plug = is_state('sensor.smartevse_2_evplugstate', 'Connected') %}
+        {% set e1_st = states('sensor.smartevse_1_state') | trim %}
+        {% set e2_st = states('sensor.smartevse_2_state') | trim %}
+        {% set e1_cur = states('sensor.smartevse_1_chargecurrent') | float(0) %}
+        {% set e2_cur = states('sensor.smartevse_2_chargecurrent') | float(0) %}
+        {% set e1_err = states('sensor.smartevse_1_error') %}
+        {% set e2_err = states('sensor.smartevse_2_error') %}
+        {% set has_error = (e1_plug and e1_err not in ['unknown','unavailable','NONE','']) or (e2_plug and e2_err not in ['unknown','unavailable','NONE','']) %}
+        {% if has_error %}
+        {"on":true,"bri":200,"seg":[{"id":0,"start":0,"stop":53,"on":true,"col":[[255,0,0]],"fx":2,"sx":60,"ix":200},{"id":1,"start":53,"stop":105,"on":true,"col":[[255,0,0]],"fx":2,"sx":60,"ix":200}]}
+        {% elif not e1_plug and not e2_plug %}
+        {"on":false,"transition":30}
+        {% else %}
+        {% set ns = namespace(s0='', s1='') %}
+        {% if not e1_plug %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":false}' %}
+        {% elif e1_st == "Charging" and e1_cur >= 1 %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[0,255,0]],"fx":28,"sx":100,"ix":128}' %}
+        {% elif e1_st == "Ready to Charge" %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[0,100,255]],"fx":2,"sx":80,"ix":128}' %}
+        {% elif e1_st == "Connected to EV" or (e1_st == "Charging" and e1_cur < 1) %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[255,160,0]],"fx":0}' %}
+        {% elif e1_st == "Stop Charging" %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[255,80,0]],"fx":3,"sx":100,"ix":128}' %}
+        {% elif e1_st == "Charging Stopped" %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[255,0,0]],"fx":0}' %}
+        {% else %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[100,100,100]],"fx":0}' %}{% endif %}
+        {% if not e2_plug %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":false}' %}
+        {% elif e2_st == "Charging" and e2_cur >= 1 %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[0,255,0]],"fx":28,"sx":100,"ix":128}' %}
+        {% elif e2_st == "Ready to Charge" %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[0,100,255]],"fx":2,"sx":80,"ix":128}' %}
+        {% elif e2_st == "Connected to EV" or (e2_st == "Charging" and e2_cur < 1) %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[255,160,0]],"fx":0}' %}
+        {% elif e2_st == "Stop Charging" %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[255,80,0]],"fx":3,"sx":100,"ix":128}' %}
+        {% elif e2_st == "Charging Stopped" %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[255,0,0]],"fx":0}' %}
+        {% else %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[100,100,100]],"fx":0}' %}{% endif %}
+        {"on":true,"bri":128,"seg":[{{ ns.s0 }},{{ ns.s1 }}]}
+        {% endif %}
+
+  # ── Timer management (stops when both unplugged or timer toggled off) ──
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: force_timer_on
+        sequence:
+          - wait_for_trigger:
+              - entity_id: input_boolean.force_charge_with_timer_state
+                to: "off"
+                trigger: state
+              - entity_id: sensor.smartevse_1_evplugstate
+                from: Connected
+                trigger: state
+              - entity_id: sensor.smartevse_2_evplugstate
+                from: Connected
+                trigger: state
+            timeout: >-
+              {% set h =
+              state_attr('input_datetime.force_charge_time','hour')|int(0) %} {%
+              set m =
+              state_attr('input_datetime.force_charge_time','minute')|int(0) %}
+              {% set s =
+              state_attr('input_datetime.force_charge_time','second')|int(0) %}
+              {{ '%02d:%02d:%02d' % (h, m, s) }}
+            continue_on_timeout: true
+          - condition: template
+            value_template: >-
+              {{ not is_state('sensor.smartevse_1_evplugstate', 'Connected') and
+                 not is_state('sensor.smartevse_2_evplugstate', 'Connected') }}
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.force_charge_with_timer_state
+      - conditions:
+          - condition: trigger
+            id: ha_start
+          - condition: state
+            entity_id: input_boolean.force_charge_with_timer_state
+            state: "on"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.force_charge_with_timer_state
+mode: parallel

@@ -1,0 +1,195 @@
+homeassistant:
+  allowlist_external_dirs:
+
+
+default_config:
+
+
+frontend:
+  themes: !include_dir_merge_named themes
+
+
+python_script:
+
+
+tts:
+  - platform: google_translate
+
+
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - 172.30.33.0/24
+
+
+automation: !include automations.yaml
+
+
+script: !include scripts.yaml
+
+
+scene: !include scenes.yaml
+
+
+logger:
+    default: info
+    logs:
+      homeassistant.config_entries: debug
+      homeassistant.components.http.view: debug
+
+
+sensor:
+  - platform: derivative
+    source: sensor.heat_meter_heat_cpr_and_add_total_system_42439
+    name: NIBE Produced Space Heat Power kW Raw
+    unit_time: h
+    unit: kW
+    round: 3
+    time_window: "00:15:00"
+
+  - platform: derivative
+    source: sensor.heat_meter_hw_cpr_and_add_total_system_42437
+    name: NIBE Produced DHW Heat Power kW Raw
+    unit_time: h
+    unit: kW
+    round: 3
+    time_window: "00:15:00"
+
+  - platform: average
+    name: Home humidity average
+    unique_id: home_humidity_average
+    entities:
+      - sensor.aqara_thp_1_humidity
+      - sensor.aqara_thp_2_humidity
+      - sensor.aqara_thp_3_humidity
+      - sensor.aqara_thp_4_humidity
+      - sensor.aqara_thp_5_humidity
+      - sensor.aqara_thp_6_humidity
+      - sensor.aqara_thp_7_humidity
+      - sensor.aqara_thp_8_humidity
+      - sensor.aqara_thp_10_humidity
+      - sensor.aqara_thp_11_humidity
+      - sensor.aqara_thp_12_humidity
+      - sensor.aqara_thp_13_humidity
+
+  - platform: average
+    name: Home temperature average
+    unique_id: home_temperature_average
+    entities:
+    #   - sensor.aqara_thp_1_temperature
+      - sensor.aqara_thp_2_temperature
+      - sensor.aqara_thp_3_temperature
+      - sensor.aqara_thp_4_temperature
+      - sensor.aqara_thp_5_temperature
+      - sensor.aqara_thp_6_temperature
+      - sensor.aqara_thp_7_temperature
+      - sensor.aqara_thp_8_temperature
+      - sensor.aqara_thp_10_temperature
+      - sensor.aqara_thp_11_temperature
+      - sensor.aqara_thp_12_temperature
+      - sensor.aqara_thp_13_temperature
+
+  - platform: average
+    name: WC 2, shower room temperature average
+    unique_id: wc_2_shower_room_temperature_average
+    entities:
+      - sensor.aqara_thp_8_temperature
+      - sensor.aqara_thp_13_temperature
+
+  - platform: average
+    name: WC 1, entrance, hallway, storeroom temperature average
+    unique_id: wc_1_entrance_hallway_storeroom_temperature_average
+    entities:
+      #- sensor.aqara_thp_4_temperature #storeroom
+      - sensor.aqara_thp_10_temperature
+      - sensor.aqara_thp_11_temperature
+      - sensor.aqara_thp_12_temperature
+
+  - platform: average
+    name: Kitchen, living room temperature average
+    unique_id: kitchen_living_room_temperature_average
+    entities:
+      - sensor.aqara_thp_5_temperature
+      - sensor.aqara_thp_7_temperature
+
+  - platform: average
+    name: Kitchen, living room humidity average
+    unique_id: kitchen_living_room_humidity_average
+    entities:
+      - sensor.aqara_thp_5_humidity
+      - sensor.aqara_thp_7_humidity
+
+  - platform: average
+    name: Outdoors temperature average
+    unique_id: outdoors_temperature_average
+    entities:
+      - sensor.vallox_outdoor_air
+      - sensor.bt1_outdoor_temperature_40004
+      - sensor.outdoor_ambient_sensor_temperature
+      - sensor.aqara_thp_9_temperature
+
+
+rest_command:
+  wled_api:
+    url: "http://192.168.0.81/json/state"
+    method: POST
+    content_type: "application/json"
+    payload: "{{ payload }}"
+
+
+rest:
+  # Current data every 2 seconds
+  - resource_template: >-
+      http://192.168.0.234/currents?L1={{ (states('sensor.shelly_pro_3em_1_phase_a_current') | float(0) * 10) | round(0) | int }}&L2={{ (states('sensor.shelly_pro_3em_1_phase_b_current') | float(0) * 10) | round(0) | int }}&L3={{ (states('sensor.shelly_pro_3em_1_phase_c_current') | float(0) * 10) | round(0) | int }}
+    method: POST
+    scan_interval: 10
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    payload: "{}"
+    sensor:
+      - name: "SmartEVSE Currents Status"
+        value_template: "{{ 'OK' if value else 'ERROR' }}"
+        icon: "mdi:current-ac"
+    
+  # EV meter data every 3 seconds  
+  - resource_template: >-
+      http://192.168.0.234/ev_meter?L1={{ (states('sensor.shelly_pro_3em_2_phase_a_current') | float(0) * 10) | round(0) | int }}&L2={{ (states('sensor.shelly_pro_3em_2_phase_b_current') | float(0) * 10) | round(0) | int }}&L3={{ (states('sensor.shelly_pro_3em_2_phase_c_current') | float(0) * 10) | round(0) | int }}&import_active_energy={{ (states('sensor.shelly_pro_3em_2_total_active_energy') | float(0) * 1000) | round(0) | int }}&export_active_energy={{ (states('sensor.shelly_pro_3em_2_total_active_returned_energy') | float(0) * 1000) | round(0) | int }}&import_active_power={{ (states('sensor.shelly_pro_3em_2_total_active_power') | float(0)) | round(0) | int }}
+    method: POST
+    scan_interval: 20
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    payload: "{}"
+    sensor:
+      - name: "SmartEVSE EV Meter Status" 
+        value_template: "{{ 'OK' if value else 'ERROR' }}"
+        icon: "mdi:meter-electric"
+
+  # Current data for SmartEVSE 2 (smartevse-8717)
+  - resource_template: >-
+      http://192.168.0.44/currents?L1={{ (states('sensor.shelly_pro_3em_1_phase_a_current') | float(0) * 10) | round(0) | int }}&L2={{ (states('sensor.shelly_pro_3em_1_phase_b_current') | float(0) * 10) | round(0) | int }}&L3={{ (states('sensor.shelly_pro_3em_1_phase_c_current') | float(0) * 10) | round(0) | int }}
+    method: POST
+    scan_interval: 10
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    payload: "{}"
+    sensor:
+      - name: "SmartEVSE 2 Currents Status"
+        value_template: "{{ 'OK' if value else 'ERROR' }}"
+        icon: "mdi:current-ac"
+
+  # EV meter data for SmartEVSE 2 (smartevse-8717)
+  - resource_template: >-
+      http://192.168.0.44/ev_meter?L1={{ (states('sensor.shelly_pro_3em_2_phase_a_current') | float(0) * 10) | round(0) | int }}&L2={{ (states('sensor.shelly_pro_3em_2_phase_b_current') | float(0) * 10) | round(0) | int }}&L3={{ (states('sensor.shelly_pro_3em_2_phase_c_current') | float(0) * 10) | round(0) | int }}&import_active_energy={{ (states('sensor.shelly_pro_3em_2_total_active_energy') | float(0) * 1000) | round(0) | int }}&export_active_energy={{ (states('sensor.shelly_pro_3em_2_total_active_returned_energy') | float(0) * 1000) | round(0) | int }}&import_active_power={{ (states('sensor.shelly_pro_3em_2_total_active_power') | float(0)) | round(0) | int }}
+    method: POST
+    scan_interval: 20
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    payload: "{}"
+    sensor:
+      - name: "SmartEVSE 2 EV Meter Status"
+        value_template: "{{ 'OK' if value else 'ERROR' }}"
+        icon: "mdi:meter-electric"
