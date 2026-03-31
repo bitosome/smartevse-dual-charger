@@ -137,11 +137,15 @@ HA acts as a central load balancer to prevent a race condition where both SmartE
 
 **Contactor protection:** A 2A hysteresis deadband prevents override updates for small fluctuations. The override is only written when the calculated share differs from the current setting by ≥ 2A. This prevents SmartEVSE's stop/restart cycle on every override change.
 
-### 4. Force Charge Reset
+### 4. Schedule Notification
+
+When a scheduled charge window starts (`schedule.charge_schedule` turns on) but the schedule gate (`input_boolean.charging_schedule_state`) is disabled, a `notify.notify` notification is sent reminding the user to enable the schedule.
+
+### 5. Force Charge Reset
 
 All force charge toggles are turned off when **both** chargers are unplugged. This prevents stale toggles when cars are removed.
 
-### 5. Timer Management
+### 6. Timer Management
 
 When the timer is activated:
 1. Waits for either: timer expiry, manual toggle off, or both EVSEs unplugged
@@ -149,7 +153,7 @@ When the timer is activated:
 
 On HA restart, the timer is always reset to off.
 
-### 6. WLED Status LEDs
+### 7. WLED Status LEDs
 
 105 LEDs split into two independent segments:
 - **Segment 0** (LEDs 0–52): SmartEVSE-1 (left side)
@@ -164,7 +168,7 @@ Each segment reflects its EVSE's state independently:
 | Ready to Charge | Blue `[0,100,255]` | Breathe (2) |
 | Connected to EV / Charging < 1A | Amber `[255,160,0]` | Solid (0) |
 | Stop Charging | Orange `[255,80,0]` | Wipe (3) |
-| Charging Stopped | Red `[255,0,0]` | Solid (0) |
+| Charging Stopped | Blue `[0,100,255]` | Breathe (2) |
 | Unknown/other | Dim white `[100,100,100]` | Solid (0) |
 
 **Global override:** If either EVSE reports an error, the entire strip pulses red (Breathe effect).
@@ -181,11 +185,11 @@ Presets are saved on the WLED device for manual testing via the WLED UI:
 | 2 | SmartEVSE-1 Charging | Left green chase, right off |
 | 3 | SmartEVSE-1 Ready | Left blue breathe, right off |
 | 4 | SmartEVSE-1 Connected | Left amber solid, right off |
-| 5 | SmartEVSE-1 Stopped | Left red solid, right off |
+| 5 | SmartEVSE-1 Stopped | Left blue breathe, right off |
 | 6 | SmartEVSE-2 Charging | Left off, right green chase |
 | 7 | SmartEVSE-2 Ready | Left off, right blue breathe |
 | 8 | SmartEVSE-2 Connected | Left off, right amber solid |
-| 9 | SmartEVSE-2 Stopped | Left off, right red solid |
+| 9 | SmartEVSE-2 Stopped | Left off, right blue breathe |
 | 11 | Error | Full strip red pulsing |
 
 The automation does **not** use presets — it builds the JSON payload dynamically so both segments can show different states simultaneously (e.g., left charging + right connected).
@@ -201,7 +205,9 @@ The Lovelace card (`card.yaml`) uses [Mushroom](https://github.com/piitaya/lovel
 - **Force charge** — tap to toggle, shows waiting/active state
 - **Price-based charge** — shows current price vs threshold
 - **Timer charge** — shows configured duration
-- **Settings** — schedule toggle, current balance slider, acceptable price, timer duration
+- **Settings** — schedule toggle, charge schedule, current balance slider, acceptable price, timer duration
+
+EVSE status card icon colors match the WLED LED colors (green=charging, blue=ready/stopped, amber=connected, orange=stopping, grey=unplugged).
 
 ## HA Helpers (create via UI)
 
