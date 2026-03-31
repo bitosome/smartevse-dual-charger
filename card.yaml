@@ -68,11 +68,20 @@ cards:
     tap_action:
       action: none
     color: >-
-      {% set s = states('sensor.smartevse_1_state')|trim %} {% if s == 'Charging'
-      %}
-        amber
-      {% elif is_state('sensor.smartevse_1_evplugstate','Connected') %}
+      {% set s = states('sensor.smartevse_1_state')|trim %}
+      {% set cur = states('sensor.smartevse_1_chargecurrent')|float(0) %}
+      {% if not is_state('sensor.smartevse_1_evplugstate','Connected') %}
+        grey
+      {% elif s == 'Charging' and cur >= 1 %}
+        green
+      {% elif s == 'Ready to Charge' %}
         blue
+      {% elif s in ['Connected to EV'] or (s == 'Charging' and cur < 1) %}
+        amber
+      {% elif s == 'Stop Charging' %}
+        orange
+      {% elif s == 'Charging Stopped' %}
+        red
       {% else %}
         grey
       {% endif %}
@@ -130,11 +139,20 @@ cards:
     tap_action:
       action: none
     color: >-
-      {% set s = states('sensor.smartevse_2_state')|trim %} {% if s ==
-      'Charging' %}
-        amber
-      {% elif is_state('sensor.smartevse_2_evplugstate','Connected') %}
+      {% set s = states('sensor.smartevse_2_state')|trim %}
+      {% set cur = states('sensor.smartevse_2_chargecurrent')|float(0) %}
+      {% if not is_state('sensor.smartevse_2_evplugstate','Connected') %}
+        grey
+      {% elif s == 'Charging' and cur >= 1 %}
+        green
+      {% elif s == 'Ready to Charge' %}
         blue
+      {% elif s in ['Connected to EV'] or (s == 'Charging' and cur < 1) %}
+        amber
+      {% elif s == 'Stop Charging' %}
+        orange
+      {% elif s == 'Charging Stopped' %}
+        red
       {% else %}
         grey
       {% endif %}
@@ -281,6 +299,8 @@ cards:
     entities:
       - entity: input_boolean.charging_schedule_state
         name: Charge with schedule
+      - entity: schedule.charge_schedule
+        name: Charge schedule
       - entity: input_number.charger_current_balance
         name: Current balance (EVSE 1 ⇄ EVSE 2)
       - entity: number.real_electricity_price_acceptable_price

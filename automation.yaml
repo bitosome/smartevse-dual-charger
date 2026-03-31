@@ -424,6 +424,23 @@ actions:
                   input_boolean.force_charge_with_acceptable_electricity_price_state
                 - input_boolean.force_charge_with_timer_state
 
+  # ── Notify if scheduled charge time arrives but schedule is disabled ──
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: schedule
+          - condition: state
+            entity_id: schedule.charge_schedule
+            state: "on"
+          - condition: state
+            entity_id: input_boolean.charging_schedule_state
+            state: "off"
+        sequence:
+          - action: notify.notify
+            data:
+              title: "EV Charging Schedule"
+              message: "Charging schedule window started but the schedule is not enabled. Enable it in charger settings if you want to charge."
+
   # ── WLED split-segment state (via HTTP API, no integration needed) ──
   # WLED at 192.168.0.81: 105 LEDs split into two segments
   #   Segment 0 (LEDs 0-52):  SmartEVSE-1 (left side)
