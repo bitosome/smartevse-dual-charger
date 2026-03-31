@@ -481,14 +481,14 @@ actions:
                 {% elif e1_st == "Ready to Charge" %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[0,100,255]],"fx":2,"sx":80,"ix":128}' %}
                 {% elif e1_st == "Connected to EV" or (e1_st == "Charging" and e1_cur < 1) %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[255,160,0]],"fx":0}' %}
                 {% elif e1_st == "Stop Charging" %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[255,80,0]],"fx":3,"sx":100,"ix":128}' %}
-                {% elif e1_st == "Charging Stopped" %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[255,0,0]],"fx":0}' %}
+                {% elif e1_st == "Charging Stopped" %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[0,100,255]],"fx":2,"sx":80,"ix":128}' %}
                 {% else %}{% set ns.s0 = '{"id":0,"start":0,"stop":53,"on":true,"col":[[100,100,100]],"fx":0}' %}{% endif %}
                 {% if not e2_plug %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":false}' %}
                 {% elif e2_st == "Charging" and e2_cur >= 1 %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[0,255,0]],"fx":28,"sx":100,"ix":128}' %}
                 {% elif e2_st == "Ready to Charge" %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[0,100,255]],"fx":2,"sx":80,"ix":128}' %}
                 {% elif e2_st == "Connected to EV" or (e2_st == "Charging" and e2_cur < 1) %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[255,160,0]],"fx":0}' %}
                 {% elif e2_st == "Stop Charging" %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[255,80,0]],"fx":3,"sx":100,"ix":128}' %}
-                {% elif e2_st == "Charging Stopped" %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[255,0,0]],"fx":0}' %}
+                {% elif e2_st == "Charging Stopped" %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[0,100,255]],"fx":2,"sx":80,"ix":128}' %}
                 {% else %}{% set ns.s1 = '{"id":1,"start":53,"stop":105,"on":true,"col":[[100,100,100]],"fx":0}' %}{% endif %}
                 {"on":true,"bri":128,"seg":[{{ ns.s0 }},{{ ns.s1 }}]}
                 {% endif %}

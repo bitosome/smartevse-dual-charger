@@ -81,7 +81,7 @@ cards:
       {% elif s == 'Stop Charging' %}
         orange
       {% elif s == 'Charging Stopped' %}
-        red
+        blue
       {% else %}
         grey
       {% endif %}
@@ -152,7 +152,7 @@ cards:
       {% elif s == 'Stop Charging' %}
         orange
       {% elif s == 'Charging Stopped' %}
-        red
+        blue
       {% else %}
         grey
       {% endif %}
