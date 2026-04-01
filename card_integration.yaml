@@ -1,0 +1,175 @@
+type: vertical-stack
+cards:
+  - type: custom:mushroom-chips-card
+    chips:
+      - type: template
+        entity: sensor.real_electricity_price_current_price
+        content: "{{ states('sensor.real_electricity_price_current_price') }} EUR/kWh"
+        icon: mdi:currency-eur
+        icon_color: >-
+          {% if states('sensor.real_electricity_price_current_price')|float(0)
+               <= states('number.smartevse_dual_charger_acceptable_price')|float(0) %}
+            green
+          {% else %}
+            red
+          {% endif %}
+      - type: template
+        entity: sensor.smartevse_dual_charger_controller_state
+        icon: mdi:scale-balance
+        content: >-
+          {{ states('sensor.smartevse_dual_charger_controller_state') }}
+      - type: template
+        entity: sensor.smartevse_dual_charger_available_current
+        icon: mdi:current-ac
+        content: >-
+          {{ states('sensor.smartevse_dual_charger_available_current') }} A free
+
+  - type: custom:mushroom-template-card
+    entity: sensor.smartevse_1_state
+    primary: >-
+      EVSE 1: {{ states('sensor.smartevse_1_state') }}
+    secondary: >-
+      Plug: {{ states('sensor.smartevse_1_evplugstate') }}
+
+      Mode: {{ states('select.smartevse_1_mode') }}
+
+      Charging current: {{ states('sensor.smartevse_1_chargecurrent') }} A
+
+      Override: {{ states('number.smartevse_1_chargecurrentoverride') }} A
+
+      Controller target: {{ states('sensor.smartevse_dual_charger_evse_1_target_current') }} A
+    multiline_secondary: true
+    icon: mdi:ev-station
+    color: >-
+      {% set s = states('sensor.smartevse_1_state')|trim %}
+      {% if not is_state('sensor.smartevse_1_evplugstate','Connected') %}
+        grey
+      {% elif s == 'Charging' %}
+        green
+      {% elif s == 'Ready to Charge' %}
+        blue
+      {% elif s == 'Connected to EV' %}
+        amber
+      {% else %}
+        grey
+      {% endif %}
+
+  - type: custom:mushroom-template-card
+    entity: sensor.smartevse_2_state
+    primary: >-
+      EVSE 2: {{ states('sensor.smartevse_2_state') }}
+    secondary: >-
+      Plug: {{ states('sensor.smartevse_2_evplugstate') }}
+
+      Mode: {{ states('select.smartevse_2_mode') }}
+
+      Charging current: {{ states('sensor.smartevse_2_chargecurrent') }} A
+
+      Override: {{ states('number.smartevse_2_chargecurrentoverride') }} A
+
+      Controller target: {{ states('sensor.smartevse_dual_charger_evse_2_target_current') }} A
+    multiline_secondary: true
+    icon: mdi:ev-station
+    color: >-
+      {% set s = states('sensor.smartevse_2_state')|trim %}
+      {% if not is_state('sensor.smartevse_2_evplugstate','Connected') %}
+        grey
+      {% elif s == 'Charging' %}
+        green
+      {% elif s == 'Ready to Charge' %}
+        blue
+      {% elif s == 'Connected to EV' %}
+        amber
+      {% else %}
+        grey
+      {% endif %}
+
+  - type: custom:mushroom-template-card
+    entity: switch.smartevse_dual_charger_charge_with_schedule
+    primary: Schedule
+    secondary: >-
+      {% if is_state('switch.smartevse_dual_charger_charge_with_schedule','on') and is_state('schedule.charge_schedule','on') %}
+        Active
+      {% elif is_state('switch.smartevse_dual_charger_charge_with_schedule','on') %}
+        Armed
+      {% else %}
+        Disabled
+      {% endif %}
+    icon: mdi:calendar-clock
+    icon_color: >-
+      {% if is_state('switch.smartevse_dual_charger_charge_with_schedule','on') and is_state('schedule.charge_schedule','on') %}
+        green
+      {% elif is_state('switch.smartevse_dual_charger_charge_with_schedule','on') %}
+        blue
+      {% else %}
+        grey
+      {% endif %}
+    tap_action:
+      action: toggle
+
+  - type: custom:mushroom-template-card
+    entity: switch.smartevse_dual_charger_force_charge
+    primary: Force charge
+    secondary: >-
+      {% if is_state('switch.smartevse_dual_charger_force_charge','on') %}
+        Active
+      {% else %}
+        Tap to start
+      {% endif %}
+    icon: mdi:lightning-bolt
+    tap_action:
+      action: toggle
+
+  - type: custom:mushroom-template-card
+    entity: switch.smartevse_dual_charger_force_price
+    primary: >-
+      Charge when <= {{ states('number.smartevse_dual_charger_acceptable_price') }} EUR/kWh
+    secondary: >-
+      {% if is_state('switch.smartevse_dual_charger_force_price','on') %}
+        {% if states('sensor.real_electricity_price_current_price')|float(0)
+             <= states('number.smartevse_dual_charger_acceptable_price')|float(0) %}
+          Price accepted
+        {% else %}
+          Waiting for price
+        {% endif %}
+      {% else %}
+        Tap to arm
+      {% endif %}
+    icon: mdi:currency-eur
+    tap_action:
+      action: toggle
+
+  - type: custom:mushroom-template-card
+    entity: switch.smartevse_dual_charger_force_timer
+    primary: >-
+      Force charge for {{ states('number.smartevse_dual_charger_force_charge_duration_minutes')|int(0) }} min
+    secondary: >-
+      {% if is_state('switch.smartevse_dual_charger_force_timer','on') %}
+        Remaining: {{ states('sensor.smartevse_dual_charger_timer_remaining') }} s
+      {% else %}
+        Tap to arm
+      {% endif %}
+    icon: mdi:timer-sand
+    tap_action:
+      action: toggle
+
+  - type: entities
+    show_header_toggle: false
+    entities:
+      - entity: switch.smartevse_dual_charger_charge_with_schedule
+        name: Charge with schedule
+      - entity: schedule.charge_schedule
+        name: Charge schedule
+      - entity: number.smartevse_dual_charger_balance_percent
+        name: Current balance
+      - entity: select.smartevse_dual_charger_low_budget_policy
+        name: Low-budget policy
+      - entity: number.smartevse_dual_charger_acceptable_price
+        name: Acceptable price
+      - entity: number.smartevse_dual_charger_force_charge_duration_minutes
+        name: Force charge duration
+      - entity: button.smartevse_dual_charger_refresh
+        name: Refresh controller
+      - entity: button.smartevse_dual_charger_reset_sessions
+        name: Reset session tracking
+

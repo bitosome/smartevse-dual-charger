@@ -1,0 +1,20 @@
+refresh:
+  name: Refresh controller
+  description: Trigger an immediate control cycle.
+  fields:
+    entry_id:
+      required: false
+      example: "abcd1234"
+      selector:
+        text:
+
+reset_sessions:
+  name: Reset session tracking
+  description: Clear the internal session-complete flags for both EVSEs.
+  fields:
+    entry_id:
+      required: false
+      example: "abcd1234"
+      selector:
+        text:
+

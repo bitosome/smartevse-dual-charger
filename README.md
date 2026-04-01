@@ -1,5 +1,63 @@
 # SmartEVSE Dual Charger — Home Assistant Configuration
 
+## Custom Integration
+
+This repository now includes a HACS-compatible custom integration at [custom_components/smartevse_dual_charger](/Users/arku02/Repositories/smartevse-dual-charger/custom_components/smartevse_dual_charger).
+
+The integration replaces the helper-heavy YAML automation with a controller that:
+
+- owns the dual-EVSE balancing loop
+- fixes the timer unplug bug
+- stops using `ChargeCurrent` as if it were actual draw
+- can push `/currents` and `/ev_meter` to both SmartEVSE devices
+- can drive WLED directly without `rest_command`
+- exposes controller switches, numbers, select entities, sensors, and buttons through the HA UI
+
+Recommended architecture for this integration:
+
+- leave the SmartEVSE devices on MQTT for native per-device entities
+- configure this controller through the UI
+- use `Normal` as the controller active mode so Home Assistant is the single balancing authority
+- remove the SmartEVSE-specific `rest:` and `rest_command:` blocks from [configuration.yaml](/Users/arku02/Repositories/smartevse-dual-charger/configuration.yaml) once the integration is in use
+
+### HACS layout
+
+The repository now contains:
+
+- [custom_components/smartevse_dual_charger](/Users/arku02/Repositories/smartevse-dual-charger/custom_components/smartevse_dual_charger)
+- [hacs.json](/Users/arku02/Repositories/smartevse-dual-charger/hacs.json)
+
+The repository now also includes the required HACS brand asset at [brands/icon.png](/Users/arku02/Repositories/smartevse-dual-charger/brands/icon.png).
+
+### Integration Entities
+
+The controller creates entities such as:
+
+- `switch.smartevse_dual_charger_force_charge`
+- `switch.smartevse_dual_charger_force_price`
+- `switch.smartevse_dual_charger_force_timer`
+- `switch.smartevse_dual_charger_charge_with_schedule`
+- `number.smartevse_dual_charger_balance_percent`
+- `number.smartevse_dual_charger_acceptable_price`
+- `number.smartevse_dual_charger_force_charge_duration_minutes`
+- `select.smartevse_dual_charger_low_budget_policy`
+- `sensor.smartevse_dual_charger_controller_state`
+- `sensor.smartevse_dual_charger_available_current`
+- `sensor.smartevse_dual_charger_evse_1_target_current`
+- `sensor.smartevse_dual_charger_evse_2_target_current`
+
+### Card Example
+
+Use [card_integration.yaml](/Users/arku02/Repositories/smartevse-dual-charger/card_integration.yaml) as the updated Lovelace example for the custom integration. It keeps the native SmartEVSE MQTT status cards and swaps the old helper entities for the new controller entities.
+
+## Legacy YAML
+
+The original YAML automation and helper-based setup are still present in this repository as legacy reference:
+
+- [automation.yaml](/Users/arku02/Repositories/smartevse-dual-charger/automation.yaml)
+- [configuration.yaml](/Users/arku02/Repositories/smartevse-dual-charger/configuration.yaml)
+- [card.yaml](/Users/arku02/Repositories/smartevse-dual-charger/card.yaml)
+
 Two [SmartEVSE](https://smartevse.nl/) devices in a shared enclosure, controlled by a single Home Assistant automation with dynamic current balancing and WLED status LEDs.
 
 ## Hardware

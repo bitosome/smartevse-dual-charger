@@ -1,0 +1,138 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "SmartEVSE Dual Charger",
+        "description": "Bind the controller to your existing SmartEVSE MQTT entities, mains/EV meter sensors, and optional local HTTP endpoints.",
+        "data": {
+          "name": "Name",
+          "evse_1_base_url": "SmartEVSE 1 base URL",
+          "evse_2_base_url": "SmartEVSE 2 base URL",
+          "wled_url": "WLED URL (optional)",
+          "evse_1_state_entity": "EVSE 1 state sensor",
+          "evse_1_plug_entity": "EVSE 1 plug state sensor",
+          "evse_1_mode_entity": "EVSE 1 mode entity",
+          "evse_1_override_entity": "EVSE 1 current override entity",
+          "evse_1_error_entity": "EVSE 1 error sensor",
+          "evse_2_state_entity": "EVSE 2 state sensor",
+          "evse_2_plug_entity": "EVSE 2 plug state sensor",
+          "evse_2_mode_entity": "EVSE 2 mode entity",
+          "evse_2_override_entity": "EVSE 2 current override entity",
+          "evse_2_error_entity": "EVSE 2 error sensor",
+          "mains_l1_entity": "Mains current L1 sensor",
+          "mains_l2_entity": "Mains current L2 sensor",
+          "mains_l3_entity": "Mains current L3 sensor",
+          "ev_meter_l1_entity": "EV meter L1 sensor",
+          "ev_meter_l2_entity": "EV meter L2 sensor",
+          "ev_meter_l3_entity": "EV meter L3 sensor",
+          "ev_meter_import_active_power_entity": "EV meter active power sensor",
+          "ev_meter_import_active_energy_entity": "EV meter import energy sensor",
+          "ev_meter_export_active_energy_entity": "EV meter export energy sensor",
+          "price_sensor_entity": "Electricity price sensor",
+          "schedule_entity": "Charge schedule entity"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "One or more endpoint URLs are invalid."
+    },
+    "abort": {
+      "already_configured": "The SmartEVSE dual charger controller is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Controller options",
+        "description": "Tune balancing behavior, endpoint dispatch, and controller cadence.",
+        "data": {
+          "active_mode": "Mode used while charging is allowed",
+          "total_current_limit": "Shared current limit (A)",
+          "min_current": "Per-EV minimum current (A)",
+          "update_interval": "Control interval (seconds)",
+          "override_deadband": "Override update deadband (A)",
+          "low_budget_policy_default": "Default low-budget policy",
+          "push_currents": "Push mains currents to SmartEVSE endpoints",
+          "currents_push_interval": "Mains current push interval (seconds)",
+          "push_ev_meter": "Push EV meter data to SmartEVSE endpoints",
+          "ev_meter_push_interval": "EV meter push interval (seconds)",
+          "push_wled": "Manage WLED directly",
+          "notify_on_schedule_window": "Create a notification when schedule window starts while disabled"
+        }
+      }
+    },
+    "selector": {
+      "low_budget_policy_default": {
+        "options": {
+          "evse_1_priority": "Prefer EVSE 1",
+          "evse_2_priority": "Prefer EVSE 2",
+          "alternate": "Alternate between EVSEs",
+          "pause_all": "Pause all charging"
+        }
+      }
+    }
+  },
+  "entity": {
+    "switch": {
+      "force_charge": {
+        "name": "Force charge"
+      },
+      "force_price": {
+        "name": "Force charge by price"
+      },
+      "force_timer": {
+        "name": "Force charge timer"
+      },
+      "charge_with_schedule": {
+        "name": "Charge with schedule"
+      }
+    },
+    "number": {
+      "balance_percent": {
+        "name": "Current balance"
+      },
+      "acceptable_price": {
+        "name": "Acceptable price"
+      },
+      "force_charge_duration_minutes": {
+        "name": "Force charge duration"
+      }
+    },
+    "select": {
+      "low_budget_policy": {
+        "name": "Low-budget policy"
+      }
+    },
+    "sensor": {
+      "controller_state": {
+        "name": "Controller state"
+      },
+      "charge_reason": {
+        "name": "Charge reason"
+      },
+      "available_current": {
+        "name": "Available current"
+      },
+      "house_load": {
+        "name": "House load"
+      },
+      "evse_1_target_current": {
+        "name": "EVSE 1 target current"
+      },
+      "evse_2_target_current": {
+        "name": "EVSE 2 target current"
+      },
+      "timer_remaining": {
+        "name": "Timer remaining"
+      }
+    },
+    "button": {
+      "refresh": {
+        "name": "Refresh controller"
+      },
+      "reset_sessions": {
+        "name": "Reset session tracking"
+      }
+    }
+  }
+}

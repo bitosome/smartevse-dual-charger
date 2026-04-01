@@ -1,0 +1,17 @@
+{
+  "domain": "smartevse_dual_charger",
+  "name": "SmartEVSE Dual Charger",
+  "codeowners": [
+    "@arku02"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/arku02/smartevse-dual-charger",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/arku02/smartevse-dual-charger/issues",
+  "loggers": [
+    "custom_components.smartevse_dual_charger"
+  ],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
