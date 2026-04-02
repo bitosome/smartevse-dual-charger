@@ -3,22 +3,13 @@
     "step": {
       "user": {
         "title": "SmartEVSE Dual Charger",
-        "description": "Bind the controller to your existing SmartEVSE MQTT entities, mains/EV meter sensors, and optional local HTTP endpoints.",
+        "description": "Connect the controller to both SmartEVSE REST endpoints, Shelly mains and EV-meter sensors, and optional local endpoints.",
         "data": {
           "name": "Name",
-          "evse_1_base_url": "SmartEVSE 1 base URL",
-          "evse_2_base_url": "SmartEVSE 2 base URL",
-          "wled_url": "WLED URL (optional)",
-          "evse_1_state_entity": "EVSE 1 state sensor",
-          "evse_1_plug_entity": "EVSE 1 plug state sensor",
-          "evse_1_mode_entity": "EVSE 1 mode entity",
-          "evse_1_override_entity": "EVSE 1 current override entity",
-          "evse_1_error_entity": "EVSE 1 error sensor",
-          "evse_2_state_entity": "EVSE 2 state sensor",
-          "evse_2_plug_entity": "EVSE 2 plug state sensor",
-          "evse_2_mode_entity": "EVSE 2 mode entity",
-          "evse_2_override_entity": "EVSE 2 current override entity",
-          "evse_2_error_entity": "EVSE 2 error sensor",
+          "smartevse_1_base_url": "SmartEVSE 1 base URL/IP",
+          "smartevse_2_base_url": "SmartEVSE 2 base URL/IP",
+          "wled_url": "WLED URL/IP (optional)",
+          "recreate_wled_presets": "Delete old SmartEVSE WLED presets and recreate the segment layout and LED map",
           "mains_l1_entity": "Mains current L1 sensor",
           "mains_l2_entity": "Mains current L2 sensor",
           "mains_l3_entity": "Mains current L3 sensor",
@@ -34,40 +25,50 @@
       }
     },
     "error": {
-      "invalid_url": "One or more endpoint URLs are invalid."
+      "invalid_url": "One or more endpoint URLs/IPs are invalid.",
+      "wled_url_required": "A WLED URL/IP is required before presets can be recreated.",
+      "wled_preset_setup_failed": "Unable to recreate WLED presets. Check Home Assistant logs."
     },
     "abort": {
       "already_configured": "The SmartEVSE dual charger controller is already configured."
+    },
+    "progress": {
+      "recreate_wled_presets": "Recreating SmartEVSE WLED presets, segment layout, and LED map."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Controller options",
-        "description": "Tune balancing behavior, endpoint dispatch, and controller cadence.",
+        "description": "Tune SmartEVSE slot rotation, meter push cadence, notifications, and optional WLED preset management.",
         "data": {
-          "active_mode": "Mode used while charging is allowed",
-          "total_current_limit": "Shared current limit (A)",
-          "min_current": "Per-EV minimum current (A)",
-          "update_interval": "Control interval (seconds)",
-          "override_deadband": "Override update deadband (A)",
-          "low_budget_policy_default": "Default low-budget policy",
+          "charge_policy_default": "Default charge policy",
+          "duty_cycle_minutes": "Duty cycle (minutes)",
+          "update_interval": "Controller refresh interval (seconds)",
           "push_currents": "Push mains currents to SmartEVSE endpoints",
           "currents_push_interval": "Mains current push interval (seconds)",
           "push_ev_meter": "Push EV meter data to SmartEVSE endpoints",
           "ev_meter_push_interval": "EV meter push interval (seconds)",
           "push_wled": "Manage WLED directly",
+          "recreate_wled_presets": "Delete old SmartEVSE WLED presets and recreate the segment layout and LED map",
           "notify_on_schedule_window": "Create a notification when schedule window starts while disabled"
         }
       }
     },
+    "progress": {
+      "recreate_wled_presets": "Recreating SmartEVSE WLED presets, segment layout, and LED map."
+    },
+    "error": {
+      "wled_url_required": "A WLED URL/IP is required before presets can be recreated.",
+      "wled_preset_setup_failed": "Unable to recreate WLED presets. Check Home Assistant logs."
+    },
     "selector": {
-      "low_budget_policy_default": {
+      "charge_policy_default": {
         "options": {
-          "evse_1_priority": "Prefer EVSE 1",
-          "evse_2_priority": "Prefer EVSE 2",
-          "alternate": "Alternate between EVSEs",
-          "pause_all": "Pause all charging"
+          "smartevse_1_first": "SmartEVSE 1 first",
+          "smartevse_2_first": "SmartEVSE 2 first",
+          "smartevse_1_only": "SmartEVSE 1 only",
+          "smartevse_2_only": "SmartEVSE 2 only"
         }
       }
     }
@@ -88,19 +89,36 @@
       }
     },
     "number": {
-      "balance_percent": {
-        "name": "Current balance"
-      },
       "acceptable_price": {
         "name": "Acceptable price"
       },
-      "force_charge_duration_minutes": {
+      "duty_cycle_minutes": {
+        "name": "Duty cycle"
+      },
+      "update_interval": {
+        "name": "Controller refresh interval"
+      },
+      "currents_push_interval": {
+        "name": "Mains current push interval"
+      },
+      "ev_meter_push_interval": {
+        "name": "EV meter push interval"
+      }
+    },
+    "text": {
+      "force_charge_duration": {
         "name": "Force charge duration"
       }
     },
     "select": {
-      "low_budget_policy": {
-        "name": "Low-budget policy"
+      "charge_policy": {
+        "name": "Charge policy",
+        "state": {
+          "smartevse_1_first": "SmartEVSE 1 first",
+          "smartevse_2_first": "SmartEVSE 2 first",
+          "smartevse_1_only": "SmartEVSE 1 only",
+          "smartevse_2_only": "SmartEVSE 2 only"
+        }
       }
     },
     "sensor": {
@@ -110,28 +128,56 @@
       "charge_reason": {
         "name": "Charge reason"
       },
-      "available_current": {
-        "name": "Available current"
+      "active_charge_slot": {
+        "name": "Active charge slot"
       },
-      "house_load": {
-        "name": "House load"
+      "duty_cycle_remaining": {
+        "name": "Duty cycle remaining"
       },
-      "evse_1_target_current": {
-        "name": "EVSE 1 target current"
+      "smartevse_1_state": {
+        "name": "SmartEVSE 1 state"
       },
-      "evse_2_target_current": {
-        "name": "EVSE 2 target current"
+      "smartevse_1_plug_state": {
+        "name": "SmartEVSE 1 plug state"
+      },
+      "smartevse_1_mode": {
+        "name": "SmartEVSE 1 mode"
+      },
+      "smartevse_1_charge_current": {
+        "name": "SmartEVSE 1 charging current"
+      },
+      "smartevse_1_max_current": {
+        "name": "SmartEVSE 1 max current"
+      },
+      "smartevse_1_override_current": {
+        "name": "SmartEVSE 1 override current"
+      },
+      "smartevse_1_error": {
+        "name": "SmartEVSE 1 error"
+      },
+      "smartevse_2_state": {
+        "name": "SmartEVSE 2 state"
+      },
+      "smartevse_2_plug_state": {
+        "name": "SmartEVSE 2 plug state"
+      },
+      "smartevse_2_mode": {
+        "name": "SmartEVSE 2 mode"
+      },
+      "smartevse_2_charge_current": {
+        "name": "SmartEVSE 2 charging current"
+      },
+      "smartevse_2_max_current": {
+        "name": "SmartEVSE 2 max current"
+      },
+      "smartevse_2_override_current": {
+        "name": "SmartEVSE 2 override current"
+      },
+      "smartevse_2_error": {
+        "name": "SmartEVSE 2 error"
       },
       "timer_remaining": {
         "name": "Timer remaining"
-      }
-    },
-    "button": {
-      "refresh": {
-        "name": "Refresh controller"
-      },
-      "reset_sessions": {
-        "name": "Reset session tracking"
       }
     }
   }

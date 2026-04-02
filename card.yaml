@@ -30,20 +30,20 @@ cards:
       {% if is_state('sensor.smartevse_1_evplugstate','Connected') %}
         {% set s = states('sensor.smartevse_1_state')|trim %}
         {% if s == 'Charging' %}
-          EVSE 1: Charging
+          SmartEVSE 1: Charging
         {% elif s == 'Ready to Charge' %}
-          EVSE 1: Ready to charge
+          SmartEVSE 1: Ready to charge
         {% elif s == 'Connected to EV' %}
-          EVSE 1: Connected to EV
+          SmartEVSE 1: Connected to EV
         {% elif s == 'Charging Stopped' %}
-          EVSE 1: Charging stopped
+          SmartEVSE 1: Charging stopped
         {% elif s == 'Stop Charging' %}
-          EVSE 1: Charging stopping
+          SmartEVSE 1: Charging stopping
         {% else %}
-          EVSE 1: Idle
+          SmartEVSE 1: Idle
         {% endif %}
       {% else %}
-        EVSE 1: Unplugged
+        SmartEVSE 1: Unplugged
       {% endif %}
     secondary: >-
       Plug: {{ states('sensor.smartevse_1_evplugstate') }}
@@ -101,20 +101,20 @@ cards:
       {% if is_state('sensor.smartevse_2_evplugstate','Connected') %}
         {% set s = states('sensor.smartevse_2_state')|trim %}
         {% if s == 'Charging' %}
-          EVSE 2: Charging
+          SmartEVSE 2: Charging
         {% elif s == 'Ready to Charge' %}
-          EVSE 2: Ready to charge
+          SmartEVSE 2: Ready to charge
         {% elif s == 'Connected to EV' %}
-          EVSE 2: Connected to EV
+          SmartEVSE 2: Connected to EV
         {% elif s == 'Charging Stopped' %}
-          EVSE 2: Charging stopped
+          SmartEVSE 2: Charging stopped
         {% elif s == 'Stop Charging' %}
-          EVSE 2: Charging stopping
+          SmartEVSE 2: Charging stopping
         {% else %}
-          EVSE 2: Idle
+          SmartEVSE 2: Idle
         {% endif %}
       {% else %}
-        EVSE 2: Unplugged
+        SmartEVSE 2: Unplugged
       {% endif %}
     secondary: >-
       Plug: {{ states('sensor.smartevse_2_evplugstate') }}
@@ -302,7 +302,7 @@ cards:
       - entity: schedule.charge_schedule
         name: Charge schedule
       - entity: input_number.charger_current_balance
-        name: Current balance (EVSE 1 ⇄ EVSE 2)
+        name: Current balance (SmartEVSE 1 ⇄ SmartEVSE 2)
       - entity: number.real_electricity_price_acceptable_price
         name: Acceptable price
       - entity: input_datetime.force_charge_time

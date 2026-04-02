@@ -2,53 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from math import isclose
 from typing import Any
 from urllib.parse import urljoin
 
 from aiohttp import ClientError
 from homeassistant.components import persistent_notification
-from homeassistant.const import ATTR_ENTITY_ID
-from homeassistant.core import Context, HomeAssistant
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    ACTIVE_STATE,
-    ATTR_AVAILABLE_CURRENT,
+    ATTR_ACTIVE_CHARGE_SLOT,
+    ATTR_ACTIVE_CHARGE_SLOT_SINCE,
     ATTR_CHARGE_ALLOWED,
     ATTR_CHARGE_REASON,
     ATTR_CONTROLLER_STATE,
-    ATTR_EVSE_1_TARGET_CURRENT,
-    ATTR_EVSE_2_TARGET_CURRENT,
-    ATTR_HOUSE_LOAD,
+    ATTR_DUTY_CYCLE_REMAINING,
     ATTR_LAST_CYCLE_REASON,
+    ATTR_LAST_EV_METER_PUSH,
     ATTR_LAST_METER_PUSH,
     ATTR_LAST_NOTIFICATION,
     ATTR_LAST_WLED_PUSH,
-    ATTR_LOW_BUDGET_WINNER,
     ATTR_MAINS_PEAK,
     ATTR_SCHEDULE_WINDOW_ACTIVE,
     ATTR_TIMER_REMAINING,
     ATTR_TIMER_UNTIL,
-    COMPLETE_STATES,
-    CONF_ACTIVE_MODE,
+    CONF_CHARGE_POLICY_DEFAULT,
     CONF_CURRENTS_PUSH_INTERVAL,
-    CONF_EVSE_1_BASE_URL,
-    CONF_EVSE_1_ERROR_ENTITY,
-    CONF_EVSE_1_MODE_ENTITY,
-    CONF_EVSE_1_OVERRIDE_ENTITY,
-    CONF_EVSE_1_PLUG_ENTITY,
-    CONF_EVSE_1_STATE_ENTITY,
-    CONF_EVSE_2_BASE_URL,
-    CONF_EVSE_2_ERROR_ENTITY,
-    CONF_EVSE_2_MODE_ENTITY,
-    CONF_EVSE_2_OVERRIDE_ENTITY,
-    CONF_EVSE_2_PLUG_ENTITY,
-    CONF_EVSE_2_STATE_ENTITY,
+    CONF_DUTY_CYCLE_MINUTES,
     CONF_EV_METER_EXPORT_ACTIVE_ENERGY_ENTITY,
     CONF_EV_METER_IMPORT_ACTIVE_ENERGY_ENTITY,
     CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY,
@@ -56,41 +41,38 @@ from .const import (
     CONF_EV_METER_L2_ENTITY,
     CONF_EV_METER_L3_ENTITY,
     CONF_EV_METER_PUSH_INTERVAL,
-    CONF_LOW_BUDGET_POLICY_DEFAULT,
     CONF_MAINS_L1_ENTITY,
     CONF_MAINS_L2_ENTITY,
     CONF_MAINS_L3_ENTITY,
     CONF_NOTIFY_ON_SCHEDULE_WINDOW,
-    CONF_OVERRIDE_DEADBAND,
     CONF_PRICE_SENSOR_ENTITY,
     CONF_PUSH_CURRENTS,
     CONF_PUSH_EV_METER,
     CONF_PUSH_WLED,
     CONF_SCHEDULE_ENTITY,
-    CONF_TOTAL_CURRENT_LIMIT,
+    CONF_SMARTEVSE_1_BASE_URL,
+    CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
     CONF_WLED_URL,
     ControllerState,
-    DEFAULT_ACTIVE_MODE,
     DEFAULT_ACCEPTABLE_PRICE,
-    DEFAULT_BALANCE_PERCENT,
+    DEFAULT_CHARGE_POLICY,
+    DEFAULT_CURRENTS_PUSH_INTERVAL,
+    DEFAULT_DUTY_CYCLE_MINUTES,
+    DEFAULT_EV_METER_PUSH_INTERVAL,
     DEFAULT_FORCE_CHARGE_DURATION_MINUTES,
-    DEFAULT_LOW_BUDGET_POLICY,
-    DEFAULT_MIN_CURRENT,
     DEFAULT_NOTIFY_ON_SCHEDULE_WINDOW,
-    DEFAULT_OVERRIDE_DEADBAND,
     DEFAULT_PUSH_CURRENTS,
     DEFAULT_PUSH_EV_METER,
     DEFAULT_PUSH_WLED,
-    DEFAULT_TOTAL_CURRENT_LIMIT,
     DEFAULT_UPDATE_INTERVAL,
     LOGGER,
-    LowBudgetPolicy,
-    PENDING_STATES,
     SCHEDULE_NOTIFICATION_ID,
     STORAGE_KEY,
     STORAGE_VERSION,
+    ChargePolicy,
 )
+from .wled import build_runtime_payload, normalize_wled_state_url
 
 MUTABLE_DEFAULTS: dict[str, Any] = {
     "force_charge": False,
@@ -98,35 +80,52 @@ MUTABLE_DEFAULTS: dict[str, Any] = {
     "force_timer": False,
     "schedule_enabled": False,
     "acceptable_price": DEFAULT_ACCEPTABLE_PRICE,
-    "balance_percent": DEFAULT_BALANCE_PERCENT,
     "force_charge_duration_minutes": DEFAULT_FORCE_CHARGE_DURATION_MINUTES,
-    "low_budget_policy": DEFAULT_LOW_BUDGET_POLICY,
+    "charge_policy": DEFAULT_CHARGE_POLICY,
+    "duty_cycle_minutes": DEFAULT_DUTY_CYCLE_MINUTES,
+    "update_interval": DEFAULT_UPDATE_INTERVAL,
+    "currents_push_interval": DEFAULT_CURRENTS_PUSH_INTERVAL,
+    "ev_meter_push_interval": DEFAULT_EV_METER_PUSH_INTERVAL,
     "timer_until": None,
-    "session_has_charged_1": False,
-    "session_has_charged_2": False,
-    "last_low_budget_winner": None,
-    "low_budget_active": False,
+    "active_charge_slot": None,
+    "active_charge_slot_since": None,
+    "last_active_charge_reason": None,
     "last_schedule_window_active": False,
     "last_meter_push": None,
     "last_ev_meter_push": None,
     "last_wled_push": None,
     "last_notification": None,
+    "smartevse_1_seen_charging": False,
+    "smartevse_1_session_complete": False,
+    "smartevse_2_seen_charging": False,
+    "smartevse_2_session_complete": False,
 }
+
+MODE_NAME_TO_ID = {
+    "Off": 0,
+    "Normal": 1,
+    "Solar": 2,
+    "Smart": 3,
+    "Pause": 4,
+}
+MODE_ID_TO_NAME = {value: key for key, value in MODE_NAME_TO_ID.items()}
 
 
 @dataclass(slots=True)
-class EVSEStatus:
-    """Computed EVSE state for one connector."""
+class SmartEVSEStatus:
+    """Status snapshot for one SmartEVSE."""
 
+    key: str
+    base_url: str
+    available: bool
     connected: bool
+    plug_state: str
     state: str
     mode: str
+    charge_current: float
+    max_current: float
     override_current: float
     error: str
-    session_has_charged: bool
-    active: bool
-    pending: bool
-    complete: bool
 
 
 class SmartEVSEDualChargerController:
@@ -144,17 +143,63 @@ class SmartEVSEDualChargerController:
             f"{STORAGE_KEY}.{entry_data['entry_id']}",
         )
         self._mutable: dict[str, Any] = {}
+        self._endpoint_failures: dict[str, str] = {}
         self._last_wled_payload: dict[str, Any] | None = None
 
     async def async_initialize(self) -> None:
         """Load persisted mutable state."""
         stored = await self._store.async_load() or {}
         self._mutable = {**MUTABLE_DEFAULTS, **stored}
-        if "low_budget_policy" not in stored:
-            self._mutable["low_budget_policy"] = self._options.get(
-                CONF_LOW_BUDGET_POLICY_DEFAULT,
-                DEFAULT_LOW_BUDGET_POLICY,
+
+        try:
+            self._mutable["charge_policy"] = ChargePolicy(self._mutable["charge_policy"]).value
+        except ValueError:
+            self._mutable["charge_policy"] = self._options.get(
+                CONF_CHARGE_POLICY_DEFAULT,
+                DEFAULT_CHARGE_POLICY,
             )
+        if "duty_cycle_minutes" not in stored:
+            self._mutable["duty_cycle_minutes"] = self._options.get(
+                CONF_DUTY_CYCLE_MINUTES,
+                DEFAULT_DUTY_CYCLE_MINUTES,
+            )
+        self._mutable["duty_cycle_minutes"] = max(1, int(self._mutable["duty_cycle_minutes"]))
+        if "update_interval" not in stored:
+            self._mutable["update_interval"] = self._options.get(
+                CONF_UPDATE_INTERVAL,
+                DEFAULT_UPDATE_INTERVAL,
+            )
+        self._mutable["update_interval"] = max(1, int(self._mutable["update_interval"]))
+        if "currents_push_interval" not in stored:
+            self._mutable["currents_push_interval"] = self._options.get(
+                CONF_CURRENTS_PUSH_INTERVAL,
+                DEFAULT_CURRENTS_PUSH_INTERVAL,
+            )
+        self._mutable["currents_push_interval"] = max(1, int(self._mutable["currents_push_interval"]))
+        if "ev_meter_push_interval" not in stored:
+            self._mutable["ev_meter_push_interval"] = self._options.get(
+                CONF_EV_METER_PUSH_INTERVAL,
+                DEFAULT_EV_METER_PUSH_INTERVAL,
+            )
+        self._mutable["ev_meter_push_interval"] = max(1, int(self._mutable["ev_meter_push_interval"]))
+
+        if CONF_CHARGE_POLICY_DEFAULT in self._options:
+            self._mutable["charge_policy"] = ChargePolicy(self._options[CONF_CHARGE_POLICY_DEFAULT]).value
+        if CONF_DUTY_CYCLE_MINUTES in self._options:
+            self._mutable["duty_cycle_minutes"] = max(1, int(self._options[CONF_DUTY_CYCLE_MINUTES]))
+        if CONF_UPDATE_INTERVAL in self._options:
+            self._mutable["update_interval"] = max(1, int(self._options[CONF_UPDATE_INTERVAL]))
+        if CONF_CURRENTS_PUSH_INTERVAL in self._options:
+            self._mutable["currents_push_interval"] = max(1, int(self._options[CONF_CURRENTS_PUSH_INTERVAL]))
+        if CONF_EV_METER_PUSH_INTERVAL in self._options:
+            self._mutable["ev_meter_push_interval"] = max(1, int(self._options[CONF_EV_METER_PUSH_INTERVAL]))
+
+        # Timer charge should not survive a Home Assistant restart.
+        self._mutable["force_timer"] = False
+        self._mutable["timer_until"] = None
+        self._mutable["charge_policy"] = self._configured_charge_policy()
+        self._reset_charge_cycle()
+        await self._async_save_state()
 
     async def async_set_force_charge(self, value: bool) -> None:
         """Enable or disable force charge."""
@@ -163,6 +208,7 @@ class SmartEVSEDualChargerController:
             self._mutable["force_price"] = False
             self._mutable["force_timer"] = False
             self._mutable["timer_until"] = None
+            self._reset_charge_cycle()
         await self._async_save_state()
 
     async def async_set_force_price(self, value: bool) -> None:
@@ -172,6 +218,7 @@ class SmartEVSEDualChargerController:
             self._mutable["force_charge"] = False
             self._mutable["force_timer"] = False
             self._mutable["timer_until"] = None
+            self._reset_charge_cycle()
         await self._async_save_state()
 
     async def async_set_force_timer(self, value: bool) -> None:
@@ -182,23 +229,22 @@ class SmartEVSEDualChargerController:
             self._mutable["force_price"] = False
             duration = int(self._mutable["force_charge_duration_minutes"])
             self._mutable["timer_until"] = (dt_util.utcnow() + timedelta(minutes=duration)).isoformat()
+            self._reset_charge_cycle()
         else:
             self._mutable["timer_until"] = None
+            self._reset_charge_cycle()
         await self._async_save_state()
 
     async def async_set_schedule_enabled(self, value: bool) -> None:
         """Enable or disable the schedule gate."""
         self._mutable["schedule_enabled"] = value
+        if not value:
+            self._reset_charge_cycle()
         await self._async_save_state()
 
     async def async_set_acceptable_price(self, value: float) -> None:
         """Update the acceptable price threshold."""
         self._mutable["acceptable_price"] = round(value, 4)
-        await self._async_save_state()
-
-    async def async_set_balance_percent(self, value: float) -> None:
-        """Update the balance split percentage."""
-        self._mutable["balance_percent"] = int(round(value))
         await self._async_save_state()
 
     async def async_set_force_charge_duration(self, value: float) -> None:
@@ -209,17 +255,37 @@ class SmartEVSEDualChargerController:
             self._mutable["timer_until"] = (dt_util.utcnow() + timedelta(minutes=duration)).isoformat()
         await self._async_save_state()
 
-    async def async_set_low_budget_policy(self, value: str) -> None:
-        """Update the low budget policy."""
-        self._mutable["low_budget_policy"] = value
-        self._mutable["low_budget_active"] = False
+    async def async_set_charge_policy(self, value: str) -> None:
+        """Update the runtime charge policy."""
+        self._mutable["charge_policy"] = ChargePolicy(value).value
+        self._reset_charge_cycle()
+        await self._async_save_state()
+
+    async def async_set_duty_cycle_minutes(self, value: float) -> None:
+        """Update the duty cycle interval."""
+        self._mutable["duty_cycle_minutes"] = max(1, int(round(value)))
+        self._reset_charge_cycle()
+        await self._async_save_state()
+
+    async def async_set_update_interval(self, value: float) -> None:
+        """Update the controller refresh interval."""
+        self._mutable["update_interval"] = max(1, int(round(value)))
+        await self._async_save_state()
+
+    async def async_set_currents_push_interval(self, value: float) -> None:
+        """Update the mains current push interval."""
+        self._mutable["currents_push_interval"] = max(1, int(round(value)))
+        await self._async_save_state()
+
+    async def async_set_ev_meter_push_interval(self, value: float) -> None:
+        """Update the EV meter push interval."""
+        self._mutable["ev_meter_push_interval"] = max(1, int(round(value)))
         await self._async_save_state()
 
     async def async_reset_sessions(self) -> None:
-        """Reset per-session completion tracking."""
-        self._mutable["session_has_charged_1"] = False
-        self._mutable["session_has_charged_2"] = False
-        self._mutable["low_budget_active"] = False
+        """Reset the active charge slot and start a new cycle."""
+        self._reset_charge_cycle()
+        self._clear_session_tracking()
         await self._async_save_state()
 
     async def async_run_cycle(self, *, reason: str) -> dict[str, Any]:
@@ -227,31 +293,29 @@ class SmartEVSEDualChargerController:
         now = dt_util.utcnow()
         self._sanitize_mutual_exclusion()
 
-        evse_1 = self._build_evse_status(1)
-        evse_2 = self._build_evse_status(2)
-
-        if not evse_1.connected:
-            self._mutable["session_has_charged_1"] = False
-        elif evse_1.state == ACTIVE_STATE:
-            self._mutable["session_has_charged_1"] = True
-
-        if not evse_2.connected:
-            self._mutable["session_has_charged_2"] = False
-        elif evse_2.state == ACTIVE_STATE:
-            self._mutable["session_has_charged_2"] = True
-
-        evse_1 = self._build_evse_status(1)
-        evse_2 = self._build_evse_status(2)
+        smartevse_1, smartevse_2 = await asyncio.gather(
+            self._async_fetch_status("smartevse_1", self._entry_data[CONF_SMARTEVSE_1_BASE_URL]),
+            self._async_fetch_status("smartevse_2", self._entry_data[CONF_SMARTEVSE_2_BASE_URL]),
+        )
+        self._update_session_tracking(smartevse_1)
+        self._update_session_tracking(smartevse_2)
 
         if self._mutable["force_timer"]:
             timer_until = self._timer_until()
             if timer_until is None or now >= timer_until:
                 self._mutable["force_timer"] = False
                 self._mutable["timer_until"] = None
+                self._reset_charge_cycle()
 
-        if self._mutable["force_timer"] and not evse_1.connected and not evse_2.connected:
-            self._mutable["force_timer"] = False
-            self._mutable["timer_until"] = None
+        if (
+            smartevse_1.available
+            and smartevse_2.available
+            and not smartevse_1.connected
+            and not smartevse_2.connected
+        ):
+            self._clear_force_modes()
+            self._mutable["charge_policy"] = self._configured_charge_policy()
+            self._reset_charge_cycle()
 
         price_value = self._state_float(self._entry_data.get(CONF_PRICE_SENSOR_ENTITY))
         schedule_window_active = self._state_on(self._entry_data.get(CONF_SCHEDULE_ENTITY))
@@ -270,31 +334,38 @@ class SmartEVSEDualChargerController:
             self._state_float(self._entry_data[CONF_MAINS_L2_ENTITY]),
             self._state_float(self._entry_data[CONF_MAINS_L3_ENTITY]),
         )
-        ev_meter_peak = max(
-            self._state_float(self._entry_data[CONF_EV_METER_L1_ENTITY]),
-            self._state_float(self._entry_data[CONF_EV_METER_L2_ENTITY]),
-            self._state_float(self._entry_data[CONF_EV_METER_L3_ENTITY]),
-        )
-        house_load = max(mains_peak - ev_meter_peak, 0.0)
-        available_current = max(self._option_float(CONF_TOTAL_CURRENT_LIMIT, DEFAULT_TOTAL_CURRENT_LIMIT) - house_load, 0.0)
 
-        target_1, target_2, low_budget_winner = self._calculate_targets(
-            available_current=available_current,
+        active_charge_slot = "none"
+        duty_cycle_remaining = 0
+        active_charge_slot_since = None
+
+        if not charge_allowed:
+            self._reset_charge_cycle()
+            self._mutable["last_active_charge_reason"] = None
+        else:
+            if self._mutable.get("last_active_charge_reason") != charge_reason:
+                self._reset_charge_cycle()
+            self._mutable["last_active_charge_reason"] = charge_reason
+            active_charge_slot, active_charge_slot_since, duty_cycle_remaining, blocked_reason = self._resolve_active_charge_slot(
+                now=now,
+                smartevse_1=smartevse_1,
+                smartevse_2=smartevse_2,
+            )
+            if active_charge_slot == "none":
+                controller_state = ControllerState.BLOCKED
+                charge_reason = blocked_reason
+
+        await self._apply_modes(
+            smartevse_1=smartevse_1,
+            smartevse_2=smartevse_2,
+            active_charge_slot=active_charge_slot,
             charge_allowed=charge_allowed,
-            evse_1=evse_1,
-            evse_2=evse_2,
         )
-
-        if low_budget_winner:
-            controller_state = ControllerState.LOW_BUDGET
-
-        await self._apply_targets(evse_1=evse_1, evse_2=evse_2, target_1=target_1, target_2=target_2)
-        await self._maybe_push_meter_data(now=now)
-        await self._maybe_push_wled(evse_1=evse_1, evse_2=evse_2)
+        await self._maybe_push_wled(smartevse_1=smartevse_1, smartevse_2=smartevse_2)
         await self._async_save_state()
 
         timer_until = self._timer_until()
-        timer_remaining = None
+        timer_remaining = 0
         if timer_until is not None:
             timer_remaining = max(int((timer_until - now).total_seconds()), 0)
 
@@ -304,27 +375,45 @@ class SmartEVSEDualChargerController:
             "force_timer": bool(self._mutable["force_timer"]),
             "schedule_enabled": bool(self._mutable["schedule_enabled"]),
             "acceptable_price": float(self._mutable["acceptable_price"]),
-            "balance_percent": int(self._mutable["balance_percent"]),
             "force_charge_duration_minutes": int(self._mutable["force_charge_duration_minutes"]),
-            "low_budget_policy": str(self._mutable["low_budget_policy"]),
+            "charge_policy": str(self._mutable["charge_policy"]),
+            "duty_cycle_minutes": int(self._mutable["duty_cycle_minutes"]),
+            "update_interval": int(self._mutable["update_interval"]),
+            "currents_push_interval": int(self._mutable["currents_push_interval"]),
+            "ev_meter_push_interval": int(self._mutable["ev_meter_push_interval"]),
             ATTR_CHARGE_ALLOWED: charge_allowed,
             ATTR_CONTROLLER_STATE: controller_state.value,
             ATTR_CHARGE_REASON: charge_reason,
-            ATTR_AVAILABLE_CURRENT: round(available_current, 1),
-            ATTR_HOUSE_LOAD: round(house_load, 1),
             ATTR_MAINS_PEAK: round(mains_peak, 1),
-            ATTR_EVSE_1_TARGET_CURRENT: target_1,
-            ATTR_EVSE_2_TARGET_CURRENT: target_2,
+            ATTR_ACTIVE_CHARGE_SLOT: active_charge_slot,
+            ATTR_ACTIVE_CHARGE_SLOT_SINCE: active_charge_slot_since,
+            ATTR_DUTY_CYCLE_REMAINING: duty_cycle_remaining,
             ATTR_SCHEDULE_WINDOW_ACTIVE: schedule_window_active,
-            ATTR_LOW_BUDGET_WINNER: low_budget_winner,
             ATTR_LAST_CYCLE_REASON: reason,
             ATTR_TIMER_UNTIL: timer_until,
             ATTR_TIMER_REMAINING: timer_remaining,
             ATTR_LAST_METER_PUSH: self._mutable["last_meter_push"],
+            ATTR_LAST_EV_METER_PUSH: self._mutable["last_ev_meter_push"],
             ATTR_LAST_WLED_PUSH: self._mutable["last_wled_push"],
             ATTR_LAST_NOTIFICATION: self._mutable["last_notification"],
-            "evse_1_connected": evse_1.connected,
-            "evse_2_connected": evse_2.connected,
+            "smartevse_1_available": smartevse_1.available,
+            "smartevse_1_state": smartevse_1.state,
+            "smartevse_1_plug_state": smartevse_1.plug_state,
+            "smartevse_1_mode": smartevse_1.mode,
+            "smartevse_1_charge_current": round(smartevse_1.charge_current, 1),
+            "smartevse_1_max_current": round(smartevse_1.max_current, 1),
+            "smartevse_1_override_current": round(smartevse_1.override_current, 1),
+            "smartevse_1_error": smartevse_1.error,
+            "smartevse_1_session_complete": bool(self._mutable["smartevse_1_session_complete"]),
+            "smartevse_2_available": smartevse_2.available,
+            "smartevse_2_state": smartevse_2.state,
+            "smartevse_2_plug_state": smartevse_2.plug_state,
+            "smartevse_2_mode": smartevse_2.mode,
+            "smartevse_2_charge_current": round(smartevse_2.charge_current, 1),
+            "smartevse_2_max_current": round(smartevse_2.max_current, 1),
+            "smartevse_2_override_current": round(smartevse_2.override_current, 1),
+            "smartevse_2_error": smartevse_2.error,
+            "smartevse_2_session_complete": bool(self._mutable["smartevse_2_session_complete"]),
         }
 
     def _sanitize_mutual_exclusion(self) -> None:
@@ -342,216 +431,295 @@ class SmartEVSEDualChargerController:
         if first != "force_timer":
             self._mutable["timer_until"] = None
 
-    def _build_evse_status(self, evse_index: int) -> EVSEStatus:
-        """Return computed EVSE status."""
-        state = self._state_str(self._entry_data[f"evse_{evse_index}_state_entity"])
-        connected = self._state_str(self._entry_data[f"evse_{evse_index}_plug_entity"]) == "Connected"
-        mode = self._state_str(self._entry_data[f"evse_{evse_index}_mode_entity"])
-        override_current = self._state_float(self._entry_data[f"evse_{evse_index}_override_entity"])
-        error_entity = self._entry_data.get(f"evse_{evse_index}_error_entity")
-        error = self._state_str(error_entity) if error_entity else ""
-        session_has_charged = bool(self._mutable[f"session_has_charged_{evse_index}"])
-        active = connected and state == ACTIVE_STATE
-        pending = connected and not active and (state in PENDING_STATES or (state == "Connected to EV" and not session_has_charged))
-        complete = connected and not active and session_has_charged and state in COMPLETE_STATES
-        return EVSEStatus(
-            connected=connected,
-            state=state,
-            mode=mode,
-            override_current=override_current,
-            error=error,
-            session_has_charged=session_has_charged,
-            active=active,
-            pending=pending,
-            complete=complete,
-        )
+    def _clear_force_modes(self) -> None:
+        """Clear all force-mode toggles."""
+        self._mutable["force_charge"] = False
+        self._mutable["force_price"] = False
+        self._mutable["force_timer"] = False
+        self._mutable["timer_until"] = None
 
-    def _determine_charge_allowed(self, *, price_value: float, schedule_window_active: bool) -> tuple[bool, ControllerState, str]:
+    def _configured_charge_policy(self) -> str:
+        """Return the configured default charge policy."""
+        value = self._options.get(CONF_CHARGE_POLICY_DEFAULT, DEFAULT_CHARGE_POLICY)
+        try:
+            return ChargePolicy(value).value
+        except ValueError:
+            return DEFAULT_CHARGE_POLICY
+
+    def _reset_charge_cycle(self) -> None:
+        """Clear the active slot so the next cycle restarts from policy."""
+        self._mutable["active_charge_slot"] = None
+        self._mutable["active_charge_slot_since"] = None
+
+    def _clear_session_tracking(self) -> None:
+        """Forget per-connector session completion state."""
+        for slot in ("smartevse_1", "smartevse_2"):
+            self._mutable[f"{slot}_seen_charging"] = False
+            self._mutable[f"{slot}_session_complete"] = False
+
+    def _update_session_tracking(self, status: SmartEVSEStatus) -> None:
+        """Track whether a connected EV has already completed one charge session."""
+        seen_key = f"{status.key}_seen_charging"
+        complete_key = f"{status.key}_session_complete"
+
+        if not status.available:
+            return
+
+        if not status.connected:
+            self._mutable[seen_key] = False
+            self._mutable[complete_key] = False
+            return
+
+        if status.state == "Charging":
+            self._mutable[seen_key] = True
+            self._mutable[complete_key] = False
+            return
+
+        if self._mutable.get(seen_key) and status.state == "Charging Stopped":
+            self._mutable[complete_key] = True
+
+    def _session_complete(self, slot: str) -> bool:
+        """Return whether the current plugged session has already completed."""
+        return bool(self._mutable.get(f"{slot}_session_complete"))
+
+    def _determine_charge_allowed(
+        self,
+        *,
+        price_value: float,
+        schedule_window_active: bool,
+    ) -> tuple[bool, ControllerState, str]:
         """Resolve high-level controller state."""
         acceptable_price = float(self._mutable["acceptable_price"])
         if self._mutable["force_charge"]:
             return True, ControllerState.FORCE, "force_charge"
         if self._mutable["force_timer"] and self._timer_until() is not None:
             return True, ControllerState.TIMER, "force_timer"
-        if self._mutable["force_price"] and price_value <= acceptable_price:
-            return True, ControllerState.PRICE, "acceptable_price"
-        if self._mutable["schedule_enabled"] and schedule_window_active:
-            return True, ControllerState.SCHEDULE, "schedule"
+        if self._mutable["force_price"]:
+            if not self._entry_data.get(CONF_PRICE_SENSOR_ENTITY):
+                return False, ControllerState.IDLE, "price_sensor_unavailable"
+            if price_value <= acceptable_price:
+                return True, ControllerState.PRICE, "acceptable_price"
+            return False, ControllerState.IDLE, "waiting_for_acceptable_price"
+        if self._mutable["schedule_enabled"]:
+            if not self._entry_data.get(CONF_SCHEDULE_ENTITY):
+                return False, ControllerState.IDLE, "schedule_entity_unavailable"
+            if schedule_window_active:
+                return True, ControllerState.SCHEDULE, "schedule"
+            return False, ControllerState.IDLE, "waiting_for_schedule_window"
         return False, ControllerState.IDLE, "idle"
 
-    def _calculate_targets(
+    def _resolve_active_charge_slot(
         self,
         *,
-        available_current: float,
+        now: datetime,
+        smartevse_1: SmartEVSEStatus,
+        smartevse_2: SmartEVSEStatus,
+    ) -> tuple[str, str | None, int, str]:
+        """Return the active slot, slot start time, remaining time, and any block reason."""
+        statuses = {
+            "smartevse_1": smartevse_1,
+            "smartevse_2": smartevse_2,
+        }
+        policy = ChargePolicy(self._mutable["charge_policy"])
+        available_slots = [slot for slot, status in statuses.items() if status.available]
+        connected_slots = [slot for slot, status in statuses.items() if status.available and status.connected]
+        eligible_slots = [slot for slot in connected_slots if not self._session_complete(slot)]
+
+        if not available_slots:
+            self._reset_charge_cycle()
+            return "none", None, 0, "smartevse_api_unavailable"
+
+        if policy == ChargePolicy.SMARTEVSE_1_ONLY:
+            return self._resolve_only_policy("smartevse_1", smartevse_1)
+        if policy == ChargePolicy.SMARTEVSE_2_ONLY:
+            return self._resolve_only_policy("smartevse_2", smartevse_2)
+
+        if not connected_slots:
+            self._reset_charge_cycle()
+            return "none", None, 0, "waiting_for_connected_ev"
+
+        if not eligible_slots:
+            self._reset_charge_cycle()
+            return "none", None, 0, "all_connected_evs_complete"
+
+        if len(eligible_slots) == 1:
+            only_slot = eligible_slots[0]
+            self._mutable["active_charge_slot"] = only_slot
+            self._mutable["active_charge_slot_since"] = None
+            return only_slot, None, 0, ""
+
+        preferred_slot = self._preferred_slot(policy)
+        active_charge_slot = str(self._mutable.get("active_charge_slot") or "")
+        active_charge_slot_since = self._parse_datetime(self._mutable.get("active_charge_slot_since"))
+        interval_seconds = max(1, int(self._mutable["duty_cycle_minutes"])) * 60
+
+        if active_charge_slot not in eligible_slots:
+            active_charge_slot = preferred_slot if preferred_slot in eligible_slots else eligible_slots[0]
+            active_charge_slot_since = now
+        elif active_charge_slot_since is None:
+            if preferred_slot in eligible_slots and active_charge_slot != preferred_slot:
+                active_charge_slot = preferred_slot
+            active_charge_slot_since = now
+        else:
+            elapsed = int((now - active_charge_slot_since).total_seconds())
+            next_slot = self._other_slot(active_charge_slot)
+            if elapsed >= interval_seconds and next_slot in eligible_slots:
+                active_charge_slot = next_slot
+                active_charge_slot_since = now
+
+        duty_cycle_remaining = max(
+            interval_seconds - int((now - active_charge_slot_since).total_seconds()),
+            0,
+        )
+
+        self._mutable["active_charge_slot"] = active_charge_slot
+        self._mutable["active_charge_slot_since"] = active_charge_slot_since.isoformat()
+        return active_charge_slot, active_charge_slot_since.isoformat(), duty_cycle_remaining, ""
+
+    def _resolve_only_policy(
+        self,
+        selected_slot: str,
+        selected_status: SmartEVSEStatus,
+    ) -> tuple[str, str | None, int, str]:
+        """Resolve a fixed-slot policy."""
+        self._mutable["active_charge_slot"] = None
+        self._mutable["active_charge_slot_since"] = None
+
+        if not selected_status.available:
+            return "none", None, 0, f"{selected_slot}_api_unavailable"
+        if not selected_status.connected:
+            return "none", None, 0, f"{selected_slot}_only_waiting_for_selected_ev"
+        if self._session_complete(selected_slot):
+            return "none", None, 0, f"{selected_slot}_only_selected_ev_already_complete"
+        return selected_slot, None, 0, ""
+
+    async def _apply_modes(
+        self,
+        *,
+        smartevse_1: SmartEVSEStatus,
+        smartevse_2: SmartEVSEStatus,
+        active_charge_slot: str,
         charge_allowed: bool,
-        evse_1: EVSEStatus,
-        evse_2: EVSEStatus,
-    ) -> tuple[int, int, str | None]:
-        """Calculate current targets in whole amps."""
-        if not charge_allowed:
-            self._mutable["low_budget_active"] = False
-            return 0, 0, None
+    ) -> None:
+        """Apply the desired SmartEVSE modes for this cycle."""
+        desired_slot = active_charge_slot if charge_allowed else "none"
+        await asyncio.gather(
+            self._apply_mode_for_smartevse(smartevse_1, desired_mode=self._desired_mode("smartevse_1", desired_slot)),
+            self._apply_mode_for_smartevse(smartevse_2, desired_mode=self._desired_mode("smartevse_2", desired_slot)),
+        )
 
-        min_current = int(round(self._option_float("min_current", DEFAULT_MIN_CURRENT)))
-        max_current = int(round(self._option_float(CONF_TOTAL_CURRENT_LIMIT, DEFAULT_TOTAL_CURRENT_LIMIT)))
-        available_int = max(int(round(available_current)), 0)
+    def _desired_mode(self, slot: str, active_charge_slot: str) -> str:
+        """Return the desired mode for the given slot."""
+        return "Smart" if slot == active_charge_slot else "Off"
 
-        candidates: list[str] = []
-        active_candidates: list[str] = []
-        for evse_id, status in (("evse_1", evse_1), ("evse_2", evse_2)):
-            if not status.connected:
-                continue
-            if status.active or status.pending:
-                candidates.append(evse_id)
-            if status.active:
-                active_candidates.append(evse_id)
+    async def _apply_mode_for_smartevse(self, status: SmartEVSEStatus, *, desired_mode: str) -> None:
+        """Apply the desired mode and clear any override current."""
+        if not status.available:
+            return
 
-        if not candidates:
-            self._mutable["low_budget_active"] = False
-            return 0, 0, None
+        params: dict[str, Any] = {}
+        if status.mode != desired_mode:
+            params["mode"] = MODE_NAME_TO_ID[desired_mode]
+        if status.override_current > 0:
+            params["disable_override_current"] = 1
+        if not params:
+            return
 
-        if len(candidates) == 1:
-            self._mutable["low_budget_active"] = False
-            target = self._target_for_single_candidate(available_int, min_current, max_current)
-            return (target, 0, None) if candidates[0] == "evse_1" else (0, target, None)
+        await self._async_post(
+            urljoin(self._normalize_url(status.base_url), "settings"),
+            params=params,
+        )
 
-        if available_int < min_current:
-            self._mutable["low_budget_active"] = True
-            self._mutable["last_low_budget_winner"] = None
-            return 0, 0, None
-
-        if available_int < (2 * min_current):
-            if LowBudgetPolicy(self._mutable.get("low_budget_policy", DEFAULT_LOW_BUDGET_POLICY)) == LowBudgetPolicy.PAUSE_ALL:
-                self._mutable["low_budget_active"] = True
-                self._mutable["last_low_budget_winner"] = None
-                return 0, 0, None
-            winner = self._select_low_budget_winner(
-                candidates=candidates,
-                active_candidates=active_candidates,
+    async def _async_fetch_status(self, key: str, base_url: str) -> SmartEVSEStatus:
+        """Fetch status from one SmartEVSE."""
+        payload = await self._async_get_json(urljoin(self._normalize_url(base_url), "settings"))
+        if payload is None:
+            return SmartEVSEStatus(
+                key=key,
+                base_url=base_url,
+                available=False,
+                connected=False,
+                plug_state="Unavailable",
+                state="Unavailable",
+                mode="Unavailable",
+                charge_current=0.0,
+                max_current=0.0,
+                override_current=0.0,
+                error="API unavailable",
             )
-            self._mutable["low_budget_active"] = True
-            self._mutable["last_low_budget_winner"] = winner
-            target = min(max(available_int, min_current), max_current)
-            return (target, 0, winner) if winner == "evse_1" else (0, target, winner)
 
-        self._mutable["low_budget_active"] = False
-        remainder = available_int - (2 * min_current)
-        ratio = max(0.0, min(float(self._mutable["balance_percent"]) / 100.0, 1.0))
-        evse_1_target = min_current + int(round(remainder * ratio))
-        evse_2_target = available_int - evse_1_target
-        evse_1_target = min(evse_1_target, max_current)
-        evse_2_target = min(evse_2_target, max_current)
+        evse = payload.get("evse") or {}
+        settings = payload.get("settings") or {}
+        connected = bool(payload.get("car_connected") or evse.get("connected"))
+        plug_state = "Connected" if connected else "Disconnected"
 
-        if evse_1_target < min_current:
-            deficit = min_current - evse_1_target
-            evse_1_target = min_current
-            evse_2_target = max(evse_2_target - deficit, min_current)
-        if evse_2_target < min_current:
-            deficit = min_current - evse_2_target
-            evse_2_target = min_current
-            evse_1_target = max(evse_1_target - deficit, min_current)
+        return SmartEVSEStatus(
+            key=key,
+            base_url=base_url,
+            available=True,
+            connected=connected,
+            plug_state=plug_state,
+            state=str(evse.get("state") or ("Connected to EV" if connected else "Ready to Charge")),
+            mode=self._normalize_mode(payload.get("mode"), payload.get("mode_id")),
+            charge_current=self._deciamp_to_amp(settings.get("charge_current")),
+            max_current=self._to_float(settings.get("current_max") or settings.get("current_max_circuit")),
+            override_current=self._deciamp_to_amp(settings.get("override_current")),
+            error=str(evse.get("error") or "None"),
+        )
 
-        return evse_1_target, evse_2_target, None
-
-    def _target_for_single_candidate(self, available_int: int, min_current: int, max_current: int) -> int:
-        """Return the target current for one active/pending EVSE."""
-        if available_int < min_current:
-            return 0
-        return min(max(available_int, min_current), max_current)
-
-    def _select_low_budget_winner(self, *, candidates: list[str], active_candidates: list[str]) -> str:
-        """Select which EVSE keeps charging when current is tight."""
-        if len(active_candidates) == 1:
-            return active_candidates[0]
-
-        policy = LowBudgetPolicy(self._mutable.get("low_budget_policy", DEFAULT_LOW_BUDGET_POLICY))
-        if policy == LowBudgetPolicy.PAUSE_ALL:
-            return candidates[0]
-        if policy == LowBudgetPolicy.EVSE_1_PRIORITY:
-            return "evse_1" if "evse_1" in candidates else candidates[0]
-        if policy == LowBudgetPolicy.EVSE_2_PRIORITY:
-            return "evse_2" if "evse_2" in candidates else candidates[0]
-
-        if self._mutable.get("low_budget_active"):
-            previous = self._mutable.get("last_low_budget_winner")
-            if previous in candidates:
-                return previous
-
-        previous = self._mutable.get("last_low_budget_winner")
-        if previous == "evse_1" and "evse_2" in candidates:
-            return "evse_2"
-        if previous == "evse_2" and "evse_1" in candidates:
-            return "evse_1"
-        return "evse_1" if "evse_1" in candidates else candidates[0]
-
-    async def _apply_targets(self, *, evse_1: EVSEStatus, evse_2: EVSEStatus, target_1: int, target_2: int) -> None:
-        """Apply mode and override changes to both EVSEs."""
-        await self._apply_target_for_evse(1, evse_1, target_1)
-        await self._apply_target_for_evse(2, evse_2, target_2)
-
-    async def _apply_target_for_evse(self, evse_index: int, status: EVSEStatus, target: int) -> None:
-        """Apply mode and override changes to one EVSE."""
-        mode_entity = self._entry_data[f"evse_{evse_index}_mode_entity"]
-        override_entity = self._entry_data[f"evse_{evse_index}_override_entity"]
-        active_mode = self._options.get(CONF_ACTIVE_MODE, DEFAULT_ACTIVE_MODE)
-        deadband = float(self._options.get(CONF_OVERRIDE_DEADBAND, DEFAULT_OVERRIDE_DEADBAND))
-
-        if not status.connected or target <= 0:
-            if status.mode != "Off":
-                await self._async_select_option(mode_entity, "Off")
-            if not isclose(status.override_current, 0.0, abs_tol=0.01):
-                await self._async_set_number(override_entity, 0.0)
+    async def async_push_currents(self) -> None:
+        """Push mains currents to both SmartEVSE devices."""
+        if not self._options.get(CONF_PUSH_CURRENTS, DEFAULT_PUSH_CURRENTS):
             return
-
-        if status.mode != active_mode:
-            await self._async_select_option(mode_entity, active_mode)
-
-        if isclose(status.override_current, 0.0, abs_tol=0.01) or abs(status.override_current - target) >= deadband:
-            await self._async_set_number(override_entity, float(target))
-
-    async def _maybe_push_meter_data(self, *, now: datetime) -> None:
-        """Push mains and EV meter values to SmartEVSE endpoints when enabled."""
-        if not self._options.get(CONF_PUSH_CURRENTS, DEFAULT_PUSH_CURRENTS) and not self._options.get(CONF_PUSH_EV_METER, DEFAULT_PUSH_EV_METER):
-            return
-
-        base_urls = [
-            self._entry_data.get(CONF_EVSE_1_BASE_URL),
-            self._entry_data.get(CONF_EVSE_2_BASE_URL),
-        ]
-        base_urls = [url for url in base_urls if url]
+        base_urls = self._configured_base_urls()
         if not base_urls:
             return
 
-        if self._options.get(CONF_PUSH_CURRENTS, DEFAULT_PUSH_CURRENTS):
-            push_every = int(self._options.get(CONF_CURRENTS_PUSH_INTERVAL, self._options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)))
-            last_push = self._parse_datetime(self._mutable.get("last_meter_push"))
-            if last_push is None or (now - last_push).total_seconds() >= push_every:
-                params = {
-                    "L1": self._deciamps(self._state_float(self._entry_data[CONF_MAINS_L1_ENTITY])),
-                    "L2": self._deciamps(self._state_float(self._entry_data[CONF_MAINS_L2_ENTITY])),
-                    "L3": self._deciamps(self._state_float(self._entry_data[CONF_MAINS_L3_ENTITY])),
-                }
-                for base_url in base_urls:
-                    await self._async_post(urljoin(self._normalize_url(base_url), "currents"), params=params)
-                self._mutable["last_meter_push"] = now.isoformat()
+        params = {
+            "L1": self._deciamps(self._state_float(self._entry_data[CONF_MAINS_L1_ENTITY])),
+            "L2": self._deciamps(self._state_float(self._entry_data[CONF_MAINS_L2_ENTITY])),
+            "L3": self._deciamps(self._state_float(self._entry_data[CONF_MAINS_L3_ENTITY])),
+        }
+        results = await asyncio.gather(
+            *(self._async_post(urljoin(self._normalize_url(base_url), "currents"), params=params) for base_url in base_urls)
+        )
+        if results and all(results):
+            self._mutable["last_meter_push"] = dt_util.utcnow().isoformat()
 
-        if self._options.get(CONF_PUSH_EV_METER, DEFAULT_PUSH_EV_METER):
-            push_every = int(self._options.get(CONF_EV_METER_PUSH_INTERVAL, self._options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL) * 2))
-            last_push = self._parse_datetime(self._mutable.get("last_ev_meter_push"))
-            if last_push is None or (now - last_push).total_seconds() >= push_every:
-                params = {
-                    "L1": self._deciamps(self._state_float(self._entry_data[CONF_EV_METER_L1_ENTITY])),
-                    "L2": self._deciamps(self._state_float(self._entry_data[CONF_EV_METER_L2_ENTITY])),
-                    "L3": self._deciamps(self._state_float(self._entry_data[CONF_EV_METER_L3_ENTITY])),
-                    "import_active_power": int(round(self._state_float(self._entry_data[CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY]))),
-                    "import_active_energy": int(round(self._state_float(self._entry_data.get(CONF_EV_METER_IMPORT_ACTIVE_ENERGY_ENTITY)) * 1000)),
-                    "export_active_energy": int(round(self._state_float(self._entry_data.get(CONF_EV_METER_EXPORT_ACTIVE_ENERGY_ENTITY)) * 1000)),
-                }
-                for base_url in base_urls:
-                    await self._async_post(urljoin(self._normalize_url(base_url), "ev_meter"), params=params)
-                self._mutable["last_ev_meter_push"] = now.isoformat()
+    async def async_push_ev_meter(self) -> None:
+        """Push EV meter data to both SmartEVSE devices."""
+        if not self._options.get(CONF_PUSH_EV_METER, DEFAULT_PUSH_EV_METER):
+            return
+        base_urls = self._configured_base_urls()
+        if not base_urls:
+            return
 
-    async def _maybe_push_wled(self, *, evse_1: EVSEStatus, evse_2: EVSEStatus) -> None:
+        params = {
+            "L1": self._deciamps(self._state_float(self._entry_data[CONF_EV_METER_L1_ENTITY])),
+            "L2": self._deciamps(self._state_float(self._entry_data[CONF_EV_METER_L2_ENTITY])),
+            "L3": self._deciamps(self._state_float(self._entry_data[CONF_EV_METER_L3_ENTITY])),
+            "import_active_power": int(round(self._state_float(self._entry_data[CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY]))),
+            "import_active_energy": int(round(self._state_float(self._entry_data.get(CONF_EV_METER_IMPORT_ACTIVE_ENERGY_ENTITY)) * 1000)),
+            "export_active_energy": int(round(self._state_float(self._entry_data.get(CONF_EV_METER_EXPORT_ACTIVE_ENERGY_ENTITY)) * 1000)),
+        }
+        results = await asyncio.gather(
+            *(self._async_post(urljoin(self._normalize_url(base_url), "ev_meter"), params=params) for base_url in base_urls)
+        )
+        if results and all(results):
+            self._mutable["last_ev_meter_push"] = dt_util.utcnow().isoformat()
+
+    def _configured_base_urls(self) -> list[str]:
+        """Return configured SmartEVSE base URLs."""
+        return [
+            url
+            for url in (
+                self._entry_data.get(CONF_SMARTEVSE_1_BASE_URL),
+                self._entry_data.get(CONF_SMARTEVSE_2_BASE_URL),
+            )
+            if url
+        ]
+
+    async def _maybe_push_wled(self, *, smartevse_1: SmartEVSEStatus, smartevse_2: SmartEVSEStatus) -> None:
         """Update WLED split segments if configured."""
         if not self._options.get(CONF_PUSH_WLED, DEFAULT_PUSH_WLED):
             return
@@ -559,55 +727,22 @@ class SmartEVSEDualChargerController:
         if not wled_url:
             return
 
-        payload = self._build_wled_payload(evse_1=evse_1, evse_2=evse_2)
+        payload = self._build_wled_payload(smartevse_1=smartevse_1, smartevse_2=smartevse_2)
         if payload == self._last_wled_payload:
             return
 
-        await self._async_post(self._normalize_wled_url(wled_url), json_payload=payload)
-        self._last_wled_payload = payload
-        self._mutable["last_wled_push"] = dt_util.utcnow().isoformat()
+        if await self._async_post(normalize_wled_state_url(wled_url), json_payload=payload):
+            self._last_wled_payload = payload
+            self._mutable["last_wled_push"] = dt_util.utcnow().isoformat()
 
-    def _build_wled_payload(self, *, evse_1: EVSEStatus, evse_2: EVSEStatus) -> dict[str, Any]:
+    def _build_wled_payload(
+        self,
+        *,
+        smartevse_1: SmartEVSEStatus,
+        smartevse_2: SmartEVSEStatus,
+    ) -> dict[str, Any]:
         """Create the WLED payload."""
-        def has_error(status: EVSEStatus) -> bool:
-            return status.connected and status.error not in {"NONE", "None", "unknown", "unavailable", ""}
-
-        def segment(segment_id: int, start: int, stop: int, status: EVSEStatus) -> dict[str, Any]:
-            if not status.connected:
-                return {"id": segment_id, "start": start, "stop": stop, "on": False}
-            if status.state == "Charging":
-                return {"id": segment_id, "start": start, "stop": stop, "on": True, "col": [[0, 255, 0]], "fx": 28, "sx": 100, "ix": 128}
-            if status.state == "Ready to Charge":
-                return {"id": segment_id, "start": start, "stop": stop, "on": True, "col": [[0, 100, 255]], "fx": 2, "sx": 80, "ix": 128}
-            if status.state == "Connected to EV":
-                return {"id": segment_id, "start": start, "stop": stop, "on": True, "col": [[255, 160, 0]], "fx": 0}
-            if status.state == "Stop Charging":
-                return {"id": segment_id, "start": start, "stop": stop, "on": True, "col": [[255, 80, 0]], "fx": 3, "sx": 100, "ix": 128}
-            if status.state == "Charging Stopped":
-                return {"id": segment_id, "start": start, "stop": stop, "on": True, "col": [[0, 100, 255]], "fx": 2, "sx": 80, "ix": 128}
-            return {"id": segment_id, "start": start, "stop": stop, "on": True, "col": [[100, 100, 100]], "fx": 0}
-
-        if not evse_1.connected and not evse_2.connected:
-            return {"on": False, "transition": 30}
-
-        if has_error(evse_1) or has_error(evse_2):
-            return {
-                "on": True,
-                "bri": 200,
-                "seg": [
-                    {"id": 0, "start": 0, "stop": 53, "on": True, "col": [[255, 0, 0]], "fx": 2, "sx": 60, "ix": 200},
-                    {"id": 1, "start": 53, "stop": 105, "on": True, "col": [[255, 0, 0]], "fx": 2, "sx": 60, "ix": 200},
-                ],
-            }
-
-        return {
-            "on": True,
-            "bri": 128,
-            "seg": [
-                segment(0, 0, 53, evse_1),
-                segment(1, 53, 105, evse_2),
-            ],
-        }
+        return build_runtime_payload(smartevse_1=smartevse_1, smartevse_2=smartevse_2)
 
     async def _handle_schedule_notification(self, *, schedule_window_active: bool, schedule_enabled: bool) -> None:
         """Create or dismiss the schedule disabled notification."""
@@ -628,13 +763,19 @@ class SmartEVSEDualChargerController:
 
         self._mutable["last_schedule_window_active"] = schedule_window_active
 
+    def _preferred_slot(self, policy: ChargePolicy) -> str:
+        """Return the first slot for the alternating policies."""
+        if policy == ChargePolicy.SMARTEVSE_2_FIRST:
+            return "smartevse_2"
+        return "smartevse_1"
+
+    def _other_slot(self, slot: str) -> str:
+        """Return the other SmartEVSE slot."""
+        return "smartevse_2" if slot == "smartevse_1" else "smartevse_1"
+
     def _timer_until(self) -> datetime | None:
         """Return the current timer end."""
         return self._parse_datetime(self._mutable.get("timer_until"))
-
-    def _option_float(self, key: str, default: float) -> float:
-        """Return a float option."""
-        return float(self._options.get(key, default))
 
     def _state_str(self, entity_id: str | None, default: str = "") -> str:
         """Read an entity state as a string."""
@@ -661,29 +802,58 @@ class SmartEVSEDualChargerController:
         """Return whether the entity is on."""
         return self._state_str(entity_id) == "on"
 
+    def get_update_interval(self) -> int:
+        """Return the controller refresh interval in seconds."""
+        return max(1, int(self._mutable["update_interval"]))
+
+    def get_currents_push_interval(self) -> int:
+        """Return the mains current push interval in seconds."""
+        return max(1, int(self._mutable["currents_push_interval"]))
+
+    def get_ev_meter_push_interval(self) -> int:
+        """Return the EV meter push interval in seconds."""
+        return max(1, int(self._mutable["ev_meter_push_interval"]))
+
+    def _to_float(self, value: Any, default: float = 0.0) -> float:
+        """Convert an arbitrary JSON value to float."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _deciamp_to_amp(self, value: Any) -> float:
+        """Convert SmartEVSE deci-amps into amps."""
+        return self._to_float(value) / 10.0
+
     def _deciamps(self, amps: float) -> int:
         """Convert amps to SmartEVSE API deci-amps."""
         return int(round(amps * 10))
 
-    async def _async_select_option(self, entity_id: str, option: str) -> None:
-        """Call select.select_option."""
-        await self.hass.services.async_call(
-            "select",
-            "select_option",
-            {ATTR_ENTITY_ID: entity_id, "option": option},
-            blocking=True,
-            context=Context(),
-        )
+    def _normalize_mode(self, mode: Any, mode_id: Any) -> str:
+        """Normalize REST mode names into title case."""
+        if isinstance(mode, str) and mode:
+            lookup = mode.strip().upper()
+            for name in MODE_NAME_TO_ID:
+                if name.upper() == lookup:
+                    return name
+        try:
+            return MODE_ID_TO_NAME[int(mode_id)]
+        except (TypeError, ValueError, KeyError):
+            return "Unknown"
 
-    async def _async_set_number(self, entity_id: str, value: float) -> None:
-        """Call number.set_value."""
-        await self.hass.services.async_call(
-            "number",
-            "set_value",
-            {ATTR_ENTITY_ID: entity_id, "value": value},
-            blocking=True,
-            context=Context(),
-        )
+    async def _async_get_json(self, url: str) -> dict[str, Any] | None:
+        """Fetch JSON and suppress repetitive endpoint failures."""
+        endpoint_key = f"GET {url}"
+        try:
+            async with self._session.get(url, timeout=5) as response:
+                response.raise_for_status()
+                payload = await response.json(content_type=None)
+        except (TimeoutError, ClientError, ValueError) as err:
+            self._log_endpoint_failure(endpoint_key, err)
+            return None
+
+        self._clear_endpoint_failure(endpoint_key)
+        return payload if isinstance(payload, dict) else None
 
     async def _async_post(
         self,
@@ -691,13 +861,37 @@ class SmartEVSEDualChargerController:
         *,
         params: dict[str, Any] | None = None,
         json_payload: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         """Send a POST request and log failures without crashing the loop."""
+        endpoint_key = f"POST {url}"
+        request_kwargs: dict[str, Any] = {"params": params, "timeout": 5}
+        if json_payload is None:
+            request_kwargs["data"] = ""
+        else:
+            request_kwargs["json"] = json_payload
         try:
-            async with self._session.post(url, params=params, json=json_payload, timeout=5) as response:
+            async with self._session.post(url, **request_kwargs) as response:
                 response.raise_for_status()
         except (TimeoutError, ClientError) as err:
-            LOGGER.warning("POST %s failed: %s", url, err)
+            self._log_endpoint_failure(endpoint_key, err)
+            return False
+
+        self._clear_endpoint_failure(endpoint_key)
+        return True
+
+    def _log_endpoint_failure(self, endpoint_key: str, err: Exception) -> None:
+        """Log only on endpoint failure state transitions."""
+        message = str(err)
+        if self._endpoint_failures.get(endpoint_key) == message:
+            return
+        self._endpoint_failures[endpoint_key] = message
+        LOGGER.warning("%s failed: %s", endpoint_key, message)
+
+    def _clear_endpoint_failure(self, endpoint_key: str) -> None:
+        """Clear endpoint failure tracking after recovery."""
+        if endpoint_key in self._endpoint_failures:
+            LOGGER.info("%s recovered", endpoint_key)
+            self._endpoint_failures.pop(endpoint_key, None)
 
     async def _async_save_state(self) -> None:
         """Persist mutable controller state."""
@@ -723,12 +917,3 @@ class SmartEVSEDualChargerController:
         if not normalized.endswith("/"):
             normalized = f"{normalized}/"
         return normalized
-
-    def _normalize_wled_url(self, base_url: str) -> str:
-        """Normalize a WLED endpoint URL."""
-        normalized = base_url.strip()
-        if not normalized.startswith(("http://", "https://")):
-            normalized = f"http://{normalized}"
-        if normalized.endswith("/json/state"):
-            return normalized
-        return urljoin(self._normalize_url(normalized), "json/state")

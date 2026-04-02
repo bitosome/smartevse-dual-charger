@@ -7,15 +7,15 @@ from typing import Any
 from homeassistant.components.diagnostics import async_redact_data
 
 from .const import (
-    CONF_EVSE_1_BASE_URL,
-    CONF_EVSE_2_BASE_URL,
+    CONF_SMARTEVSE_1_BASE_URL,
+    CONF_SMARTEVSE_2_BASE_URL,
     CONF_WLED_URL,
 )
 from .data import SmartEVSEDualChargerConfigEntry
 
 TO_REDACT = {
-    CONF_EVSE_1_BASE_URL,
-    CONF_EVSE_2_BASE_URL,
+    CONF_SMARTEVSE_1_BASE_URL,
+    CONF_SMARTEVSE_2_BASE_URL,
     CONF_WLED_URL,
 }
 

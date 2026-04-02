@@ -9,12 +9,11 @@ refresh:
         text:
 
 reset_sessions:
-  name: Reset session tracking
-  description: Clear the internal session-complete flags for both EVSEs.
+  name: Reset charge cycle
+  description: Clear the active SmartEVSE duty-cycle slot so the current charge policy restarts immediately.
   fields:
     entry_id:
       required: false
       example: "abcd1234"
       selector:
         text:
-

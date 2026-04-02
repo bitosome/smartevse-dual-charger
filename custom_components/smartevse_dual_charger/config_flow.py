@@ -12,20 +12,9 @@ from homeassistant.core import callback
 from homeassistant.helpers import selector
 
 from .const import (
-    CONF_ACTIVE_MODE,
+    CONF_CHARGE_POLICY_DEFAULT,
     CONF_CURRENTS_PUSH_INTERVAL,
-    CONF_EVSE_1_BASE_URL,
-    CONF_EVSE_1_ERROR_ENTITY,
-    CONF_EVSE_1_MODE_ENTITY,
-    CONF_EVSE_1_OVERRIDE_ENTITY,
-    CONF_EVSE_1_PLUG_ENTITY,
-    CONF_EVSE_1_STATE_ENTITY,
-    CONF_EVSE_2_BASE_URL,
-    CONF_EVSE_2_ERROR_ENTITY,
-    CONF_EVSE_2_MODE_ENTITY,
-    CONF_EVSE_2_OVERRIDE_ENTITY,
-    CONF_EVSE_2_PLUG_ENTITY,
-    CONF_EVSE_2_STATE_ENTITY,
+    CONF_DUTY_CYCLE_MINUTES,
     CONF_EV_METER_EXPORT_ACTIVE_ENERGY_ENTITY,
     CONF_EV_METER_IMPORT_ACTIVE_ENERGY_ENTITY,
     CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY,
@@ -33,36 +22,54 @@ from .const import (
     CONF_EV_METER_L2_ENTITY,
     CONF_EV_METER_L3_ENTITY,
     CONF_EV_METER_PUSH_INTERVAL,
-    CONF_LOW_BUDGET_POLICY_DEFAULT,
     CONF_MAINS_L1_ENTITY,
     CONF_MAINS_L2_ENTITY,
     CONF_MAINS_L3_ENTITY,
     CONF_NOTIFY_ON_SCHEDULE_WINDOW,
-    CONF_OVERRIDE_DEADBAND,
     CONF_PRICE_SENSOR_ENTITY,
     CONF_PUSH_CURRENTS,
     CONF_PUSH_EV_METER,
     CONF_PUSH_WLED,
+    CONF_RECREATE_WLED_PRESETS,
     CONF_SCHEDULE_ENTITY,
-    CONF_TOTAL_CURRENT_LIMIT,
+    CONF_SMARTEVSE_1_BASE_URL,
+    CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
     CONF_WLED_URL,
-    DEFAULT_ACTIVE_MODE,
-    DEFAULT_LOW_BUDGET_POLICY,
+    DEFAULT_CHARGE_POLICY,
+    DEFAULT_CURRENTS_PUSH_INTERVAL,
+    DEFAULT_DUTY_CYCLE_MINUTES,
+    DEFAULT_EV_METER_PUSH_INTERVAL,
     DEFAULT_NAME,
     DEFAULT_NOTIFY_ON_SCHEDULE_WINDOW,
-    DEFAULT_OVERRIDE_DEADBAND,
     DEFAULT_PUSH_CURRENTS,
     DEFAULT_PUSH_EV_METER,
     DEFAULT_PUSH_WLED,
-    DEFAULT_TOTAL_CURRENT_LIMIT,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
-    LowBudgetPolicy,
+    LOGGER,
+    ChargePolicy,
 )
+from .wled import WLEDPresetError, async_recreate_wled_assets, normalize_wled_base_url
 
-ACTIVE_MODE_OPTIONS = ["Normal", "Smart"]
-LOW_BUDGET_POLICY_OPTIONS = [policy.value for policy in LowBudgetPolicy]
+CHARGE_POLICY_OPTIONS = [policy.value for policy in ChargePolicy]
+LEGACY_DEFAULTS: dict[str, Any] = {
+    CONF_NAME: DEFAULT_NAME,
+    CONF_SMARTEVSE_1_BASE_URL: "192.168.0.234",
+    CONF_SMARTEVSE_2_BASE_URL: "192.168.0.44",
+    CONF_WLED_URL: "192.168.0.81",
+    CONF_MAINS_L1_ENTITY: "sensor.shelly_pro_3em_1_phase_a_current",
+    CONF_MAINS_L2_ENTITY: "sensor.shelly_pro_3em_1_phase_b_current",
+    CONF_MAINS_L3_ENTITY: "sensor.shelly_pro_3em_1_phase_c_current",
+    CONF_EV_METER_L1_ENTITY: "sensor.shelly_pro_3em_2_phase_a_current",
+    CONF_EV_METER_L2_ENTITY: "sensor.shelly_pro_3em_2_phase_b_current",
+    CONF_EV_METER_L3_ENTITY: "sensor.shelly_pro_3em_2_phase_c_current",
+    CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY: "sensor.shelly_pro_3em_2_total_active_power",
+    CONF_EV_METER_IMPORT_ACTIVE_ENERGY_ENTITY: "sensor.shelly_pro_3em_2_total_active_energy",
+    CONF_EV_METER_EXPORT_ACTIVE_ENERGY_ENTITY: "sensor.shelly_pro_3em_2_total_active_returned_energy",
+    CONF_PRICE_SENSOR_ENTITY: "sensor.real_electricity_price_current_price",
+    CONF_SCHEDULE_ENTITY: "schedule.charge_schedule",
+}
 
 
 def _entity_selector(domain: str) -> selector.EntitySelector:
@@ -76,7 +83,7 @@ def _entity_selector(domain: str) -> selector.EntitySelector:
 
 
 def _url_or_host(value: str) -> str:
-    """Validate a URL or host-like input."""
+    """Validate a URL/IP or host-like input."""
     normalized = value.strip()
     if not normalized:
         raise vol.Invalid("empty")
@@ -86,29 +93,70 @@ def _url_or_host(value: str) -> str:
     return normalized
 
 
+def _wled_url_or_host(value: str) -> str:
+    """Validate and normalize a WLED URL/IP to its base URL."""
+    return normalize_wled_base_url(_url_or_host(value)).removesuffix("/")
+
+
+def _optional_entity_default(values: dict[str, Any], key: str) -> str | None:
+    """Return a selector-friendly default for optional entity fields."""
+    value = values.get(key)
+    return value or None
+
+
 class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a SmartEVSE Dual Charger config flow."""
 
     VERSION = 1
+
+    def __init__(self) -> None:
+        """Initialize config flow state."""
+        self._progress_task = None
+        self._pending_user_input: dict[str, Any] | None = None
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
         """Handle the initial step."""
         if self._async_current_entries():
             return self.async_abort(reason="already_configured")
 
+        if self._progress_task is not None:
+            if not self._progress_task.done():
+                return self.async_show_progress(
+                    step_id="user",
+                    progress_action=CONF_RECREATE_WLED_PRESETS,
+                    progress_task=self._progress_task,
+                )
+            return self.async_show_progress_done(next_step_id="finish_user_wled")
+
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
-                user_input[CONF_EVSE_1_BASE_URL] = _url_or_host(user_input[CONF_EVSE_1_BASE_URL])
-                user_input[CONF_EVSE_2_BASE_URL] = _url_or_host(user_input[CONF_EVSE_2_BASE_URL])
-                if user_input.get(CONF_WLED_URL):
-                    user_input[CONF_WLED_URL] = _url_or_host(user_input[CONF_WLED_URL])
-                await self.async_set_unique_id(DOMAIN)
-                self._abort_if_unique_id_configured()
-                return self.async_create_entry(
-                    title=user_input[CONF_NAME],
-                    data=user_input,
-                )
+                form_data = dict(user_input)
+                recreate_wled_presets = bool(form_data.pop(CONF_RECREATE_WLED_PRESETS, False))
+                form_data[CONF_SMARTEVSE_1_BASE_URL] = _url_or_host(form_data[CONF_SMARTEVSE_1_BASE_URL])
+                form_data[CONF_SMARTEVSE_2_BASE_URL] = _url_or_host(form_data[CONF_SMARTEVSE_2_BASE_URL])
+                if form_data.get(CONF_WLED_URL):
+                    form_data[CONF_WLED_URL] = _wled_url_or_host(form_data[CONF_WLED_URL])
+                if recreate_wled_presets:
+                    if not form_data.get(CONF_WLED_URL):
+                        errors["base"] = "wled_url_required"
+                    else:
+                        self._pending_user_input = form_data
+                        self._progress_task = self.hass.async_create_task(
+                            async_recreate_wled_assets(self.hass, form_data[CONF_WLED_URL])
+                        )
+                        return self.async_show_progress(
+                            step_id="user",
+                            progress_action=CONF_RECREATE_WLED_PRESETS,
+                            progress_task=self._progress_task,
+                        )
+                if not errors:
+                    await self.async_set_unique_id(DOMAIN)
+                    self._abort_if_unique_id_configured()
+                    return self.async_create_entry(
+                        title=form_data[CONF_NAME],
+                        data=form_data,
+                    )
             except vol.Invalid:
                 errors["base"] = "invalid_url"
 
@@ -116,6 +164,45 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=self._build_user_schema(user_input),
             errors=errors,
+        )
+
+    async def async_step_finish_user_wled(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
+        """Finish the WLED preset recreation task before creating the entry."""
+        assert user_input is None
+        progress_task = self._progress_task
+        pending_user_input = self._pending_user_input
+        self._progress_task = None
+        self._pending_user_input = None
+
+        if progress_task is None or pending_user_input is None:
+            return await self.async_step_user()
+
+        try:
+            await progress_task
+        except WLEDPresetError as err:
+            LOGGER.warning("WLED preset recreation failed during initial setup: %s", err)
+            values = dict(pending_user_input)
+            values[CONF_RECREATE_WLED_PRESETS] = True
+            return self.async_show_form(
+                step_id="user",
+                data_schema=self._build_user_schema(values),
+                errors={"base": "wled_preset_setup_failed"},
+            )
+        except Exception:
+            LOGGER.exception("Unexpected error during initial WLED preset recreation")
+            values = dict(pending_user_input)
+            values[CONF_RECREATE_WLED_PRESETS] = True
+            return self.async_show_form(
+                step_id="user",
+                data_schema=self._build_user_schema(values),
+                errors={"base": "wled_preset_setup_failed"},
+            )
+
+        await self.async_set_unique_id(DOMAIN)
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(
+            title=pending_user_input[CONF_NAME],
+            data=pending_user_input,
         )
 
     @staticmethod
@@ -126,34 +213,43 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     def _build_user_schema(self, user_input: dict[str, Any] | None) -> vol.Schema:
         """Build the user step schema."""
-        user_input = user_input or {}
+        user_input = {**LEGACY_DEFAULTS, **(user_input or {})}
         return vol.Schema(
             {
                 vol.Required(CONF_NAME, default=user_input.get(CONF_NAME, DEFAULT_NAME)): selector.TextSelector(),
-                vol.Required(CONF_EVSE_1_BASE_URL, default=user_input.get(CONF_EVSE_1_BASE_URL, "")): selector.TextSelector(),
-                vol.Required(CONF_EVSE_2_BASE_URL, default=user_input.get(CONF_EVSE_2_BASE_URL, "")): selector.TextSelector(),
+                vol.Required(CONF_SMARTEVSE_1_BASE_URL, default=user_input.get(CONF_SMARTEVSE_1_BASE_URL, "")): selector.TextSelector(),
+                vol.Required(CONF_SMARTEVSE_2_BASE_URL, default=user_input.get(CONF_SMARTEVSE_2_BASE_URL, "")): selector.TextSelector(),
                 vol.Optional(CONF_WLED_URL, default=user_input.get(CONF_WLED_URL, "")): selector.TextSelector(),
-                vol.Required(CONF_EVSE_1_STATE_ENTITY, default=user_input.get(CONF_EVSE_1_STATE_ENTITY, "")): _entity_selector("sensor"),
-                vol.Required(CONF_EVSE_1_PLUG_ENTITY, default=user_input.get(CONF_EVSE_1_PLUG_ENTITY, "")): _entity_selector("sensor"),
-                vol.Required(CONF_EVSE_1_MODE_ENTITY, default=user_input.get(CONF_EVSE_1_MODE_ENTITY, "")): _entity_selector("select"),
-                vol.Required(CONF_EVSE_1_OVERRIDE_ENTITY, default=user_input.get(CONF_EVSE_1_OVERRIDE_ENTITY, "")): _entity_selector("number"),
-                vol.Optional(CONF_EVSE_1_ERROR_ENTITY, default=user_input.get(CONF_EVSE_1_ERROR_ENTITY, "")): _entity_selector("sensor"),
-                vol.Required(CONF_EVSE_2_STATE_ENTITY, default=user_input.get(CONF_EVSE_2_STATE_ENTITY, "")): _entity_selector("sensor"),
-                vol.Required(CONF_EVSE_2_PLUG_ENTITY, default=user_input.get(CONF_EVSE_2_PLUG_ENTITY, "")): _entity_selector("sensor"),
-                vol.Required(CONF_EVSE_2_MODE_ENTITY, default=user_input.get(CONF_EVSE_2_MODE_ENTITY, "")): _entity_selector("select"),
-                vol.Required(CONF_EVSE_2_OVERRIDE_ENTITY, default=user_input.get(CONF_EVSE_2_OVERRIDE_ENTITY, "")): _entity_selector("number"),
-                vol.Optional(CONF_EVSE_2_ERROR_ENTITY, default=user_input.get(CONF_EVSE_2_ERROR_ENTITY, "")): _entity_selector("sensor"),
+                vol.Required(
+                    CONF_RECREATE_WLED_PRESETS,
+                    default=bool(user_input.get(CONF_RECREATE_WLED_PRESETS, False)),
+                ): selector.BooleanSelector(),
                 vol.Required(CONF_MAINS_L1_ENTITY, default=user_input.get(CONF_MAINS_L1_ENTITY, "")): _entity_selector("sensor"),
                 vol.Required(CONF_MAINS_L2_ENTITY, default=user_input.get(CONF_MAINS_L2_ENTITY, "")): _entity_selector("sensor"),
                 vol.Required(CONF_MAINS_L3_ENTITY, default=user_input.get(CONF_MAINS_L3_ENTITY, "")): _entity_selector("sensor"),
                 vol.Required(CONF_EV_METER_L1_ENTITY, default=user_input.get(CONF_EV_METER_L1_ENTITY, "")): _entity_selector("sensor"),
                 vol.Required(CONF_EV_METER_L2_ENTITY, default=user_input.get(CONF_EV_METER_L2_ENTITY, "")): _entity_selector("sensor"),
                 vol.Required(CONF_EV_METER_L3_ENTITY, default=user_input.get(CONF_EV_METER_L3_ENTITY, "")): _entity_selector("sensor"),
-                vol.Required(CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY, default=user_input.get(CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY, "")): _entity_selector("sensor"),
-                vol.Optional(CONF_EV_METER_IMPORT_ACTIVE_ENERGY_ENTITY, default=user_input.get(CONF_EV_METER_IMPORT_ACTIVE_ENERGY_ENTITY, "")): _entity_selector("sensor"),
-                vol.Optional(CONF_EV_METER_EXPORT_ACTIVE_ENERGY_ENTITY, default=user_input.get(CONF_EV_METER_EXPORT_ACTIVE_ENERGY_ENTITY, "")): _entity_selector("sensor"),
-                vol.Optional(CONF_PRICE_SENSOR_ENTITY, default=user_input.get(CONF_PRICE_SENSOR_ENTITY, "")): _entity_selector("sensor"),
-                vol.Optional(CONF_SCHEDULE_ENTITY, default=user_input.get(CONF_SCHEDULE_ENTITY, "")): _entity_selector("schedule"),
+                vol.Required(
+                    CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY,
+                    default=user_input.get(CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY, ""),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_EV_METER_IMPORT_ACTIVE_ENERGY_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_EV_METER_IMPORT_ACTIVE_ENERGY_ENTITY),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_EV_METER_EXPORT_ACTIVE_ENERGY_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_EV_METER_EXPORT_ACTIVE_ENERGY_ENTITY),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_PRICE_SENSOR_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_PRICE_SENSOR_ENTITY),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_SCHEDULE_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_SCHEDULE_ENTITY),
+                ): _entity_selector("schedule"),
             }
         )
 
@@ -164,87 +260,199 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize options flow."""
         self._config_entry = config_entry
+        self._progress_task = None
+        self._pending_options: dict[str, Any] | None = None
+
+    def _current_value(self, key: str, fallback: Any) -> Any:
+        """Prefer live runtime values when the entry is loaded."""
+        if hasattr(self._config_entry, "runtime_data"):
+            return self._config_entry.runtime_data.coordinator.data.get(key, fallback)
+        return fallback
+
+    def _build_options_schema(self, values: dict[str, Any]) -> vol.Schema:
+        """Build the options step schema."""
+        return vol.Schema(
+            {
+                vol.Required(
+                    CONF_CHARGE_POLICY_DEFAULT,
+                    default=values.get(
+                        CONF_CHARGE_POLICY_DEFAULT,
+                        self._current_value(
+                            "charge_policy",
+                            DEFAULT_CHARGE_POLICY,
+                        ),
+                    ),
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=CHARGE_POLICY_OPTIONS,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                        translation_key=CONF_CHARGE_POLICY_DEFAULT,
+                    )
+                ),
+                vol.Required(
+                    CONF_DUTY_CYCLE_MINUTES,
+                    default=values.get(
+                        CONF_DUTY_CYCLE_MINUTES,
+                        self._current_value(
+                            CONF_DUTY_CYCLE_MINUTES,
+                            DEFAULT_DUTY_CYCLE_MINUTES,
+                        ),
+                    ),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=1,
+                        max=720,
+                        step=1,
+                        mode=selector.NumberSelectorMode.BOX,
+                        unit_of_measurement="min",
+                    )
+                ),
+                vol.Required(
+                    CONF_UPDATE_INTERVAL,
+                    default=values.get(
+                        CONF_UPDATE_INTERVAL,
+                        self._current_value(
+                            CONF_UPDATE_INTERVAL,
+                            DEFAULT_UPDATE_INTERVAL,
+                        ),
+                    ),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=1,
+                        max=60,
+                        step=1,
+                        mode=selector.NumberSelectorMode.BOX,
+                        unit_of_measurement="s",
+                    )
+                ),
+                vol.Required(
+                    CONF_PUSH_CURRENTS,
+                    default=values.get(CONF_PUSH_CURRENTS, DEFAULT_PUSH_CURRENTS),
+                ): selector.BooleanSelector(),
+                vol.Required(
+                    CONF_CURRENTS_PUSH_INTERVAL,
+                    default=values.get(
+                        CONF_CURRENTS_PUSH_INTERVAL,
+                        self._current_value(
+                            CONF_CURRENTS_PUSH_INTERVAL,
+                            DEFAULT_CURRENTS_PUSH_INTERVAL,
+                        ),
+                    ),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=1,
+                        max=300,
+                        step=1,
+                        mode=selector.NumberSelectorMode.BOX,
+                        unit_of_measurement="s",
+                    )
+                ),
+                vol.Required(
+                    CONF_PUSH_EV_METER,
+                    default=values.get(CONF_PUSH_EV_METER, DEFAULT_PUSH_EV_METER),
+                ): selector.BooleanSelector(),
+                vol.Required(
+                    CONF_EV_METER_PUSH_INTERVAL,
+                    default=values.get(
+                        CONF_EV_METER_PUSH_INTERVAL,
+                        self._current_value(
+                            CONF_EV_METER_PUSH_INTERVAL,
+                            DEFAULT_EV_METER_PUSH_INTERVAL,
+                        ),
+                    ),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=1,
+                        max=300,
+                        step=1,
+                        mode=selector.NumberSelectorMode.BOX,
+                        unit_of_measurement="s",
+                    )
+                ),
+                vol.Required(
+                    CONF_PUSH_WLED,
+                    default=values.get(CONF_PUSH_WLED, DEFAULT_PUSH_WLED),
+                ): selector.BooleanSelector(),
+                vol.Required(
+                    CONF_RECREATE_WLED_PRESETS,
+                    default=bool(values.get(CONF_RECREATE_WLED_PRESETS, False)),
+                ): selector.BooleanSelector(),
+                vol.Required(
+                    CONF_NOTIFY_ON_SCHEDULE_WINDOW,
+                    default=values.get(CONF_NOTIFY_ON_SCHEDULE_WINDOW, DEFAULT_NOTIFY_ON_SCHEDULE_WINDOW),
+                ): selector.BooleanSelector(),
+            }
+        )
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
         """Manage options."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+        if self._progress_task is not None:
+            if not self._progress_task.done():
+                return self.async_show_progress(
+                    step_id="init",
+                    progress_action=CONF_RECREATE_WLED_PRESETS,
+                    progress_task=self._progress_task,
+                )
+            return self.async_show_progress_done(next_step_id="finish_wled")
 
-        options = {**self._config_entry.options}
+        base_values = {**self._config_entry.data, **self._config_entry.options}
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            options_data = dict(user_input)
+            recreate_wled_presets = bool(options_data.pop(CONF_RECREATE_WLED_PRESETS, False))
+            if recreate_wled_presets:
+                wled_url = self._config_entry.data.get(CONF_WLED_URL)
+                if not wled_url:
+                    errors["base"] = "wled_url_required"
+                else:
+                    self._pending_options = options_data
+                    self._progress_task = self.hass.async_create_task(
+                        async_recreate_wled_assets(self.hass, wled_url)
+                    )
+                    return self.async_show_progress(
+                        step_id="init",
+                        progress_action=CONF_RECREATE_WLED_PRESETS,
+                        progress_task=self._progress_task,
+                    )
+
+            if not errors:
+                return self.async_create_entry(title="", data=options_data)
+
+            base_values.update(user_input)
+
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_ACTIVE_MODE, default=options.get(CONF_ACTIVE_MODE, DEFAULT_ACTIVE_MODE)): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=ACTIVE_MODE_OPTIONS,
-                            mode=selector.SelectSelectorMode.DROPDOWN,
-                        )
-                    ),
-                    vol.Required(CONF_TOTAL_CURRENT_LIMIT, default=options.get(CONF_TOTAL_CURRENT_LIMIT, DEFAULT_TOTAL_CURRENT_LIMIT)): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=6,
-                            max=80,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    ),
-                    vol.Required("min_current", default=options.get("min_current", 6)): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=6,
-                            max=16,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    ),
-                    vol.Required(CONF_UPDATE_INTERVAL, default=options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=5,
-                            max=60,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                            unit_of_measurement="s",
-                        )
-                    ),
-                    vol.Required(CONF_OVERRIDE_DEADBAND, default=options.get(CONF_OVERRIDE_DEADBAND, DEFAULT_OVERRIDE_DEADBAND)): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=0,
-                            max=6,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                            unit_of_measurement="A",
-                        )
-                    ),
-                    vol.Required(CONF_LOW_BUDGET_POLICY_DEFAULT, default=options.get(CONF_LOW_BUDGET_POLICY_DEFAULT, DEFAULT_LOW_BUDGET_POLICY)): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=LOW_BUDGET_POLICY_OPTIONS,
-                            mode=selector.SelectSelectorMode.DROPDOWN,
-                            translation_key=CONF_LOW_BUDGET_POLICY_DEFAULT,
-                        )
-                    ),
-                    vol.Required(CONF_PUSH_CURRENTS, default=options.get(CONF_PUSH_CURRENTS, DEFAULT_PUSH_CURRENTS)): selector.BooleanSelector(),
-                    vol.Required(CONF_CURRENTS_PUSH_INTERVAL, default=options.get(CONF_CURRENTS_PUSH_INTERVAL, 10)): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=5,
-                            max=300,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                            unit_of_measurement="s",
-                        )
-                    ),
-                    vol.Required(CONF_PUSH_EV_METER, default=options.get(CONF_PUSH_EV_METER, DEFAULT_PUSH_EV_METER)): selector.BooleanSelector(),
-                    vol.Required(CONF_EV_METER_PUSH_INTERVAL, default=options.get(CONF_EV_METER_PUSH_INTERVAL, 20)): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=5,
-                            max=300,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                            unit_of_measurement="s",
-                        )
-                    ),
-                    vol.Required(CONF_PUSH_WLED, default=options.get(CONF_PUSH_WLED, DEFAULT_PUSH_WLED)): selector.BooleanSelector(),
-                    vol.Required(CONF_NOTIFY_ON_SCHEDULE_WINDOW, default=options.get(CONF_NOTIFY_ON_SCHEDULE_WINDOW, DEFAULT_NOTIFY_ON_SCHEDULE_WINDOW)): selector.BooleanSelector(),
-                }
-            ),
+            data_schema=self._build_options_schema(base_values),
+            errors=errors,
         )
 
+    async def async_step_finish_wled(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
+        """Finish the WLED preset recreation task before saving options."""
+        assert user_input is None
+        progress_task = self._progress_task
+        pending_options = self._pending_options or {**self._config_entry.options}
+        self._progress_task = None
+        self._pending_options = None
+
+        if progress_task is None:
+            return await self.async_step_init()
+
+        try:
+            await progress_task
+        except WLEDPresetError as err:
+            LOGGER.warning("WLED preset recreation failed: %s", err)
+            return self.async_show_form(
+                step_id="init",
+                data_schema=self._build_options_schema(pending_options),
+                errors={"base": "wled_preset_setup_failed"},
+            )
+        except Exception:
+            LOGGER.exception("Unexpected error during WLED preset recreation")
+            return self.async_show_form(
+                step_id="init",
+                data_schema=self._build_options_schema(pending_options),
+                errors={"base": "wled_preset_setup_failed"},
+            )
+
+        return self.async_create_entry(title="", data=pending_options)
