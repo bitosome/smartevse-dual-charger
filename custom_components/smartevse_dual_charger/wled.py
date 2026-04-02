@@ -12,7 +12,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 WLED_LED_COUNT = 105
 WLED_SEGMENT_SPLIT = 53
-WLED_LED_OFFSET = 10
+WLED_LED_OFFSET = 11
 WLED_LED_MAP_ID = 0
 WLED_PRESET_NAME_PREFIX = "SmartEVSE "
 WLED_PRESET_ID_START = 101
@@ -56,8 +56,8 @@ def normalize_wled_state_url(base_url: str) -> str:
 def build_runtime_payload(*, smartevse_1: Any, smartevse_2: Any) -> dict[str, Any]:
     """Build the live WLED payload for both SmartEVSE segments."""
     segments = [
-        _segment_for_status("smartevse_2", smartevse_2),
-        _segment_for_status("smartevse_1", smartevse_1),
+        _segment_for_smartevse_status("smartevse_2", smartevse_2),
+        _segment_for_smartevse_status("smartevse_1", smartevse_1),
     ]
 
     if not getattr(smartevse_1, "connected", False) and not getattr(smartevse_2, "connected", False):
@@ -113,16 +113,16 @@ async def async_recreate_wled_assets(hass: HomeAssistant, wled_url: str) -> None
     )
 
 
-def _segment_for_status(slot: str, status: Any) -> dict[str, Any]:
+def _segment_for_smartevse_status(smartevse_key: str, status: Any) -> dict[str, Any]:
     """Return the runtime segment payload for one SmartEVSE."""
     if not getattr(status, "connected", False):
-        return _segment_visual(slot, "off")
+        return _segment_visual(smartevse_key, "off")
     if _has_error(status):
-        return _segment_visual(slot, "error")
+        return _segment_visual(smartevse_key, "error")
     state = str(getattr(status, "state", "") or "")
     if state == "Charging":
-        return _segment_visual(slot, "charging")
-    return _segment_visual(slot, "idle")
+        return _segment_visual(smartevse_key, "charging")
+    return _segment_visual(smartevse_key, "idle")
 
 
 def _has_error(status: Any) -> bool:
@@ -133,9 +133,9 @@ def _has_error(status: Any) -> bool:
     return error not in {"NONE", "None", "unknown", "unavailable", ""}
 
 
-def _slot_segment(slot: str) -> tuple[int, int, int]:
-    """Return the WLED segment geometry for one SmartEVSE slot."""
-    if slot == "smartevse_1":
+def _smartevse_segment(smartevse_key: str) -> tuple[int, int, int]:
+    """Return the WLED segment geometry for one SmartEVSE."""
+    if smartevse_key == "smartevse_1":
         return 0, *RIGHT_SEGMENT
     return 1, *LEFT_SEGMENT
 
@@ -304,9 +304,9 @@ def _combined_preset(smartevse_1_visual: str, smartevse_2_visual: str) -> dict[s
     return {**_base_preset_payload(), "seg": segments}
 
 
-def _segment_visual(slot: str, visual: str) -> dict[str, Any]:
-    """Return the WLED payload for one slot visual state."""
-    segment_id, start, stop = _slot_segment(slot)
+def _segment_visual(smartevse_key: str, visual: str) -> dict[str, Any]:
+    """Return the WLED payload for one SmartEVSE visual state."""
+    segment_id, start, stop = _smartevse_segment(smartevse_key)
     if visual == "off":
         return {"id": segment_id, "start": start, "stop": stop, "on": False}
     if visual == "error":
@@ -330,7 +330,7 @@ def _segment_visual(slot: str, visual: str) -> dict[str, Any]:
             "fx": 28,
             "sx": 100,
             "ix": 128,
-            "rev": slot == "smartevse_1",
+            "rev": smartevse_key == "smartevse_1",
         }
     return {
         "id": segment_id,

@@ -10,10 +10,11 @@ from homeassistant.const import UnitOfElectricCurrent, UnitOfTime
 from homeassistant.core import HomeAssistant
 
 from .const import (
-    ATTR_ACTIVE_CHARGE_SLOT,
-    ATTR_ACTIVE_CHARGE_SLOT_SINCE,
+    ATTR_ACTIVE_SMARTEVSE,
+    ATTR_ACTIVE_SMARTEVSE_SINCE,
     ATTR_CHARGE_ALLOWED,
     ATTR_CHARGE_REASON,
+    ATTR_CONTROLLER_ERROR,
     ATTR_CONTROLLER_STATE,
     ATTR_DUTY_CYCLE_REMAINING,
     ATTR_LAST_CYCLE_REASON,
@@ -48,9 +49,14 @@ SENSOR_DESCRIPTIONS: tuple[ControllerSensorDescription, ...] = (
         value_key=ATTR_CHARGE_REASON,
     ),
     ControllerSensorDescription(
-        key="active_charge_slot",
-        translation_key="active_charge_slot",
-        value_key=ATTR_ACTIVE_CHARGE_SLOT,
+        key="controller_error",
+        translation_key="controller_error",
+        value_key=ATTR_CONTROLLER_ERROR,
+    ),
+    ControllerSensorDescription(
+        key="active_smartevse",
+        translation_key="active_smartevse",
+        value_key=ATTR_ACTIVE_SMARTEVSE,
     ),
     ControllerSensorDescription(
         key="duty_cycle_remaining",
@@ -196,8 +202,9 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
         return {
             ATTR_CHARGE_ALLOWED: self.coordinator.data.get(ATTR_CHARGE_ALLOWED),
             ATTR_CHARGE_REASON: self.coordinator.data.get(ATTR_CHARGE_REASON),
-            ATTR_ACTIVE_CHARGE_SLOT: self.coordinator.data.get(ATTR_ACTIVE_CHARGE_SLOT),
-            ATTR_ACTIVE_CHARGE_SLOT_SINCE: self.coordinator.data.get(ATTR_ACTIVE_CHARGE_SLOT_SINCE),
+            ATTR_CONTROLLER_ERROR: self.coordinator.data.get(ATTR_CONTROLLER_ERROR),
+            ATTR_ACTIVE_SMARTEVSE: self.coordinator.data.get(ATTR_ACTIVE_SMARTEVSE),
+            ATTR_ACTIVE_SMARTEVSE_SINCE: self.coordinator.data.get(ATTR_ACTIVE_SMARTEVSE_SINCE),
             ATTR_DUTY_CYCLE_REMAINING: self.coordinator.data.get(ATTR_DUTY_CYCLE_REMAINING),
             "charge_policy": self.coordinator.data.get("charge_policy"),
             "duty_cycle_minutes": self.coordinator.data.get("duty_cycle_minutes"),

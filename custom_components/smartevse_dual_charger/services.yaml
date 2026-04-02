@@ -10,7 +10,7 @@ refresh:
 
 reset_sessions:
   name: Reset charge cycle
-  description: Clear the active SmartEVSE duty-cycle slot so the current charge policy restarts immediately.
+  description: Clear the active SmartEVSE selection so the current charge policy restarts immediately.
   fields:
     entry_id:
       required: false

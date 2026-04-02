@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
-from homeassistant.components.number import NumberEntity
+from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.core import HomeAssistant
 
 from .const import (
@@ -63,6 +63,7 @@ async def async_setup_entry(
                 native_max_value=60,
                 native_step=1,
                 native_unit_of_measurement="s",
+                mode=NumberMode.BOX,
             ),
             ControllerNumberEntity(
                 entry,
@@ -108,6 +109,7 @@ class ControllerNumberEntity(SmartEVSEDualChargerEntity, NumberEntity):
         native_unit_of_measurement: str,
         after_set: AfterSetHook | None = None,
         options_key: str | None = None,
+        mode: NumberMode | None = None,
     ) -> None:
         """Initialize the number."""
         super().__init__(entry)
@@ -121,6 +123,7 @@ class ControllerNumberEntity(SmartEVSEDualChargerEntity, NumberEntity):
         self._attr_native_max_value = native_max_value
         self._attr_native_step = native_step
         self._attr_native_unit_of_measurement = native_unit_of_measurement
+        self._attr_mode = mode
 
     @property
     def native_value(self) -> float:

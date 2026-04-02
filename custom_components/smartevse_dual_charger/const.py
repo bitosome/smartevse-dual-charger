@@ -9,7 +9,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "smartevse_dual_charger"
 NAME = "SmartEVSE Dual Charger"
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 
 LOGGER = logging.getLogger(__package__)
 
@@ -17,7 +17,7 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.SWITCH,
     Platform.NUMBER,
-    Platform.TEXT,
+    Platform.TIME,
     Platform.SELECT,
 ]
 
@@ -37,10 +37,11 @@ DEFAULT_PUSH_CURRENTS = True
 DEFAULT_PUSH_EV_METER = True
 DEFAULT_PUSH_WLED = True
 
-ATTR_ACTIVE_CHARGE_SLOT = "active_charge_slot"
-ATTR_ACTIVE_CHARGE_SLOT_SINCE = "active_charge_slot_since"
+ATTR_ACTIVE_SMARTEVSE = "active_smartevse"
+ATTR_ACTIVE_SMARTEVSE_SINCE = "active_smartevse_since"
 ATTR_CHARGE_ALLOWED = "charge_allowed"
 ATTR_CHARGE_REASON = "charge_reason"
+ATTR_CONTROLLER_ERROR = "controller_error"
 ATTR_CONTROLLER_STATE = "controller_state"
 ATTR_DUTY_CYCLE_REMAINING = "duty_cycle_remaining"
 ATTR_LAST_CYCLE_REASON = "last_cycle_reason"
@@ -82,7 +83,7 @@ SCHEDULE_NOTIFICATION_ID = f"{DOMAIN}_schedule_disabled"
 
 
 class ChargePolicy(StrEnum):
-    """Which SmartEVSE should start the next charging slot."""
+    """Which SmartEVSE should start charging first."""
 
     SMARTEVSE_1_FIRST = "smartevse_1_first"
     SMARTEVSE_2_FIRST = "smartevse_2_first"

@@ -58,12 +58,12 @@ Available policies:
 
 Behavior:
 
-- `SmartEVSE 1 first`: when both unfinished EV sessions are connected, SmartEVSE 1 gets the first duty-cycle slot, then charging alternates between both chargers
+- `SmartEVSE 1 first`: when both unfinished EV sessions are connected, SmartEVSE 1 charges first, then charging alternates between both chargers
 - `SmartEVSE 2 first`: same, but SmartEVSE 2 starts first
 - `SmartEVSE 1 only`: only SmartEVSE 1 is ever enabled; duty-cycle rotation is not used
 - `SmartEVSE 2 only`: only SmartEVSE 2 is ever enabled; duty-cycle rotation is not used
 
-If only one unfinished EV session is connected and the policy is one of the `first` policies, that SmartEVSE charges immediately and duty-cycle timing is not used. If a second unfinished EV becomes connected later, the controller starts a fresh duty-cycle window from that point and reapplies the preferred `first` slot immediately.
+If only one unfinished EV session is connected and the policy is one of the `first` policies, that SmartEVSE charges immediately and duty-cycle timing is not used. If a second unfinished EV becomes connected later, the controller starts a fresh duty-cycle window from that point and reapplies the preferred SmartEVSE immediately.
 
 The configured default policy is set in the integration options and defaults to `SmartEVSE 1 first`. The Home Assistant `Charge policy` select is a temporary runtime override for the current plugged-in session only. When both EVs are unplugged, the runtime policy automatically resets back to the configured default.
 
@@ -76,9 +76,12 @@ The same charge policy is applied regardless of why charging is active:
 
 If the active charge reason changes while charging remains allowed, the duty-cycle state is reset and the newly active mode starts again from the selected charge policy.
 
+Enabling any force mode also starts a fresh manual cycle by clearing remembered per-EV completion state for the currently plugged sessions.
+When a new charge-allowed window opens after being disallowed, the controller also starts a fresh cycle for the still-plugged sessions.
+
 ## Duty Cycle
 
-`Duty cycle` is the time each SmartEVSE keeps the charging slot while both unfinished EV sessions remain connected under a `first` policy.
+`Duty cycle` is the time each SmartEVSE stays active while both unfinished EV sessions remain connected under a `first` policy.
 
 Example:
 
@@ -95,11 +98,13 @@ Result:
 
 Important exceptions:
 
-- If the active EV finishes before the duty cycle ends and the other EV is still waiting, the controller switches immediately to the next unfinished EV and does not wait for the slot timer to expire
+- If the active EV finishes before the duty cycle ends and the other EV is still waiting, the controller switches immediately to the next unfinished EV and does not wait for the duty-cycle timer to expire
 - If only one unfinished EV session remains connected, the controller keeps that SmartEVSE in `Smart` continuously and does not rotate
 - If both connected EV sessions are already complete, the controller blocks further charging until one EV is unplugged or a new charge cycle is started
 
 Changing the runtime `Charge policy` select or `Duty cycle` number takes effect immediately and resets the current rotation so the new policy is applied right away.
+
+Changing the runtime `Charge policy` also clears remembered completion state for the currently plugged sessions, so a manual policy flip can immediately hand charging back to the other SmartEVSE.
 
 ## Charge Triggers
 
@@ -124,7 +129,7 @@ Do not run the legacy automation and this integration at the same time. Both wil
 
 ## Meter Push Cadence
 
-With SmartEVSE `Smart` mode, the important reaction time is the mains and EV-meter push cadence, not the Home Assistant slot decision loop.
+With SmartEVSE `Smart` mode, the important reaction time is the mains and EV-meter push cadence, not the Home Assistant charger-selection loop.
 
 The integration now sends meter data on dedicated timers, separate from the main controller refresh:
 
@@ -133,6 +138,11 @@ The integration now sends meter data on dedicated timers, separate from the main
 - `Controller refresh interval` only affects SmartEVSE status polling, schedule/price reevaluation, and duty-cycle switching
 
 This matches the old `rest:` behavior more closely and avoids current pushes being delayed by slow `GET /settings` calls. The EV-meter loop is intentionally offset from the mains-current loop so both push jobs do not hit the SmartEVSE web server at the same second. If breaker protection needs faster reaction, lower the push intervals.
+
+Fail-safe behavior:
+
+- If force-by-price is enabled and the price sensor is unavailable or invalid, charging is blocked instead of assuming `0`.
+- If mains current pushing is enabled and any mains phase sensor is unavailable or invalid, the controller blocks charging and exposes `controller_error = mains_data_unavailable` instead of pushing `0/0/0` to SmartEVSE.
 
 Current defaults:
 
@@ -147,7 +157,7 @@ All three intervals are exposed in two places:
 
 ## WLED Layout
 
-When WLED is enabled, the integration drives a 105-LED circular layout with a 10-LED start offset and two fixed half-circle segments:
+When WLED is enabled, the integration drives a 105-LED circular layout with an 11-LED start offset and two fixed half-circle segments:
 
 - Left half: SmartEVSE 1
 - Right half: SmartEVSE 2
@@ -202,11 +212,12 @@ The integration creates:
 
 - Switches: force charge, force charge by price, force charge timer, charge with schedule
 - Numbers: acceptable price, duty cycle, controller refresh interval, mains current push interval, EV meter push interval
-- Text: force charge duration (`H:MM`, for example `3:32`)
+- Time: force charge duration (`HH:MM`)
 - Selects: charge policy
 - Sensors:
   - Controller state and charge reason
-  - Active charge slot
+  - Controller error
+  - Active SmartEVSE
   - Duty cycle remaining
   - SmartEVSE 1 state, plug state, mode, charging current, max current, override current, error
   - SmartEVSE 2 state, plug state, mode, charging current, max current, override current, error
@@ -220,7 +231,7 @@ Service actions:
 Behavior:
 
 - `Refresh controller` / `smartevse_dual_charger.refresh`: runs one controller cycle immediately. This forces an immediate SmartEVSE status poll, reevaluates force/schedule/price/timer state, reapplies the current charge policy if needed, and refreshes the integration entities. It does not reset timers, force modes, or duty-cycle state.
-- `Reset charge cycle` / `smartevse_dual_charger.reset_sessions`: clears the integration's active slot rotation state, forgets remembered per-EV completion state, and immediately reevaluates the current charge policy from a clean start.
+- `Reset charge cycle` / `smartevse_dual_charger.reset_sessions`: clears the integration's active SmartEVSE rotation state, forgets remembered per-EV completion state, and immediately reevaluates the current charge policy from a clean start.
 
 ## Dashboard
 
@@ -228,8 +239,8 @@ Behavior:
 
 It shows:
 
-- Controller state, charge reason, active slot, and duty-cycle remaining
-- Per-SmartEVSE state, plug state, mode, charging current, max current, override current, slot status, and error
+- Controller state, charge reason, active SmartEVSE, and duty-cycle remaining
+- Per-SmartEVSE state, plug state, mode, charging current, max current, override current, SmartEVSE status, and error
 - Schedule, force-charge, price-gated, and timer controls
 - Charge policy, duty cycle, pricing, and schedule settings
 
