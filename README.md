@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.5`
+Version: `0.0.7.1`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -12,9 +12,6 @@ It is not a SmartEVSE `PWR SHARE` implementation.
 
 - Current integration: [`custom_components/smartevse_dual_charger`](custom_components/smartevse_dual_charger)
 - Current dashboard example: [`card_integration.yaml`](card_integration.yaml)
-- Legacy automation reference: [`automation.yaml`](automation.yaml)
-- Legacy helper-based dashboard reference: [`card.yaml`](card.yaml)
-- Legacy `rest:` example reference: [`configuration.yaml`](configuration.yaml)
 
 ## Architecture
 
@@ -398,9 +395,7 @@ It shows:
 - force charge, price, and timer controls
 - charge policy and main tuning entities
 
-It expects Mushroom cards and uses the integration entities, not the legacy helper entities.
-
-[`card.yaml`](card.yaml) is only a reference for the old helper-based automation setup.
+It expects Mushroom cards and reads detailed charger state from the stable `Controller state` sensor attributes, so the card does not depend on alias-derived per-SmartEVSE entity IDs.
 
 ## Legacy Compatibility
 
