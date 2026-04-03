@@ -30,15 +30,15 @@ cards:
             Duty left: n/a
           {% endif %}
   - type: custom:mushroom-template-card
-    entity: sensor.smartevse_dual_charger_smartevse_1_state
+    entity: sensor.smartevse_dual_charger_controller_state
     primary: >-
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %}
       {% set name =
-      state_attr('sensor.smartevse_dual_charger_controller_state','smartevse_1_name')
-      or 'Volvo XC40' %}
-      {% if
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
-      %}
-        {% set s = states('sensor.smartevse_dual_charger_smartevse_1_state')|trim %}
+      state_attr(ctrl,'smartevse_1_name')
+      or 'SmartEVSE 1' %}
+      {% set plug = state_attr(ctrl,'smartevse_1_plug_state') %}
+      {% set s = (state_attr(ctrl,'smartevse_1_state') or '')|trim %}
+      {% if plug == 'Connected' %}
         {% if s == 'Charging' %}
           {{ name }}: Charging
         {% elif s == 'Ready to Charge' %}
@@ -56,71 +56,67 @@ cards:
         {{ name }}: Unplugged
       {% endif %}
     secondary: >-
-      Plug: {{ states('sensor.smartevse_dual_charger_smartevse_1_plug_state') }}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %}
+      Plug: {{ state_attr(ctrl,'smartevse_1_plug_state') }}
 
-      Mode: {{ states('sensor.smartevse_dual_charger_smartevse_1_mode') }}
+      Mode: {{ state_attr(ctrl,'smartevse_1_mode') }}
 
       Charging current: {{
-      states('sensor.smartevse_dual_charger_smartevse_1_charging_current') }} A
+      state_attr(ctrl,'smartevse_1_charge_current') }} A
 
       Max current: {{
-      states('sensor.smartevse_dual_charger_smartevse_1_max_current') }} A
+      state_attr(ctrl,'smartevse_1_max_current') }} A
 
       Override: {{
-      states('sensor.smartevse_dual_charger_smartevse_1_override_current') }} A
+      state_attr(ctrl,'smartevse_1_override_current') }} A
 
       This SmartEVSE: {% if
-      state_attr('sensor.smartevse_dual_charger_controller_state','active_smartevse_raw') == 'smartevse_1'
+      state_attr(ctrl,'active_smartevse_raw') == 'smartevse_1'
       %}Active{% elif
-      state_attr('sensor.smartevse_dual_charger_controller_state','smartevse_1_session_complete')
+      state_attr(ctrl,'smartevse_1_session_complete')
       %}Complete{% elif
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
+      state_attr(ctrl,'smartevse_1_plug_state') == 'Connected'
       %}Idle{% else %}None{% endif %} {% set error =
-      states('sensor.smartevse_dual_charger_smartevse_1_error') %} {% if error
+      state_attr(ctrl,'smartevse_1_error') %} {% if error
       not in ['unknown','unavailable','NONE','None',''] %}
 
       Error: {{ error }} {% endif %}
     multiline_secondary: true
     icon: >-
-      {% set s = states('sensor.smartevse_dual_charger_smartevse_1_state')|trim
-      %} {% if not
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
-      %}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %}
+      {% set s = (state_attr(ctrl,'smartevse_1_state') or '')|trim %} {% if
+      state_attr(ctrl,'smartevse_1_plug_state') != 'Connected' %}
         mdi:power-plug-off-outline
       {% elif s == 'Charging' %}
         mdi:ev-station
-      {% elif state_attr('sensor.smartevse_dual_charger_controller_state','active_smartevse_raw') ==
-      'smartevse_1' %}
+      {% elif state_attr(ctrl,'active_smartevse_raw') == 'smartevse_1' %}
         mdi:ev-plug-type2
       {% else %}
         mdi:pause-circle-outline
       {% endif %}
     color: >-
-      {% set s = states('sensor.smartevse_dual_charger_smartevse_1_state')|trim
-      %} {% set cur =
-      states('sensor.smartevse_dual_charger_smartevse_1_charging_current')|float(0)
-      %} {% if not
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
-      %}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %}
+      {% set s = (state_attr(ctrl,'smartevse_1_state') or '')|trim %} {% set cur
+      = state_attr(ctrl,'smartevse_1_charge_current')|float(0) %} {% if
+      state_attr(ctrl,'smartevse_1_plug_state') != 'Connected' %}
         grey
       {% elif s == 'Charging' and cur >= 1 %}
         green
-      {% elif state_attr('sensor.smartevse_dual_charger_controller_state','active_smartevse_raw') ==
-      'smartevse_1' %}
+      {% elif state_attr(ctrl,'active_smartevse_raw') == 'smartevse_1' %}
         blue
       {% else %}
         grey
       {% endif %}
   - type: custom:mushroom-template-card
-    entity: sensor.smartevse_dual_charger_smartevse_2_state
+    entity: sensor.smartevse_dual_charger_controller_state
     primary: >-
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %}
       {% set name =
-      state_attr('sensor.smartevse_dual_charger_controller_state','smartevse_2_name')
-      or 'Volvo EX30' %}
-      {% if
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
-      %}
-        {% set s = states('sensor.smartevse_dual_charger_smartevse_2_state')|trim %}
+      state_attr(ctrl,'smartevse_2_name')
+      or 'SmartEVSE 2' %}
+      {% set plug = state_attr(ctrl,'smartevse_2_plug_state') %}
+      {% set s = (state_attr(ctrl,'smartevse_2_state') or '')|trim %}
+      {% if plug == 'Connected' %}
         {% if s == 'Charging' %}
           {{ name }}: Charging
         {% elif s == 'Ready to Charge' %}
@@ -138,57 +134,53 @@ cards:
         {{ name }}: Unplugged
       {% endif %}
     secondary: >-
-      Plug: {{ states('sensor.smartevse_dual_charger_smartevse_2_plug_state') }}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %}
+      Plug: {{ state_attr(ctrl,'smartevse_2_plug_state') }}
 
-      Mode: {{ states('sensor.smartevse_dual_charger_smartevse_2_mode') }}
+      Mode: {{ state_attr(ctrl,'smartevse_2_mode') }}
 
       Charging current: {{
-      states('sensor.smartevse_dual_charger_smartevse_2_charging_current') }} A
+      state_attr(ctrl,'smartevse_2_charge_current') }} A
 
       Max current: {{
-      states('sensor.smartevse_dual_charger_smartevse_2_max_current') }} A
+      state_attr(ctrl,'smartevse_2_max_current') }} A
 
       Override: {{
-      states('sensor.smartevse_dual_charger_smartevse_2_override_current') }} A
+      state_attr(ctrl,'smartevse_2_override_current') }} A
 
       This SmartEVSE: {% if
-      state_attr('sensor.smartevse_dual_charger_controller_state','active_smartevse_raw') == 'smartevse_2'
+      state_attr(ctrl,'active_smartevse_raw') == 'smartevse_2'
       %}Active{% elif
-      state_attr('sensor.smartevse_dual_charger_controller_state','smartevse_2_session_complete')
+      state_attr(ctrl,'smartevse_2_session_complete')
       %}Complete{% elif
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
+      state_attr(ctrl,'smartevse_2_plug_state') == 'Connected'
       %}Idle{% else %}None{% endif %} {% set error =
-      states('sensor.smartevse_dual_charger_smartevse_2_error') %} {% if error
+      state_attr(ctrl,'smartevse_2_error') %} {% if error
       not in ['unknown','unavailable','NONE','None',''] %}
 
       Error: {{ error }} {% endif %}
     multiline_secondary: true
     icon: >-
-      {% set s = states('sensor.smartevse_dual_charger_smartevse_2_state')|trim
-      %} {% if not
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
-      %}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %}
+      {% set s = (state_attr(ctrl,'smartevse_2_state') or '')|trim %} {% if
+      state_attr(ctrl,'smartevse_2_plug_state') != 'Connected' %}
         mdi:power-plug-off-outline
       {% elif s == 'Charging' %}
         mdi:ev-station
-      {% elif state_attr('sensor.smartevse_dual_charger_controller_state','active_smartevse_raw') ==
-      'smartevse_2' %}
+      {% elif state_attr(ctrl,'active_smartevse_raw') == 'smartevse_2' %}
         mdi:ev-plug-type2
       {% else %}
         mdi:pause-circle-outline
       {% endif %}
     color: >-
-      {% set s = states('sensor.smartevse_dual_charger_smartevse_2_state')|trim
-      %} {% set cur =
-      states('sensor.smartevse_dual_charger_smartevse_2_charging_current')|float(0)
-      %} {% if not
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
-      %}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %}
+      {% set s = (state_attr(ctrl,'smartevse_2_state') or '')|trim %} {% set cur
+      = state_attr(ctrl,'smartevse_2_charge_current')|float(0) %} {% if
+      state_attr(ctrl,'smartevse_2_plug_state') != 'Connected' %}
         grey
       {% elif s == 'Charging' and cur >= 1 %}
         green
-      {% elif state_attr('sensor.smartevse_dual_charger_controller_state','active_smartevse_raw') ==
-      'smartevse_2' %}
+      {% elif state_attr(ctrl,'active_smartevse_raw') == 'smartevse_2' %}
         blue
       {% else %}
         grey
@@ -227,11 +219,10 @@ cards:
     entity: switch.smartevse_dual_charger_force_charge
     primary: Force charge
     secondary: >-
-      {% set any_connected =
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
-      or
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
-      %} {% if is_state('switch.smartevse_dual_charger_force_charge','on') %}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %} {% set
+      any_connected = state_attr(ctrl,'smartevse_1_plug_state') == 'Connected'
+      or state_attr(ctrl,'smartevse_2_plug_state') == 'Connected' %} {% if
+      is_state('switch.smartevse_dual_charger_force_charge','on') %}
         {% if not any_connected %}
           Waiting EV plug to be connected
         {% else %}
@@ -242,12 +233,11 @@ cards:
       {% endif %}
     icon: mdi:lightning-bolt
     icon_color: >-
-      {% set any_connected =
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
-      or
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
-      %} {% if is_state('switch.smartevse_dual_charger_force_charge','on') and
-      not any_connected %}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %} {% set
+      any_connected = state_attr(ctrl,'smartevse_1_plug_state') == 'Connected'
+      or state_attr(ctrl,'smartevse_2_plug_state') == 'Connected' %} {% if
+      is_state('switch.smartevse_dual_charger_force_charge','on') and not
+      any_connected %}
         orange
       {% elif is_state('switch.smartevse_dual_charger_force_charge','on') %}
         green
@@ -262,11 +252,9 @@ cards:
       Charge when ≤ {{ states('number.smartevse_dual_charger_acceptable_price')
       }} EUR/kWh
     secondary: >-
-      {% set any_connected =
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
-      or
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
-      %} {% if
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %} {% set
+      any_connected = state_attr(ctrl,'smartevse_1_plug_state') == 'Connected'
+      or state_attr(ctrl,'smartevse_2_plug_state') == 'Connected' %} {% if
       is_state('switch.smartevse_dual_charger_force_charge_by_price','on') %}
         {% if not any_connected %}
           Waiting EV plug to be connected
@@ -283,11 +271,9 @@ cards:
       {% endif %}
     icon: mdi:currency-eur
     icon_color: >-
-      {% set any_connected =
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
-      or
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
-      %} {% if
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %} {% set
+      any_connected = state_attr(ctrl,'smartevse_1_plug_state') == 'Connected'
+      or state_attr(ctrl,'smartevse_2_plug_state') == 'Connected' %} {% if
       is_state('switch.smartevse_dual_charger_force_charge_by_price','on') and
       not any_connected %}
         orange
@@ -305,12 +291,10 @@ cards:
       {% set minutes = states('number.smartevse_dual_charger_force_charge_duration')|int(0) %}
       Force charge for {{ '%d:%02d'|format(minutes // 60, minutes % 60) }}
     secondary: >-
-      {% set any_connected =
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
-      or
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
-      %} {% if is_state('switch.smartevse_dual_charger_force_charge_timer','on')
-      %}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %} {% set
+      any_connected = state_attr(ctrl,'smartevse_1_plug_state') == 'Connected'
+      or state_attr(ctrl,'smartevse_2_plug_state') == 'Connected' %} {% if
+      is_state('switch.smartevse_dual_charger_force_charge_timer','on') %}
         {% if not any_connected %}
           Waiting EV plug to be connected
         {% else %}
@@ -321,12 +305,11 @@ cards:
       {% endif %}
     icon: mdi:timer-sand
     icon_color: >-
-      {% set any_connected =
-      is_state('sensor.smartevse_dual_charger_smartevse_1_plug_state','Connected')
-      or
-      is_state('sensor.smartevse_dual_charger_smartevse_2_plug_state','Connected')
-      %} {% if is_state('switch.smartevse_dual_charger_force_charge_timer','on')
-      and not any_connected %}
+      {% set ctrl = 'sensor.smartevse_dual_charger_controller_state' %} {% set
+      any_connected = state_attr(ctrl,'smartevse_1_plug_state') == 'Connected'
+      or state_attr(ctrl,'smartevse_2_plug_state') == 'Connected' %} {% if
+      is_state('switch.smartevse_dual_charger_force_charge_timer','on') and not
+      any_connected %}
         orange
       {% elif is_state('switch.smartevse_dual_charger_force_charge_timer','on')
       %}

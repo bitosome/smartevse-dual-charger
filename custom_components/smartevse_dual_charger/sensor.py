@@ -28,7 +28,6 @@ from .const import (
 )
 from .data import SmartEVSEDualChargerConfigEntry
 from .entity import SmartEVSEDualChargerEntity
-from .naming import smartevse_sensor_name
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -194,18 +193,6 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
         if self.entity_description.key in {"duty_cycle_remaining", "timer_remaining"}:
             return 0 if value is None else int(value)
         return value
-
-    @property
-    def name(self) -> str | None:
-        """Return a dynamic entity name when an alias is configured."""
-        custom_name = smartevse_sensor_name(
-            self.entity_description.translation_key,
-            self._configured_smartevse_name("smartevse_1"),
-            self._configured_smartevse_name("smartevse_2"),
-        )
-        if custom_name is not None:
-            return custom_name
-        return super().name
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:

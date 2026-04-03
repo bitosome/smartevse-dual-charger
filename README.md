@@ -82,7 +82,7 @@ Current prefilled defaults:
 Notes:
 
 - SmartEVSE MQTT entities are not required.
-- SmartEVSE display names are optional aliases used in Home Assistant UI surfaces such as the charge-policy dropdown, active SmartEVSE sensor, per-SmartEVSE sensor names, and the example dashboard card.
+- SmartEVSE display names are optional aliases used in Home Assistant UI surfaces such as the charge-policy dropdown, the active SmartEVSE sensor, and the example dashboard card.
 - If WLED setup is enabled, the flow opens a dedicated second WLED step.
 - For WLED, enter only the base URL/IP. Do not include `/json/state`.
 - Only one config entry is supported.
@@ -114,7 +114,7 @@ The options flow controls the default behavior of the integration:
 The runtime number entities reflect the live values and can be changed directly from Home Assistant without reopening the options dialog.
 
 The options flow does not edit WLED layout fields directly. If WLED is already configured, the recreate checkbox reuses the stored WLED URL/IP, LED count, LED offset, and presets JSON.
-Changing either SmartEVSE display name updates the charge-policy dropdown labels, the active SmartEVSE sensor value, per-SmartEVSE sensor names, and the example dashboard card after the entry reloads.
+Changing either SmartEVSE display name updates the charge-policy dropdown labels, the active SmartEVSE sensor value, and the example dashboard card after the entry reloads.
 
 ## Charge Triggers and Precedence
 
