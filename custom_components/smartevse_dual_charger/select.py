@@ -8,6 +8,7 @@ from homeassistant.core import HomeAssistant
 from .const import ChargePolicy
 from .data import SmartEVSEDualChargerConfigEntry
 from .entity import SmartEVSEDualChargerEntity
+from .naming import charge_policy_labels
 
 
 async def async_setup_entry(
@@ -28,14 +29,20 @@ class ChargePolicySelect(SmartEVSEDualChargerEntity, SelectEntity):
         """Initialize the selector."""
         super().__init__(entry)
         self._attr_unique_id = f"{entry.entry_id}_charge_policy"
-        self._attr_options = [policy.value for policy in ChargePolicy]
+        self._policy_labels = charge_policy_labels(
+            self._configured_smartevse_name("smartevse_1"),
+            self._configured_smartevse_name("smartevse_2"),
+        )
+        self._label_to_policy = {label: policy for policy, label in self._policy_labels.items()}
+        self._attr_options = list(self._label_to_policy)
 
     @property
     def current_option(self) -> str:
         """Return the selected option."""
-        return str(self.coordinator.data.get("charge_policy", ChargePolicy.SMARTEVSE_1_FIRST.value))
+        policy = str(self.coordinator.data.get("charge_policy", ChargePolicy.SMARTEVSE_1_FIRST.value))
+        return self._policy_labels[policy]
 
     async def async_select_option(self, option: str) -> None:
         """Select a runtime option."""
-        await self._entry.runtime_data.controller.async_set_charge_policy(option)
+        await self._entry.runtime_data.controller.async_set_charge_policy(self._label_to_policy[option])
         await self._entry.runtime_data.coordinator._async_refresh_now("select_option")

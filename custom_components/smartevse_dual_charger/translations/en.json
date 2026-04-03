@@ -6,6 +6,8 @@
         "description": "Connect the controller to both SmartEVSE REST endpoints, Shelly mains and EV-meter sensors, and choose whether WLED should be set up.",
         "data": {
           "name": "Name",
+          "smartevse_1_name": "SmartEVSE 1 display name",
+          "smartevse_2_name": "SmartEVSE 2 display name",
           "smartevse_1_base_url": "SmartEVSE 1 base URL/IP",
           "smartevse_2_base_url": "SmartEVSE 2 base URL/IP",
           "setup_wled": "Set up WLED now",
@@ -52,6 +54,8 @@
         "title": "Controller options",
         "description": "Tune SmartEVSE rotation, meter push cadence, notifications, and optional WLED preset management.",
         "data": {
+          "smartevse_1_name": "SmartEVSE 1 display name",
+          "smartevse_2_name": "SmartEVSE 2 display name",
           "charge_policy_default": "Default charge policy",
           "duty_cycle_minutes": "Duty cycle (minutes)",
           "update_interval": "Controller refresh interval (seconds)",

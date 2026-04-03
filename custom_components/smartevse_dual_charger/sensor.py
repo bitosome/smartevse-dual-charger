@@ -28,6 +28,7 @@ from .const import (
 )
 from .data import SmartEVSEDualChargerConfigEntry
 from .entity import SmartEVSEDualChargerEntity
+from .naming import smartevse_sensor_name
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -195,6 +196,18 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
         return value
 
     @property
+    def name(self) -> str | None:
+        """Return a dynamic entity name when an alias is configured."""
+        custom_name = smartevse_sensor_name(
+            self.entity_description.translation_key,
+            self._configured_smartevse_name("smartevse_1"),
+            self._configured_smartevse_name("smartevse_2"),
+        )
+        if custom_name is not None:
+            return custom_name
+        return super().name
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Return useful controller attributes on the state sensor."""
         if self.entity_description.key != "controller_state":
@@ -219,6 +232,8 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
             ATTR_LAST_EV_METER_PUSH: self.coordinator.data.get(ATTR_LAST_EV_METER_PUSH),
             ATTR_LAST_WLED_PUSH: self.coordinator.data.get(ATTR_LAST_WLED_PUSH),
             ATTR_LAST_NOTIFICATION: self.coordinator.data.get(ATTR_LAST_NOTIFICATION),
+            "active_smartevse_raw": self.coordinator.data.get("active_smartevse_raw"),
+            "smartevse_1_name": self.coordinator.data.get("smartevse_1_name"),
             "smartevse_1_available": self.coordinator.data.get("smartevse_1_available"),
             "smartevse_1_state": self.coordinator.data.get("smartevse_1_state"),
             "smartevse_1_plug_state": self.coordinator.data.get("smartevse_1_plug_state"),
@@ -228,6 +243,7 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
             "smartevse_1_override_current": self.coordinator.data.get("smartevse_1_override_current"),
             "smartevse_1_error": self.coordinator.data.get("smartevse_1_error"),
             "smartevse_1_session_complete": self.coordinator.data.get("smartevse_1_session_complete"),
+            "smartevse_2_name": self.coordinator.data.get("smartevse_2_name"),
             "smartevse_2_available": self.coordinator.data.get("smartevse_2_available"),
             "smartevse_2_state": self.coordinator.data.get("smartevse_2_state"),
             "smartevse_2_plug_state": self.coordinator.data.get("smartevse_2_plug_state"),

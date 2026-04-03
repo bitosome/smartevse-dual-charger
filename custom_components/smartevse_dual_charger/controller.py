@@ -51,6 +51,8 @@ from .const import (
     CONF_PUSH_EV_METER,
     CONF_PUSH_WLED,
     CONF_SCHEDULE_ENTITY,
+    CONF_SMARTEVSE_1_NAME,
+    CONF_SMARTEVSE_2_NAME,
     CONF_SMARTEVSE_1_BASE_URL,
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
@@ -68,6 +70,8 @@ from .const import (
     DEFAULT_PUSH_CURRENTS,
     DEFAULT_PUSH_EV_METER,
     DEFAULT_PUSH_WLED,
+    DEFAULT_SMARTEVSE_1_NAME,
+    DEFAULT_SMARTEVSE_2_NAME,
     DEFAULT_UPDATE_INTERVAL,
     DEFAULT_WLED_LED_COUNT,
     DEFAULT_WLED_LED_OFFSET,
@@ -77,6 +81,7 @@ from .const import (
     STORAGE_VERSION,
     ChargePolicy,
 )
+from .naming import active_smartevse_label, configured_smartevse_name
 from .wled import build_runtime_payload, normalize_wled_state_url, runtime_state_matches_payload
 
 MUTABLE_DEFAULTS: dict[str, Any] = {
@@ -410,6 +415,9 @@ class SmartEVSEDualChargerController:
         if timer_until is not None:
             timer_remaining = max(int((timer_until - now).total_seconds()), 0)
 
+        smartevse_1_name = self._configured_smartevse_name("smartevse_1")
+        smartevse_2_name = self._configured_smartevse_name("smartevse_2")
+
         return {
             "force_charge": bool(self._mutable["force_charge"]),
             "force_price": bool(self._mutable["force_price"]),
@@ -427,7 +435,8 @@ class SmartEVSEDualChargerController:
             ATTR_CONTROLLER_STATE: controller_state.value,
             ATTR_CHARGE_REASON: charge_reason,
             ATTR_MAINS_PEAK: None if mains_peak is None else round(mains_peak, 1),
-            ATTR_ACTIVE_SMARTEVSE: active_smartevse,
+            ATTR_ACTIVE_SMARTEVSE: active_smartevse_label(active_smartevse, smartevse_1_name, smartevse_2_name),
+            "active_smartevse_raw": active_smartevse,
             ATTR_ACTIVE_SMARTEVSE_SINCE: active_smartevse_since,
             ATTR_DUTY_CYCLE_REMAINING: duty_cycle_remaining,
             ATTR_SCHEDULE_WINDOW_ACTIVE: schedule_window_active,
@@ -438,6 +447,7 @@ class SmartEVSEDualChargerController:
             ATTR_LAST_EV_METER_PUSH: self._mutable["last_ev_meter_push"],
             ATTR_LAST_WLED_PUSH: self._mutable["last_wled_push"],
             ATTR_LAST_NOTIFICATION: self._mutable["last_notification"],
+            "smartevse_1_name": smartevse_1_name,
             "smartevse_1_available": smartevse_1.available,
             "smartevse_1_state": smartevse_1.state,
             "smartevse_1_plug_state": smartevse_1.plug_state,
@@ -447,6 +457,7 @@ class SmartEVSEDualChargerController:
             "smartevse_1_override_current": round(smartevse_1.override_current, 1),
             "smartevse_1_error": smartevse_1.error,
             "smartevse_1_session_complete": bool(self._mutable["smartevse_1_session_complete"]),
+            "smartevse_2_name": smartevse_2_name,
             "smartevse_2_available": smartevse_2.available,
             "smartevse_2_state": smartevse_2.state,
             "smartevse_2_plug_state": smartevse_2.plug_state,
@@ -487,6 +498,22 @@ class SmartEVSEDualChargerController:
             return ChargePolicy(value).value
         except ValueError:
             return DEFAULT_CHARGE_POLICY
+
+    def _configured_smartevse_name(self, smartevse_key: str) -> str:
+        """Return the configured alias for one SmartEVSE."""
+        values = {
+            **self._entry_data,
+            **self._options,
+            CONF_SMARTEVSE_1_NAME: self._options.get(
+                CONF_SMARTEVSE_1_NAME,
+                self._entry_data.get(CONF_SMARTEVSE_1_NAME, DEFAULT_SMARTEVSE_1_NAME),
+            ),
+            CONF_SMARTEVSE_2_NAME: self._options.get(
+                CONF_SMARTEVSE_2_NAME,
+                self._entry_data.get(CONF_SMARTEVSE_2_NAME, DEFAULT_SMARTEVSE_2_NAME),
+            ),
+        }
+        return configured_smartevse_name(values, smartevse_key)
 
     def _reset_charge_cycle(self, *, preserve_previous_active: bool = False) -> None:
         """Clear the active SmartEVSE so the next cycle restarts from policy."""

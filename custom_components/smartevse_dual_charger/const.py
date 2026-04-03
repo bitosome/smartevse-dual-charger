@@ -35,6 +35,8 @@ DEFAULT_CHARGE_POLICY = "smartevse_1_first"
 DEFAULT_PUSH_CURRENTS = True
 DEFAULT_PUSH_EV_METER = True
 DEFAULT_PUSH_WLED = True
+DEFAULT_SMARTEVSE_1_NAME = "Volvo XC40"
+DEFAULT_SMARTEVSE_2_NAME = "Volvo EX30"
 DEFAULT_WLED_LED_COUNT = 105
 DEFAULT_WLED_LED_OFFSET = 11
 
@@ -75,6 +77,8 @@ CONF_PRICE_SENSOR_ENTITY = "price_sensor_entity"
 CONF_PUSH_CURRENTS = "push_currents"
 CONF_PUSH_EV_METER = "push_ev_meter"
 CONF_PUSH_WLED = "push_wled"
+CONF_SMARTEVSE_1_NAME = "smartevse_1_name"
+CONF_SMARTEVSE_2_NAME = "smartevse_2_name"
 CONF_RECREATE_WLED_PRESETS = "recreate_wled_presets"
 CONF_SCHEDULE_ENTITY = "schedule_entity"
 CONF_UPDATE_INTERVAL = "update_interval"
