@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from urllib.parse import urlparse
 
@@ -36,6 +37,9 @@ from .const import (
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
     CONF_WLED_URL,
+    CONF_WLED_LED_COUNT,
+    CONF_WLED_LED_OFFSET,
+    CONF_WLED_PRESETS_JSON,
     DEFAULT_CHARGE_POLICY,
     DEFAULT_CURRENTS_PUSH_INTERVAL,
     DEFAULT_DUTY_CYCLE_MINUTES,
@@ -46,11 +50,20 @@ from .const import (
     DEFAULT_PUSH_EV_METER,
     DEFAULT_PUSH_WLED,
     DEFAULT_UPDATE_INTERVAL,
+    DEFAULT_WLED_LED_COUNT,
+    DEFAULT_WLED_LED_OFFSET,
     DOMAIN,
     LOGGER,
     ChargePolicy,
 )
-from .wled import WLEDPresetError, async_recreate_wled_assets, normalize_wled_base_url
+from .wled import (
+    WLEDPresetError,
+    async_recreate_wled_assets,
+    build_default_presets_json,
+    normalize_wled_base_url,
+)
+
+CONF_SETUP_WLED = "setup_wled"
 
 CHARGE_POLICY_OPTIONS = [policy.value for policy in ChargePolicy]
 LEGACY_DEFAULTS: dict[str, Any] = {
@@ -98,6 +111,17 @@ def _wled_url_or_host(value: str) -> str:
     return normalize_wled_base_url(_url_or_host(value)).removesuffix("/")
 
 
+def _parse_presets_json(value: str) -> dict[str, Any]:
+    """Validate presets.json text and return parsed JSON."""
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as err:
+        raise vol.Invalid("invalid_json") from err
+    if not isinstance(payload, dict):
+        raise vol.Invalid("invalid_json")
+    return payload
+
+
 def _optional_entity_default(values: dict[str, Any], key: str) -> str | None:
     """Return a selector-friendly default for optional entity fields."""
     value = values.get(key)
@@ -113,43 +137,29 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialize config flow state."""
         self._progress_task = None
         self._pending_user_input: dict[str, Any] | None = None
+        self._pending_wled_input: dict[str, Any] | None = None
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
         """Handle the initial step."""
         if self._async_current_entries():
             return self.async_abort(reason="already_configured")
 
-        if self._progress_task is not None:
-            if not self._progress_task.done():
-                return self.async_show_progress(
-                    step_id="user",
-                    progress_action=CONF_RECREATE_WLED_PRESETS,
-                    progress_task=self._progress_task,
-                )
-            return self.async_show_progress_done(next_step_id="finish_user_wled")
-
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
                 form_data = dict(user_input)
-                recreate_wled_presets = bool(form_data.pop(CONF_RECREATE_WLED_PRESETS, False))
+                setup_wled = bool(form_data.pop(CONF_SETUP_WLED, False))
                 form_data[CONF_SMARTEVSE_1_BASE_URL] = _url_or_host(form_data[CONF_SMARTEVSE_1_BASE_URL])
                 form_data[CONF_SMARTEVSE_2_BASE_URL] = _url_or_host(form_data[CONF_SMARTEVSE_2_BASE_URL])
-                if form_data.get(CONF_WLED_URL):
-                    form_data[CONF_WLED_URL] = _wled_url_or_host(form_data[CONF_WLED_URL])
-                if recreate_wled_presets:
-                    if not form_data.get(CONF_WLED_URL):
-                        errors["base"] = "wled_url_required"
-                    else:
-                        self._pending_user_input = form_data
-                        self._progress_task = self.hass.async_create_task(
-                            async_recreate_wled_assets(self.hass, form_data[CONF_WLED_URL])
-                        )
-                        return self.async_show_progress(
-                            step_id="user",
-                            progress_action=CONF_RECREATE_WLED_PRESETS,
-                            progress_task=self._progress_task,
-                        )
+                if setup_wled:
+                    self._pending_user_input = form_data
+                    self._pending_wled_input = {
+                        CONF_WLED_URL: LEGACY_DEFAULTS[CONF_WLED_URL],
+                        CONF_WLED_LED_COUNT: DEFAULT_WLED_LED_COUNT,
+                        CONF_WLED_LED_OFFSET: DEFAULT_WLED_LED_OFFSET,
+                        CONF_WLED_PRESETS_JSON: build_default_presets_json(),
+                    }
+                    return await self.async_step_wled()
                 if not errors:
                     await self.async_set_unique_id(DOMAIN)
                     self._abort_if_unique_id_configured()
@@ -166,13 +176,56 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    async def async_step_wled(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
+        """Configure and optionally rebuild WLED assets."""
+        if self._progress_task is not None:
+            if not self._progress_task.done():
+                return self.async_show_progress(
+                    step_id="wled",
+                    progress_action=CONF_RECREATE_WLED_PRESETS,
+                    progress_task=self._progress_task,
+                )
+            return self.async_show_progress_done(next_step_id="finish_user_wled")
+
+        if self._pending_user_input is None:
+            return await self.async_step_user()
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                wled_data = self._normalize_wled_input(user_input)
+                self._pending_wled_input = dict(user_input)
+                presets_payload = _parse_presets_json(wled_data[CONF_WLED_PRESETS_JSON])
+                self._progress_task = self.hass.async_create_task(
+                    async_recreate_wled_assets(
+                        self.hass,
+                        wled_data[CONF_WLED_URL],
+                        led_count=wled_data[CONF_WLED_LED_COUNT],
+                        led_offset=wled_data[CONF_WLED_LED_OFFSET],
+                        presets_payload=presets_payload,
+                    )
+                )
+                return self.async_show_progress(
+                    step_id="wled",
+                    progress_action=CONF_RECREATE_WLED_PRESETS,
+                    progress_task=self._progress_task,
+                )
+            except vol.Invalid as err:
+                errors["base"] = str(err) if str(err) else "invalid_url"
+
+        return self.async_show_form(
+            step_id="wled",
+            data_schema=self._build_wled_schema(user_input or self._pending_wled_input),
+            errors=errors,
+        )
+
     async def async_step_finish_user_wled(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
         """Finish the WLED preset recreation task before creating the entry."""
         assert user_input is None
         progress_task = self._progress_task
         pending_user_input = self._pending_user_input
+        pending_wled_input = self._pending_wled_input
         self._progress_task = None
-        self._pending_user_input = None
 
         if progress_task is None or pending_user_input is None:
             return await self.async_step_user()
@@ -181,23 +234,29 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await progress_task
         except WLEDPresetError as err:
             LOGGER.warning("WLED preset recreation failed during initial setup: %s", err)
-            values = dict(pending_user_input)
-            values[CONF_RECREATE_WLED_PRESETS] = True
+            values = dict(pending_wled_input or {})
             return self.async_show_form(
-                step_id="user",
-                data_schema=self._build_user_schema(values),
+                step_id="wled",
+                data_schema=self._build_wled_schema(values),
                 errors={"base": "wled_preset_setup_failed"},
             )
         except Exception:
             LOGGER.exception("Unexpected error during initial WLED preset recreation")
-            values = dict(pending_user_input)
-            values[CONF_RECREATE_WLED_PRESETS] = True
+            values = dict(pending_wled_input or {})
             return self.async_show_form(
-                step_id="user",
-                data_schema=self._build_user_schema(values),
+                step_id="wled",
+                data_schema=self._build_wled_schema(values),
                 errors={"base": "wled_preset_setup_failed"},
             )
 
+        if pending_wled_input is not None:
+            pending_user_input = {
+                **pending_user_input,
+                **self._normalize_wled_input(pending_wled_input),
+            }
+
+        self._pending_user_input = None
+        self._pending_wled_input = None
         await self.async_set_unique_id(DOMAIN)
         self._abort_if_unique_id_configured()
         return self.async_create_entry(
@@ -219,10 +278,9 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_NAME, default=user_input.get(CONF_NAME, DEFAULT_NAME)): selector.TextSelector(),
                 vol.Required(CONF_SMARTEVSE_1_BASE_URL, default=user_input.get(CONF_SMARTEVSE_1_BASE_URL, "")): selector.TextSelector(),
                 vol.Required(CONF_SMARTEVSE_2_BASE_URL, default=user_input.get(CONF_SMARTEVSE_2_BASE_URL, "")): selector.TextSelector(),
-                vol.Optional(CONF_WLED_URL, default=user_input.get(CONF_WLED_URL, "")): selector.TextSelector(),
                 vol.Required(
-                    CONF_RECREATE_WLED_PRESETS,
-                    default=bool(user_input.get(CONF_RECREATE_WLED_PRESETS, False)),
+                    CONF_SETUP_WLED,
+                    default=bool(user_input.get(CONF_SETUP_WLED, False)),
                 ): selector.BooleanSelector(),
                 vol.Required(CONF_MAINS_L1_ENTITY, default=user_input.get(CONF_MAINS_L1_ENTITY, "")): _entity_selector("sensor"),
                 vol.Required(CONF_MAINS_L2_ENTITY, default=user_input.get(CONF_MAINS_L2_ENTITY, "")): _entity_selector("sensor"),
@@ -252,6 +310,54 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ): _entity_selector("schedule"),
             }
         )
+
+    def _build_wled_schema(self, user_input: dict[str, Any] | None) -> vol.Schema:
+        """Build the WLED setup step schema."""
+        user_input = user_input or {}
+        return vol.Schema(
+            {
+                vol.Required(CONF_WLED_URL, default=user_input.get(CONF_WLED_URL, LEGACY_DEFAULTS[CONF_WLED_URL])): selector.TextSelector(),
+                vol.Required(
+                    CONF_WLED_LED_COUNT,
+                    default=int(user_input.get(CONF_WLED_LED_COUNT, DEFAULT_WLED_LED_COUNT)),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=1,
+                        max=2000,
+                        step=1,
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+                vol.Required(
+                    CONF_WLED_LED_OFFSET,
+                    default=int(user_input.get(CONF_WLED_LED_OFFSET, DEFAULT_WLED_LED_OFFSET)),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0,
+                        max=2000,
+                        step=1,
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+                vol.Required(
+                    CONF_WLED_PRESETS_JSON,
+                    default=user_input.get(CONF_WLED_PRESETS_JSON, build_default_presets_json()),
+                ): selector.TextSelector(
+                    selector.TextSelectorConfig(
+                        multiline=True,
+                    )
+                ),
+            }
+        )
+
+    def _normalize_wled_input(self, user_input: dict[str, Any]) -> dict[str, Any]:
+        """Validate and normalize WLED step input."""
+        return {
+            CONF_WLED_URL: _wled_url_or_host(str(user_input[CONF_WLED_URL])),
+            CONF_WLED_LED_COUNT: max(1, int(float(user_input[CONF_WLED_LED_COUNT]))),
+            CONF_WLED_LED_OFFSET: max(0, int(float(user_input[CONF_WLED_LED_OFFSET]))),
+            CONF_WLED_PRESETS_JSON: str(user_input[CONF_WLED_PRESETS_JSON]).strip(),
+        }
 
 
 class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
@@ -406,9 +512,20 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
                 if not wled_url:
                     errors["base"] = "wled_url_required"
                 else:
+                    presets_json = str(self._config_entry.data.get(CONF_WLED_PRESETS_JSON, "")).strip()
+                    try:
+                        presets_payload = _parse_presets_json(presets_json) if presets_json else None
+                    except vol.Invalid:
+                        presets_payload = None
                     self._pending_options = options_data
                     self._progress_task = self.hass.async_create_task(
-                        async_recreate_wled_assets(self.hass, wled_url)
+                        async_recreate_wled_assets(
+                            self.hass,
+                            wled_url,
+                            led_count=int(self._config_entry.data.get(CONF_WLED_LED_COUNT, DEFAULT_WLED_LED_COUNT)),
+                            led_offset=int(self._config_entry.data.get(CONF_WLED_LED_OFFSET, DEFAULT_WLED_LED_OFFSET)),
+                            presets_payload=presets_payload,
+                        )
                     )
                     return self.async_show_progress(
                         step_id="init",

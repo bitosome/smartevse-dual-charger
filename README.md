@@ -2,52 +2,152 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-This repository contains:
+Version: `0.0.5`
 
-- The current integration in [`custom_components/smartevse_dual_charger`](custom_components/smartevse_dual_charger)
-- The legacy YAML automation in [`automation.yaml`](automation.yaml)
-- The legacy helper-based dashboard in [`card.yaml`](card.yaml)
-- The current integration dashboard example in [`card_integration.yaml`](card_integration.yaml)
+This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
-## What It Does
+It is not a SmartEVSE `PWR SHARE` implementation.
 
-The integration acts as a single coordinator for both SmartEVSE devices:
+## Repository Contents
 
-- Reads each SmartEVSE directly from `GET /settings`
-- Controls each SmartEVSE directly through `POST /settings`
-- Pushes `/currents` and `/ev_meter` updates to both SmartEVSE devices when enabled
-- Lets SmartEVSE handle feeder protection in built-in `Smart` mode
-- Alternates charging access between SmartEVSE 1 and SmartEVSE 2 on a configurable duty cycle
-- Stops using duty-cycle rotation as soon as only one unfinished EV session remains
-- Exposes controller entities for force charge, schedule gating, pricing, charge policy, and diagnostics
-- Mirrors charger state to WLED when configured
-- Can recreate SmartEVSE-specific WLED presets and LED mapping from the options flow
+- Current integration: [`custom_components/smartevse_dual_charger`](custom_components/smartevse_dual_charger)
+- Current dashboard example: [`card_integration.yaml`](card_integration.yaml)
+- Legacy automation reference: [`automation.yaml`](automation.yaml)
+- Legacy helper-based dashboard reference: [`card.yaml`](card.yaml)
+- Legacy `rest:` example reference: [`configuration.yaml`](configuration.yaml)
 
-This integration is designed for the "two independent SmartEVSE chargers, one shared supply, SmartEVSE owns the current regulation" setup. It is not a `PWR SHARE` implementation.
+## Architecture
 
-## Control Model
+The integration coordinates both chargers as one controller:
 
-The integration no longer calculates current budgets or target currents in Home Assistant.
+- polls both SmartEVSE devices via `GET /settings`
+- writes SmartEVSE state via `POST /settings`
+- can push `/currents` and `/ev_meter` to both SmartEVSE devices
+- can mirror charger state to one WLED ring
+- exposes one Home Assistant control surface for charging policy, force modes, schedule gating, diagnostics, and per-charger state
+
+The integration no longer calculates charging current budgets in Home Assistant.
 
 Instead:
 
-- Home Assistant decides which SmartEVSE is allowed to charge right now
-- The selected SmartEVSE is put in `Smart` mode
-- The non-selected SmartEVSE is put in `Off`
-- SmartEVSE uses its own configured `Smart`-mode logic together with the pushed mains and EV-meter data
+- Home Assistant decides which SmartEVSE is allowed to charge
+- the selected SmartEVSE is put into `Smart`
+- the other SmartEVSE is put into `Off`
+- SmartEVSE itself enforces current limits using its own `Smart`-mode settings and the pushed mains / EV-meter data
 
-That means feeder protection now depends on the SmartEVSE configuration itself:
+That means these SmartEVSE-side settings still matter and must be configured on the chargers themselves:
 
 - `current_main`
 - `current_max_circuit`
 - `current_min`
-- SmartEVSE meter mode being set to API where required
+- meter/API mode as required by your SmartEVSE setup
 
-Those values must be configured on the SmartEVSE devices themselves. They are not derived by Home Assistant anymore.
+## Initial Setup
+
+The config flow asks for:
+
+- SmartEVSE 1 base URL/IP
+- SmartEVSE 2 base URL/IP
+- whether WLED should be set up now
+- mains current sensors for L1/L2/L3
+- EV-meter current sensors for L1/L2/L3
+- EV-meter active power sensor
+- EV-meter import/export energy sensors
+- price sensor
+- schedule entity
+- optional WLED recreation checkbox
+
+Current prefilled defaults:
+
+| Field | Default |
+| --- | --- |
+| SmartEVSE 1 base URL/IP | `192.168.0.234` |
+| SmartEVSE 2 base URL/IP | `192.168.0.44` |
+| WLED URL/IP | `192.168.0.81` |
+| Mains L1 | `sensor.shelly_pro_3em_1_phase_a_current` |
+| Mains L2 | `sensor.shelly_pro_3em_1_phase_b_current` |
+| Mains L3 | `sensor.shelly_pro_3em_1_phase_c_current` |
+| EV meter L1 | `sensor.shelly_pro_3em_2_phase_a_current` |
+| EV meter L2 | `sensor.shelly_pro_3em_2_phase_b_current` |
+| EV meter L3 | `sensor.shelly_pro_3em_2_phase_c_current` |
+| EV meter active power | `sensor.shelly_pro_3em_2_total_active_power` |
+| EV meter import energy | `sensor.shelly_pro_3em_2_total_active_energy` |
+| EV meter export energy | `sensor.shelly_pro_3em_2_total_active_returned_energy` |
+| Price sensor | `sensor.real_electricity_price_current_price` |
+| Schedule entity | `schedule.charge_schedule` |
+
+Notes:
+
+- SmartEVSE MQTT entities are not required.
+- If WLED setup is enabled, the flow opens a dedicated second WLED step.
+- For WLED, enter only the base URL/IP. Do not include `/json/state`.
+- Only one config entry is supported.
+
+If WLED setup is enabled, the second step asks for:
+
+- WLED URL/IP
+- WLED LED count
+- WLED LED offset
+- full `presets.json` content to upload
+
+The WLED step validates the JSON and then performs the destructive WLED rebuild before the config entry is created.
+
+## Options Flow
+
+The options flow controls the default behavior of the integration:
+
+- default charge policy
+- duty cycle
+- controller refresh interval
+- mains current push enable + interval
+- EV meter push enable + interval
+- WLED push enable
+- destructive WLED recreation checkbox
+- schedule-window notification toggle
+
+The runtime number entities reflect the live values and can be changed directly from Home Assistant without reopening the options dialog.
+
+The options flow does not edit WLED layout fields directly. If WLED is already configured, the recreate checkbox reuses the stored WLED URL/IP, LED count, LED offset, and presets JSON.
+
+## Charge Triggers and Precedence
+
+Available charging gates:
+
+- `Force charge`
+- `Force charge timer`
+- `Force charge by price`
+- `Charge with schedule`
+
+Precedence is fixed:
+
+1. `Force charge`
+2. `Force charge timer`
+3. `Force charge by price`
+4. `Charge with schedule`
+
+Practical result:
+
+- any force mode wins over schedule
+- force modes are mutually exclusive
+- schedule is only used when no force mode is active
+
+High-level controller states:
+
+- `idle`
+- `force`
+- `timer`
+- `price`
+- `schedule`
+- `blocked`
+
+Important trigger behavior:
+
+- timer mode is cleared on Home Assistant restart
+- if both EVs are unplugged, all force modes are cleared and the runtime charge policy resets to the configured default
+- when charging becomes allowed again after being disallowed, the controller starts a fresh cycle for still-plugged EVs
+- enabling a force mode starts a fresh manual cycle
 
 ## Charge Policy
-
-`Charge policy` replaces the old low-budget policy.
 
 Available policies:
 
@@ -58,180 +158,224 @@ Available policies:
 
 Behavior:
 
-- `SmartEVSE 1 first`: when both unfinished EV sessions are connected, SmartEVSE 1 charges first, then charging alternates between both chargers
+- `SmartEVSE 1 first`: if both unfinished EVs are connected, SmartEVSE 1 starts first, then rotation is controlled by duty cycle
 - `SmartEVSE 2 first`: same, but SmartEVSE 2 starts first
-- `SmartEVSE 1 only`: only SmartEVSE 1 is ever enabled; duty-cycle rotation is not used
-- `SmartEVSE 2 only`: only SmartEVSE 2 is ever enabled; duty-cycle rotation is not used
+- `SmartEVSE 1 only`: only SmartEVSE 1 may charge
+- `SmartEVSE 2 only`: only SmartEVSE 2 may charge
 
-If only one unfinished EV session is connected and the policy is one of the `first` policies, that SmartEVSE charges immediately and duty-cycle timing is not used. If a second unfinished EV becomes connected later, the controller starts a fresh duty-cycle window from that point and reapplies the preferred SmartEVSE immediately.
+There are two policy layers:
 
-The configured default policy is set in the integration options and defaults to `SmartEVSE 1 first`. The Home Assistant `Charge policy` select is a temporary runtime override for the current plugged-in session only. When both EVs are unplugged, the runtime policy automatically resets back to the configured default.
+- configured default policy from the options flow
+- runtime `Charge policy` select in Home Assistant
 
-The same charge policy is applied regardless of why charging is active:
+The runtime select is temporary:
 
-- force charge
-- force timer
-- force by price
-- schedule charging
+- it applies immediately
+- it resets the current cycle immediately
+- it is cleared back to the configured default when both EVs are unplugged
 
-If the active charge reason changes while charging remains allowed, the duty-cycle state is reset and the newly active mode starts again from the selected charge policy.
+Changing either the runtime charge policy or duty cycle while charging is active restarts the current cycle immediately.
 
-Enabling any force mode also starts a fresh manual cycle by clearing remembered per-EV completion state for the currently plugged sessions.
-When a new charge-allowed window opens after being disallowed, the controller also starts a fresh cycle for the still-plugged sessions.
+## Duty Cycle Behavior
 
-## Duty Cycle
+`Duty cycle` applies only to the `SmartEVSE 1 first` and `SmartEVSE 2 first` policies, and only while two unfinished connected EV sessions are competing.
 
-`Duty cycle` is the time each SmartEVSE stays active while both unfinished EV sessions remain connected under a `first` policy.
+If there is only one unfinished connected EV, duty cycle is not used.
 
-Example:
+### Charging Scenarios
 
-- policy = `SmartEVSE 1 first`
-- duty cycle = `60 min`
+| Scenario | Result |
+| --- | --- |
+| No EV connected | No charging |
+| One unfinished EV connected on either charger | That SmartEVSE charges continuously in `Smart` |
+| Two unfinished EVs connected, policy `SmartEVSE 1 first` | SmartEVSE 1 starts, then rotates by duty cycle |
+| Two unfinished EVs connected, policy `SmartEVSE 2 first` | SmartEVSE 2 starts, then rotates by duty cycle |
+| Policy `SmartEVSE 1 only` | Only SmartEVSE 1 may charge |
+| Policy `SmartEVSE 2 only` | Only SmartEVSE 2 may charge |
+| Second EV connects while one EV is already charging | Controller reevaluates immediately on the next cycle and starts a fresh policy-based cycle |
+| Waiting EV disconnects | Remaining unfinished EV continues without rotation |
+| Active EV disconnects | Other unfinished connected EV takes over immediately on the next cycle |
+| Active EV finishes before duty cycle ends | Duty cycle for that EV is cancelled and the other unfinished connected EV starts on the next controller cycle |
+| Both connected EVs are already complete | Controller goes `blocked` until unplug, manual reset, or a new allowed charging window starts |
 
-Result:
+How session completion is detected:
 
-1. SmartEVSE 1 enters `Smart`
-2. SmartEVSE 2 stays `Off`
-3. After 60 minutes, SmartEVSE 1 is turned `Off`
-4. SmartEVSE 2 enters `Smart`
-5. The cycle repeats while charging is still allowed and both cars remain connected
+- an EV session is considered complete only after that same SmartEVSE was seen in `Charging` and later in `Charging Stopped`
+- unplugging clears completion for that side
+- a new charging session clears completion again
 
-Important exceptions:
+## Price and Schedule Handling
 
-- If the active EV finishes before the duty cycle ends and the other EV is still waiting, the controller switches immediately to the next unfinished EV and does not wait for the duty-cycle timer to expire
-- If only one unfinished EV session remains connected, the controller keeps that SmartEVSE in `Smart` continuously and does not rotate
-- If both connected EV sessions are already complete, the controller blocks further charging until one EV is unplugged or a new charge cycle is started
+Price mode:
 
-Changing the runtime `Charge policy` select or `Duty cycle` number takes effect immediately and resets the current rotation so the new policy is applied right away.
+- if the price sensor is missing or invalid, charging is blocked
+- invalid price data is not treated as `0`
+- charging starts only when `price <= acceptable_price`
 
-Changing the runtime `Charge policy` also clears remembered completion state for the currently plugged sessions, so a manual policy flip can immediately hand charging back to the other SmartEVSE.
+Schedule mode:
 
-## Charge Triggers
+- if the schedule entity is missing, charging is blocked
+- if the schedule window is active while the schedule gate is disabled, the integration can create a persistent notification
 
-The original control scenarios are still covered:
+The schedule reminder is implemented as a Home Assistant persistent notification, not as `notify.notify`.
 
-- Manual force charge
-- Price-gated charging
-- Timer-based charging with automatic expiry
-- Schedule-gated charging
-- Mutual exclusion between force modes
-- Timer reset on Home Assistant restart
-- Force-mode reset when both cars are unplugged
-- Schedule reminder when a schedule window starts while the schedule gate is disabled
-- Periodic SmartEVSE `/currents` and `/ev_meter` pushes
-- WLED state mirroring for both chargers
+## Controller Refresh and Meter Pushes
 
-One implementation detail differs from the legacy YAML:
+The integration has three independent timings:
 
-- The reminder is sent as a Home Assistant persistent notification instead of `notify.notify`
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| Controller refresh interval | `10 s` | Poll SmartEVSE status, reevaluate charge reason, recompute active SmartEVSE, update entities |
+| Mains current push interval | `10 s` | Push `/currents` to both SmartEVSE devices |
+| EV meter push interval | `10 s` | Push `/ev_meter` to both SmartEVSE devices |
 
-Do not run the legacy automation and this integration at the same time. Both will write SmartEVSE modes and will fight each other.
+Important details:
 
-## Meter Push Cadence
-
-With SmartEVSE `Smart` mode, the important reaction time is the mains and EV-meter push cadence, not the Home Assistant charger-selection loop.
-
-The integration now sends meter data on dedicated timers, separate from the main controller refresh:
-
-- `Mains current push interval`
-- `EV meter push interval`
-- `Controller refresh interval` only affects SmartEVSE status polling, schedule/price reevaluation, and duty-cycle switching
-
-This matches the old `rest:` behavior more closely and avoids current pushes being delayed by slow `GET /settings` calls. The EV-meter loop is intentionally offset from the mains-current loop so both push jobs do not hit the SmartEVSE web server at the same second. If breaker protection needs faster reaction, lower the push intervals.
+- mains and EV-meter pushes run on dedicated loops, separate from the main controller refresh
+- the EV-meter loop is intentionally offset so it does not align with the mains push loop
+- interval changes made through Home Assistant number entities apply immediately
 
 Fail-safe behavior:
 
-- If force-by-price is enabled and the price sensor is unavailable or invalid, charging is blocked instead of assuming `0`.
-- If mains current pushing is enabled and any mains phase sensor is unavailable or invalid, the controller blocks charging and exposes `controller_error = mains_data_unavailable` instead of pushing `0/0/0` to SmartEVSE.
+- if mains current pushing is enabled and any mains phase sensor is invalid, charging is blocked and `controller_error` becomes `mains_data_unavailable`
+- the integration does not push `0/0/0` to SmartEVSE in that case
+- if SmartEVSE REST becomes unavailable, controller error reflects the unavailable endpoint when applicable
 
-Current defaults:
+## WLED Integration
 
-- `Controller refresh interval`: `10 s`
-- `Mains current push interval`: `10 s`
-- `EV meter push interval`: `10 s`
+When enabled, the integration drives one WLED device directly over the JSON API.
 
-All three intervals are exposed in two places:
+Physical model:
 
-- Integration options
-- Home Assistant number entities for live runtime tuning
+- 105 LEDs
+- circular layout
+- global LED offset of `11`
+- two fixed half-circle segments
+- physical result: SmartEVSE 1 on the left, SmartEVSE 2 on the right
 
-## WLED Layout
+Runtime visuals:
 
-When WLED is enabled, the integration drives a 105-LED circular layout with an 11-LED start offset and two fixed half-circle segments:
+- disconnected: off
+- connected / ready / charging stopped: blue pulsing idle animation
+- charging: green animated
+- SmartEVSE 1 charging animation runs in reverse direction
+- error: red
 
-- Left half: SmartEVSE 1
-- Right half: SmartEVSE 2
+### WLED Recreation Checkbox
 
-The integration applies that geometry through `ledmap.json`, so the runtime WLED payload can still use only two contiguous segments.
+The setup flow and options flow include this destructive action:
 
-State colors:
-
-- Charging: green animated, with SmartEVSE 1 running in reverse direction
-- Connected, `Ready to Charge`, and `Charging Stopped`: the same blue pulsing idle animation
-- Error: red
-
-## WLED Presets
-
-The options flow includes a one-shot checkbox:
-
-- `Delete old SmartEVSE WLED presets and recreate the segment layout and LED map`
+- `Delete all WLED presets and segments, then recreate the SmartEVSE layout and LED map`
 
 When checked, the integration:
 
-- Deletes existing WLED segments beyond the SmartEVSE pair and rebuilds the two fixed SmartEVSE half-circle segments
-- Uploads a fresh `ledmap.json` for the circular 105-LED layout
-- Removes old WLED presets whose names start with `SmartEVSE`
-- Creates a new namespaced SmartEVSE preset set without touching unrelated user presets
+- uploads a fresh `ledmap.json`
+- deletes all existing WLED segments
+- deletes all existing WLED presets
+- recreates the two SmartEVSE segments
+- recreates presets from the stored `presets.json` content
 
-The recreated preset set includes combined two-segment presets for the practical shared-ring states, for example:
+The flow shows a progress spinner while this runs.
 
+Important: this wipes unrelated presets and segments on that WLED device too.
+
+### Recreated WLED Presets
+
+The recreated preset set is:
+
+- `SmartEVSE Off`
+- `SmartEVSE Error`
+- `SmartEVSE 1 Charging`
+- `SmartEVSE 1 Idle`
+- `SmartEVSE 2 Charging`
+- `SmartEVSE 2 Idle`
 - `SmartEVSE 1 Idle + SmartEVSE 2 Idle`
 - `SmartEVSE 1 Charging + SmartEVSE 2 Idle`
 - `SmartEVSE 1 Idle + SmartEVSE 2 Charging`
 - `SmartEVSE 1 Charging + SmartEVSE 2 Charging`
 
-The options dialog shows a progress spinner while that work runs.
+Presets are recreated mainly as a setup/bootstrap asset set. Runtime control is done by writing WLED segment state directly.
 
-## Default Configuration Values
+## Home Assistant Entities
 
-The initial config flow is prefilled with the original installation defaults:
+### Switches
 
-- SmartEVSE 1 base URL/IP: `192.168.0.234`
-- SmartEVSE 2 base URL/IP: `192.168.0.44`
-- WLED URL/IP: `192.168.0.81`
-- Shelly 3EM mains sensors
-- Shelly 3EM EV-meter sensors
-- Price sensor
-- Schedule entity
+- `Force charge`
+- `Force charge by price`
+- `Force charge timer`
+- `Charge with schedule`
 
-The SmartEVSE MQTT entities are no longer required in the config flow because the integration reads and writes the SmartEVSE devices directly through REST.
+### Numbers
 
-## Entities
+All numeric inputs use Home Assistant number entities with box input.
 
-The integration creates:
+- `Acceptable price`
+- `Force charge duration`
+- `Duty cycle`
+- `Controller refresh interval`
+- `Mains current push interval`
+- `EV meter push interval`
 
-- Switches: force charge, force charge by price, force charge timer, charge with schedule
-- Numbers: acceptable price, duty cycle, controller refresh interval, mains current push interval, EV meter push interval
-- Time: force charge duration (`HH:MM`)
-- Selects: charge policy
-- Sensors:
-  - Controller state and charge reason
-  - Controller error
-  - Active SmartEVSE
-  - Duty cycle remaining
-  - SmartEVSE 1 state, plug state, mode, charging current, max current, override current, error
-  - SmartEVSE 2 state, plug state, mode, charging current, max current, override current, error
-  - Timer remaining
+### Selects
 
-Service actions:
+- `Charge policy`
+
+### Sensors
+
+- `Controller state`
+- `Charge reason`
+- `Controller error`
+- `Active SmartEVSE`
+- `Duty cycle remaining`
+- `Timer remaining`
+- `SmartEVSE 1 state`
+- `SmartEVSE 1 plug state`
+- `SmartEVSE 1 mode`
+- `SmartEVSE 1 charging current`
+- `SmartEVSE 1 max current`
+- `SmartEVSE 1 override current`
+- `SmartEVSE 1 error`
+- `SmartEVSE 2 state`
+- `SmartEVSE 2 plug state`
+- `SmartEVSE 2 mode`
+- `SmartEVSE 2 charging current`
+- `SmartEVSE 2 max current`
+- `SmartEVSE 2 override current`
+- `SmartEVSE 2 error`
+
+The `Controller state` sensor also exposes useful extra attributes such as:
+
+- `charge_allowed`
+- `charge_reason`
+- `controller_error`
+- `active_smartevse`
+- `duty_cycle_remaining`
+- `charge_policy`
+- current intervals
+- per-SmartEVSE session completion flags
+- last push timestamps
+
+### Service Actions
 
 - `smartevse_dual_charger.refresh`
 - `smartevse_dual_charger.reset_sessions`
 
 Behavior:
 
-- `Refresh controller` / `smartevse_dual_charger.refresh`: runs one controller cycle immediately. This forces an immediate SmartEVSE status poll, reevaluates force/schedule/price/timer state, reapplies the current charge policy if needed, and refreshes the integration entities. It does not reset timers, force modes, or duty-cycle state.
-- `Reset charge cycle` / `smartevse_dual_charger.reset_sessions`: clears the integration's active SmartEVSE rotation state, forgets remembered per-EV completion state, and immediately reevaluates the current charge policy from a clean start.
+- `refresh`: runs one controller cycle immediately
+- `reset_sessions`: clears remembered per-EV completion state and active SmartEVSE selection, then starts a fresh cycle
+
+These are service actions only. The integration no longer exposes separate button entities for them.
+
+## Controller Error Values
+
+`Controller error` is meant for automation and notification handling. Current actionable values are:
+
+- `mains_data_unavailable`
+- `price_sensor_unavailable`
+- `schedule_entity_unavailable`
+- `smartevse_api_unavailable`
+- per-device API failures such as `smartevse_1_api_unavailable` or `smartevse_2_api_unavailable`
 
 ## Dashboard
 
@@ -239,49 +383,53 @@ Behavior:
 
 It shows:
 
-- Controller state, charge reason, active SmartEVSE, and duty-cycle remaining
-- Per-SmartEVSE state, plug state, mode, charging current, max current, override current, SmartEVSE status, and error
-- Schedule, force-charge, price-gated, and timer controls
-- Charge policy, duty cycle, pricing, and schedule settings
+- current electricity price
+- active SmartEVSE
+- duty cycle remaining
+- detailed per-SmartEVSE state cards
+- schedule control
+- force charge, price, and timer controls
+- charge policy and main tuning entities
 
-[`card.yaml`](card.yaml) is retained only as a reference for the old helper-based setup.
+It expects Mushroom cards and uses the integration entities, not the legacy helper entities.
+
+[`card.yaml`](card.yaml) is only a reference for the old helper-based automation setup.
+
+## Legacy Compatibility
+
+Do not run the legacy YAML automation and this integration at the same time.
+
+Both write SmartEVSE modes and will fight each other.
 
 ## Project Layout
 
-- [`custom_components/smartevse_dual_charger/__init__.py`](custom_components/smartevse_dual_charger/__init__.py): integration setup, service registration, config-entry wiring
+- [`custom_components/smartevse_dual_charger/__init__.py`](custom_components/smartevse_dual_charger/__init__.py): setup, unload, service registration
 - [`custom_components/smartevse_dual_charger/config_flow.py`](custom_components/smartevse_dual_charger/config_flow.py): initial setup and options flow
-- [`custom_components/smartevse_dual_charger/controller.py`](custom_components/smartevse_dual_charger/controller.py): charge policy orchestration, timer/force logic, SmartEVSE API I/O, WLED, notifications
-- [`custom_components/smartevse_dual_charger/coordinator.py`](custom_components/smartevse_dual_charger/coordinator.py): scheduled refresh and immediate price/schedule refresh triggers
+- [`custom_components/smartevse_dual_charger/controller.py`](custom_components/smartevse_dual_charger/controller.py): charging logic, SmartEVSE API I/O, session tracking, WLED calls, notifications
+- [`custom_components/smartevse_dual_charger/coordinator.py`](custom_components/smartevse_dual_charger/coordinator.py): refresh scheduling, push loops, immediate price/schedule refresh triggers
+- [`custom_components/smartevse_dual_charger/number.py`](custom_components/smartevse_dual_charger/number.py): runtime number entities
+- [`custom_components/smartevse_dual_charger/select.py`](custom_components/smartevse_dual_charger/select.py): runtime charge policy select
 - [`custom_components/smartevse_dual_charger/sensor.py`](custom_components/smartevse_dual_charger/sensor.py): controller and SmartEVSE detail sensors
-- [`custom_components/smartevse_dual_charger/services.yaml`](custom_components/smartevse_dual_charger/services.yaml): service action descriptions
+- [`custom_components/smartevse_dual_charger/switch.py`](custom_components/smartevse_dual_charger/switch.py): force and schedule switches
+- [`custom_components/smartevse_dual_charger/wled.py`](custom_components/smartevse_dual_charger/wled.py): WLED runtime control, LED map, segment/preset recreation
+- [`custom_components/smartevse_dual_charger/diagnostics.py`](custom_components/smartevse_dual_charger/diagnostics.py): diagnostics with URL/IP redaction
+- [`custom_components/smartevse_dual_charger/services.yaml`](custom_components/smartevse_dual_charger/services.yaml): service descriptions
 
 ## Best-Practice Notes
 
-The current refactor keeps the integration aligned with the Home Assistant config-entry model:
+Current integration structure follows the Home Assistant config-entry model:
 
-- Uses config entries and `ConfigEntry.runtime_data`
-- Uses `DataUpdateCoordinator`
-- Registers service actions in `async_setup`
-- Supports unload/reload
-- Uses translated entity names and `has_entity_name`
-- Exposes diagnostics with URL/IP redaction
-- Uses a service device entry for the controller
-- Logs endpoint failures only on transition instead of every cycle
+- config-entry based setup
+- single config entry
+- `ConfigEntry.runtime_data`
+- `DataUpdateCoordinator`
+- unload/reload support
+- translated entities with `has_entity_name`
+- diagnostics with URL/IP redaction
+- service registration in `async_setup`
 
-Still worth improving:
+Known limitations:
 
-- Automated tests are still missing
-- The config flow validates URL/IP shape but does not yet verify connectivity
-- A dedicated reconfigure flow is not implemented yet
-- There is still no repair flow for broken external entity mappings or unreachable devices
-
-## Validation
-
-Validate locally after changes with:
-
-- `python3 -m compileall custom_components/smartevse_dual_charger`
-- JSON parsing of [`custom_components/smartevse_dual_charger/manifest.json`](custom_components/smartevse_dual_charger/manifest.json)
-- JSON parsing of [`custom_components/smartevse_dual_charger/translations/en.json`](custom_components/smartevse_dual_charger/translations/en.json)
-- YAML parsing of [`card_integration.yaml`](card_integration.yaml)
-
-Automated regression coverage has not been added yet.
+- no automated test suite yet
+- no dedicated Repairs flow yet
+- no reconfigure flow beyond the standard options flow

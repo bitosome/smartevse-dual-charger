@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
-from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.components.number import NumberDeviceClass, NumberEntity, NumberMode
+from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant
 
 from .const import (
@@ -40,6 +41,19 @@ async def async_setup_entry(
                 native_max_value=5.0,
                 native_step=0.001,
                 native_unit_of_measurement="EUR/kWh",
+                mode=NumberMode.BOX,
+            ),
+            ControllerNumberEntity(
+                entry,
+                data_key="force_charge_duration_minutes",
+                translation_key="force_charge_duration",
+                setter=controller.async_set_force_charge_duration,
+                native_min_value=5,
+                native_max_value=720,
+                native_step=1,
+                native_unit_of_measurement=UnitOfTime.MINUTES,
+                device_class=NumberDeviceClass.DURATION,
+                mode=NumberMode.BOX,
             ),
             ControllerNumberEntity(
                 entry,
@@ -50,7 +64,9 @@ async def async_setup_entry(
                 native_min_value=1,
                 native_max_value=720,
                 native_step=1,
-                native_unit_of_measurement="min",
+                native_unit_of_measurement=UnitOfTime.MINUTES,
+                device_class=NumberDeviceClass.DURATION,
+                mode=NumberMode.BOX,
             ),
             ControllerNumberEntity(
                 entry,
@@ -62,7 +78,8 @@ async def async_setup_entry(
                 native_min_value=1,
                 native_max_value=60,
                 native_step=1,
-                native_unit_of_measurement="s",
+                native_unit_of_measurement=UnitOfTime.SECONDS,
+                device_class=NumberDeviceClass.DURATION,
                 mode=NumberMode.BOX,
             ),
             ControllerNumberEntity(
@@ -75,7 +92,9 @@ async def async_setup_entry(
                 native_min_value=1,
                 native_max_value=300,
                 native_step=1,
-                native_unit_of_measurement="s",
+                native_unit_of_measurement=UnitOfTime.SECONDS,
+                device_class=NumberDeviceClass.DURATION,
+                mode=NumberMode.BOX,
             ),
             ControllerNumberEntity(
                 entry,
@@ -87,7 +106,9 @@ async def async_setup_entry(
                 native_min_value=1,
                 native_max_value=300,
                 native_step=1,
-                native_unit_of_measurement="s",
+                native_unit_of_measurement=UnitOfTime.SECONDS,
+                device_class=NumberDeviceClass.DURATION,
+                mode=NumberMode.BOX,
             ),
         ]
     )
@@ -107,6 +128,7 @@ class ControllerNumberEntity(SmartEVSEDualChargerEntity, NumberEntity):
         native_max_value: float,
         native_step: float,
         native_unit_of_measurement: str,
+        device_class: NumberDeviceClass | None = None,
         after_set: AfterSetHook | None = None,
         options_key: str | None = None,
         mode: NumberMode | None = None,
@@ -123,6 +145,7 @@ class ControllerNumberEntity(SmartEVSEDualChargerEntity, NumberEntity):
         self._attr_native_max_value = native_max_value
         self._attr_native_step = native_step
         self._attr_native_unit_of_measurement = native_unit_of_measurement
+        self._attr_device_class = device_class
         self._attr_mode = mode
 
     @property

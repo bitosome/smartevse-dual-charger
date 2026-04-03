@@ -55,6 +55,8 @@ from .const import (
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
     CONF_WLED_URL,
+    CONF_WLED_LED_COUNT,
+    CONF_WLED_LED_OFFSET,
     ControllerState,
     DEFAULT_ACCEPTABLE_PRICE,
     DEFAULT_CHARGE_POLICY,
@@ -67,13 +69,15 @@ from .const import (
     DEFAULT_PUSH_EV_METER,
     DEFAULT_PUSH_WLED,
     DEFAULT_UPDATE_INTERVAL,
+    DEFAULT_WLED_LED_COUNT,
+    DEFAULT_WLED_LED_OFFSET,
     LOGGER,
     SCHEDULE_NOTIFICATION_ID,
     STORAGE_KEY,
     STORAGE_VERSION,
     ChargePolicy,
 )
-from .wled import build_runtime_payload, normalize_wled_state_url
+from .wled import build_runtime_payload, normalize_wled_state_url, runtime_state_matches_payload
 
 MUTABLE_DEFAULTS: dict[str, Any] = {
     "force_charge": False,
@@ -90,6 +94,7 @@ MUTABLE_DEFAULTS: dict[str, Any] = {
     "timer_until": None,
     "active_smartevse": None,
     "active_smartevse_since": None,
+    "pending_previous_active_smartevse": None,
     "last_charge_allowed": False,
     "last_active_charge_reason": None,
     "last_schedule_window_active": False,
@@ -211,7 +216,7 @@ class SmartEVSEDualChargerController:
             self._mutable["force_timer"] = False
             self._mutable["timer_until"] = None
             self._clear_session_tracking()
-            self._reset_charge_cycle()
+            self._reset_charge_cycle(preserve_previous_active=True)
         await self._async_save_state()
 
     async def async_set_force_price(self, value: bool) -> None:
@@ -222,7 +227,7 @@ class SmartEVSEDualChargerController:
             self._mutable["force_timer"] = False
             self._mutable["timer_until"] = None
             self._clear_session_tracking()
-            self._reset_charge_cycle()
+            self._reset_charge_cycle(preserve_previous_active=True)
         await self._async_save_state()
 
     async def async_set_force_timer(self, value: bool) -> None:
@@ -234,17 +239,17 @@ class SmartEVSEDualChargerController:
             duration = int(self._mutable["force_charge_duration_minutes"])
             self._mutable["timer_until"] = (dt_util.utcnow() + timedelta(minutes=duration)).isoformat()
             self._clear_session_tracking()
-            self._reset_charge_cycle()
+            self._reset_charge_cycle(preserve_previous_active=True)
         else:
             self._mutable["timer_until"] = None
-            self._reset_charge_cycle()
+            self._reset_charge_cycle(preserve_previous_active=True)
         await self._async_save_state()
 
     async def async_set_schedule_enabled(self, value: bool) -> None:
         """Enable or disable the schedule gate."""
         self._mutable["schedule_enabled"] = value
         if not value:
-            self._reset_charge_cycle()
+            self._reset_charge_cycle(preserve_previous_active=True)
         await self._async_save_state()
 
     async def async_set_acceptable_price(self, value: float) -> None:
@@ -264,13 +269,13 @@ class SmartEVSEDualChargerController:
         """Update the runtime charge policy."""
         self._mutable["charge_policy"] = ChargePolicy(value).value
         self._clear_session_tracking()
-        self._reset_charge_cycle()
+        self._reset_charge_cycle(preserve_previous_active=True)
         await self._async_save_state()
 
     async def async_set_duty_cycle_minutes(self, value: float) -> None:
         """Update the duty cycle interval."""
         self._mutable["duty_cycle_minutes"] = max(1, int(round(value)))
-        self._reset_charge_cycle()
+        self._reset_charge_cycle(preserve_previous_active=True)
         await self._async_save_state()
 
     async def async_set_update_interval(self, value: float) -> None:
@@ -290,7 +295,7 @@ class SmartEVSEDualChargerController:
 
     async def async_reset_sessions(self) -> None:
         """Reset the active SmartEVSE and start a new cycle."""
-        self._reset_charge_cycle()
+        self._reset_charge_cycle(preserve_previous_active=True)
         self._clear_session_tracking()
         await self._async_save_state()
 
@@ -357,7 +362,11 @@ class SmartEVSEDualChargerController:
             self._reset_charge_cycle()
         self._mutable["last_charge_allowed"] = charge_allowed
 
-        previous_active_smartevse = str(self._mutable.get("active_smartevse") or "")
+        previous_active_smartevse = str(
+            self._mutable.get("pending_previous_active_smartevse")
+            or self._mutable.get("active_smartevse")
+            or ""
+        )
         active_smartevse = "none"
         duty_cycle_remaining = 0
         active_smartevse_since = None
@@ -385,6 +394,7 @@ class SmartEVSEDualChargerController:
             and previous_active_smartevse != active_smartevse
         ):
             self._clear_smartevse_session_tracking(previous_active_smartevse)
+        self._mutable["pending_previous_active_smartevse"] = None
 
         await self._apply_modes(
             smartevse_1=smartevse_1,
@@ -478,8 +488,12 @@ class SmartEVSEDualChargerController:
         except ValueError:
             return DEFAULT_CHARGE_POLICY
 
-    def _reset_charge_cycle(self) -> None:
+    def _reset_charge_cycle(self, *, preserve_previous_active: bool = False) -> None:
         """Clear the active SmartEVSE so the next cycle restarts from policy."""
+        if preserve_previous_active and self._mutable.get("active_smartevse") in {"smartevse_1", "smartevse_2"}:
+            self._mutable["pending_previous_active_smartevse"] = self._mutable["active_smartevse"]
+        elif not preserve_previous_active:
+            self._mutable["pending_previous_active_smartevse"] = None
         self._mutable["active_smartevse"] = None
         self._mutable["active_smartevse_since"] = None
 
@@ -785,11 +799,14 @@ class SmartEVSEDualChargerController:
         if not wled_url:
             return
 
+        state_url = normalize_wled_state_url(wled_url)
         payload = self._build_wled_payload(smartevse_1=smartevse_1, smartevse_2=smartevse_2)
-        if payload == self._last_wled_payload:
+        current_state = await self._async_get_json(state_url)
+        if current_state is not None and runtime_state_matches_payload(current_state, payload):
+            self._last_wled_payload = payload
             return
 
-        if await self._async_post(normalize_wled_state_url(wled_url), json_payload=payload):
+        if await self._async_post(state_url, json_payload=payload):
             self._last_wled_payload = payload
             self._mutable["last_wled_push"] = dt_util.utcnow().isoformat()
 
@@ -800,7 +817,12 @@ class SmartEVSEDualChargerController:
         smartevse_2: SmartEVSEStatus,
     ) -> dict[str, Any]:
         """Create the WLED payload."""
-        return build_runtime_payload(smartevse_1=smartevse_1, smartevse_2=smartevse_2)
+        return build_runtime_payload(
+            smartevse_1=smartevse_1,
+            smartevse_2=smartevse_2,
+            led_count=int(self._entry_data.get(CONF_WLED_LED_COUNT, DEFAULT_WLED_LED_COUNT)),
+            led_offset=int(self._entry_data.get(CONF_WLED_LED_OFFSET, DEFAULT_WLED_LED_OFFSET)),
+        )
 
     async def _handle_schedule_notification(self, *, schedule_window_active: bool, schedule_enabled: bool) -> None:
         """Create or dismiss the schedule disabled notification."""

@@ -3,13 +3,12 @@
     "step": {
       "user": {
         "title": "SmartEVSE Dual Charger",
-        "description": "Connect the controller to both SmartEVSE REST endpoints, Shelly mains and EV-meter sensors, and optional local endpoints.",
+        "description": "Connect the controller to both SmartEVSE REST endpoints, Shelly mains and EV-meter sensors, and choose whether WLED should be set up.",
         "data": {
           "name": "Name",
           "smartevse_1_base_url": "SmartEVSE 1 base URL/IP",
           "smartevse_2_base_url": "SmartEVSE 2 base URL/IP",
-          "wled_url": "WLED URL/IP (optional)",
-          "recreate_wled_presets": "Delete old SmartEVSE WLED presets and recreate the segment layout and LED map",
+          "setup_wled": "Set up WLED now",
           "mains_l1_entity": "Mains current L1 sensor",
           "mains_l2_entity": "Mains current L2 sensor",
           "mains_l3_entity": "Mains current L3 sensor",
@@ -22,10 +21,21 @@
           "price_sensor_entity": "Electricity price sensor",
           "schedule_entity": "Charge schedule entity"
         }
+      },
+      "wled": {
+        "title": "WLED Setup",
+        "description": "Provide the WLED base URL/IP, physical LED layout, and the presets.json content to upload.",
+        "data": {
+          "wled_url": "WLED URL/IP",
+          "wled_led_count": "WLED LED count",
+          "wled_led_offset": "WLED LED offset",
+          "wled_presets_json": "WLED presets JSON"
+        }
       }
     },
     "error": {
       "invalid_url": "One or more endpoint URLs/IPs are invalid.",
+      "invalid_json": "The WLED presets JSON is invalid.",
       "wled_url_required": "A WLED URL/IP is required before presets can be recreated.",
       "wled_preset_setup_failed": "Unable to recreate WLED presets. Check Home Assistant logs."
     },
@@ -33,7 +43,7 @@
       "already_configured": "The SmartEVSE dual charger controller is already configured."
     },
     "progress": {
-      "recreate_wled_presets": "Recreating SmartEVSE WLED presets, segment layout, and LED map."
+      "recreate_wled_presets": "Deleting all WLED presets and segments, then recreating the SmartEVSE layout and LED map."
     }
   },
   "options": {
@@ -50,13 +60,13 @@
           "push_ev_meter": "Push EV meter data to SmartEVSE endpoints",
           "ev_meter_push_interval": "EV meter push interval (seconds)",
           "push_wled": "Manage WLED directly",
-          "recreate_wled_presets": "Delete old SmartEVSE WLED presets and recreate the segment layout and LED map",
+          "recreate_wled_presets": "Delete all WLED presets and segments, then recreate the SmartEVSE layout and LED map",
           "notify_on_schedule_window": "Create a notification when schedule window starts while disabled"
         }
       }
     },
     "progress": {
-      "recreate_wled_presets": "Recreating SmartEVSE WLED presets, segment layout, and LED map."
+      "recreate_wled_presets": "Deleting all WLED presets and segments, then recreating the SmartEVSE layout and LED map."
     },
     "error": {
       "wled_url_required": "A WLED URL/IP is required before presets can be recreated.",
@@ -92,6 +102,9 @@
       "acceptable_price": {
         "name": "Acceptable price"
       },
+      "force_charge_duration": {
+        "name": "Force charge duration"
+      },
       "duty_cycle_minutes": {
         "name": "Duty cycle"
       },
@@ -103,11 +116,6 @@
       },
       "ev_meter_push_interval": {
         "name": "EV meter push interval"
-      }
-    },
-    "time": {
-      "force_charge_duration": {
-        "name": "Force charge duration"
       }
     },
     "select": {

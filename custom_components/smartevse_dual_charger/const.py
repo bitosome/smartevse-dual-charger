@@ -9,7 +9,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "smartevse_dual_charger"
 NAME = "SmartEVSE Dual Charger"
-VERSION = "0.0.4"
+VERSION = "0.0.5"
 
 LOGGER = logging.getLogger(__package__)
 
@@ -17,7 +17,6 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.SWITCH,
     Platform.NUMBER,
-    Platform.TIME,
     Platform.SELECT,
 ]
 
@@ -36,6 +35,8 @@ DEFAULT_CHARGE_POLICY = "smartevse_1_first"
 DEFAULT_PUSH_CURRENTS = True
 DEFAULT_PUSH_EV_METER = True
 DEFAULT_PUSH_WLED = True
+DEFAULT_WLED_LED_COUNT = 105
+DEFAULT_WLED_LED_OFFSET = 11
 
 ATTR_ACTIVE_SMARTEVSE = "active_smartevse"
 ATTR_ACTIVE_SMARTEVSE_SINCE = "active_smartevse_since"
@@ -78,6 +79,9 @@ CONF_RECREATE_WLED_PRESETS = "recreate_wled_presets"
 CONF_SCHEDULE_ENTITY = "schedule_entity"
 CONF_UPDATE_INTERVAL = "update_interval"
 CONF_WLED_URL = "wled_url"
+CONF_WLED_LED_COUNT = "wled_led_count"
+CONF_WLED_LED_OFFSET = "wled_led_offset"
+CONF_WLED_PRESETS_JSON = "wled_presets_json"
 
 SCHEDULE_NOTIFICATION_ID = f"{DOMAIN}_schedule_disabled"
 
