@@ -33,8 +33,10 @@ from .const import (
     CONF_PUSH_WLED,
     CONF_RECREATE_WLED_PRESETS,
     CONF_SCHEDULE_ENTITY,
+    CONF_SMARTEVSE_1_BATTERY_ENTITY,
     CONF_SMARTEVSE_1_NAME,
     CONF_SMARTEVSE_2_NAME,
+    CONF_SMARTEVSE_2_BATTERY_ENTITY,
     CONF_SMARTEVSE_1_BASE_URL,
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
@@ -73,6 +75,8 @@ LEGACY_DEFAULTS: dict[str, Any] = {
     CONF_NAME: DEFAULT_NAME,
     CONF_SMARTEVSE_1_NAME: DEFAULT_SMARTEVSE_1_NAME,
     CONF_SMARTEVSE_2_NAME: DEFAULT_SMARTEVSE_2_NAME,
+    CONF_SMARTEVSE_1_BATTERY_ENTITY: "sensor.volvo_xc40_battery",
+    CONF_SMARTEVSE_2_BATTERY_ENTITY: "sensor.volvo_ex30_battery",
     CONF_SMARTEVSE_1_BASE_URL: "192.168.0.234",
     CONF_SMARTEVSE_2_BASE_URL: "192.168.0.44",
     CONF_WLED_URL: "192.168.0.81",
@@ -291,6 +295,14 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_NAME, default=user_input.get(CONF_NAME, DEFAULT_NAME)): selector.TextSelector(),
                 vol.Optional(CONF_SMARTEVSE_1_NAME, default=user_input.get(CONF_SMARTEVSE_1_NAME, DEFAULT_SMARTEVSE_1_NAME)): selector.TextSelector(),
                 vol.Optional(CONF_SMARTEVSE_2_NAME, default=user_input.get(CONF_SMARTEVSE_2_NAME, DEFAULT_SMARTEVSE_2_NAME)): selector.TextSelector(),
+                vol.Optional(
+                    CONF_SMARTEVSE_1_BATTERY_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_SMARTEVSE_1_BATTERY_ENTITY),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_SMARTEVSE_2_BATTERY_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_SMARTEVSE_2_BATTERY_ENTITY),
+                ): _entity_selector("sensor"),
                 vol.Required(CONF_SMARTEVSE_1_BASE_URL, default=user_input.get(CONF_SMARTEVSE_1_BASE_URL, "")): selector.TextSelector(),
                 vol.Required(CONF_SMARTEVSE_2_BASE_URL, default=user_input.get(CONF_SMARTEVSE_2_BASE_URL, "")): selector.TextSelector(),
                 vol.Required(
@@ -409,6 +421,20 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
                         self._config_entry.data.get(CONF_SMARTEVSE_2_NAME, DEFAULT_SMARTEVSE_2_NAME),
                     ),
                 ): selector.TextSelector(),
+                vol.Optional(
+                    CONF_SMARTEVSE_1_BATTERY_ENTITY,
+                    default=_optional_entity_default(
+                        values,
+                        CONF_SMARTEVSE_1_BATTERY_ENTITY,
+                    ),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_SMARTEVSE_2_BATTERY_ENTITY,
+                    default=_optional_entity_default(
+                        values,
+                        CONF_SMARTEVSE_2_BATTERY_ENTITY,
+                    ),
+                ): _entity_selector("sensor"),
                 vol.Required(
                     CONF_CHARGE_POLICY_DEFAULT,
                     default=values.get(

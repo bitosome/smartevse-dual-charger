@@ -8,6 +8,8 @@
           "name": "Name",
           "smartevse_1_name": "SmartEVSE 1 display name",
           "smartevse_2_name": "SmartEVSE 2 display name",
+          "smartevse_1_battery_entity": "SmartEVSE 1 EV battery sensor",
+          "smartevse_2_battery_entity": "SmartEVSE 2 EV battery sensor",
           "smartevse_1_base_url": "SmartEVSE 1 base URL/IP",
           "smartevse_2_base_url": "SmartEVSE 2 base URL/IP",
           "setup_wled": "Set up WLED now",
@@ -56,6 +58,8 @@
         "data": {
           "smartevse_1_name": "SmartEVSE 1 display name",
           "smartevse_2_name": "SmartEVSE 2 display name",
+          "smartevse_1_battery_entity": "SmartEVSE 1 EV battery sensor",
+          "smartevse_2_battery_entity": "SmartEVSE 2 EV battery sensor",
           "charge_policy_default": "Default charge policy",
           "duty_cycle_minutes": "Duty cycle (minutes)",
           "update_interval": "Controller refresh interval (seconds)",

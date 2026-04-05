@@ -35,6 +35,40 @@ IDLE_SX = 45
 IDLE_IX = 128
 
 
+def build_flow_card_visuals() -> dict[str, dict[str, Any]]:
+    """Return the SmartEVSE visual definitions used by the flow card."""
+    return {
+        "off": {
+            "color": [148, 163, 184],
+            "fx": 0,
+            "sx": 0,
+            "ix": 0,
+        },
+        "idle": {
+            "color": COLOR_IDLE,
+            "fx": IDLE_FX,
+            "sx": IDLE_SX,
+            "ix": IDLE_IX,
+        },
+        "error": {
+            "color": COLOR_ERROR,
+            "fx": 2,
+            "sx": 60,
+            "ix": 200,
+        },
+        "charging": {
+            "color": COLOR_CHARGING,
+            "fx": CHARGING_FX,
+            "sx": CHARGING_SX,
+            "ix": CHARGING_IX,
+            "pal": CHARGING_PAL,
+            "c1": CHARGING_C1,
+            "c2": CHARGING_C2,
+            "c3": CHARGING_C3,
+        },
+    }
+
+
 class WLEDPresetError(RuntimeError):
     """Raised when WLED assets cannot be recreated."""
 

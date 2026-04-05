@@ -51,8 +51,10 @@ from .const import (
     CONF_PUSH_EV_METER,
     CONF_PUSH_WLED,
     CONF_SCHEDULE_ENTITY,
+    CONF_SMARTEVSE_1_BATTERY_ENTITY,
     CONF_SMARTEVSE_1_NAME,
     CONF_SMARTEVSE_2_NAME,
+    CONF_SMARTEVSE_2_BATTERY_ENTITY,
     CONF_SMARTEVSE_1_BASE_URL,
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
@@ -82,7 +84,7 @@ from .const import (
     ChargePolicy,
 )
 from .naming import active_smartevse_label, configured_smartevse_name
-from .wled import build_runtime_payload, normalize_wled_state_url, runtime_state_matches_payload
+from .wled import build_flow_card_visuals, build_runtime_payload, normalize_wled_state_url, runtime_state_matches_payload
 
 MUTABLE_DEFAULTS: dict[str, Any] = {
     "force_charge": False,
@@ -417,6 +419,8 @@ class SmartEVSEDualChargerController:
 
         smartevse_1_name = self._configured_smartevse_name("smartevse_1")
         smartevse_2_name = self._configured_smartevse_name("smartevse_2")
+        smartevse_1_battery = self._state_display(self._configured_battery_entity("smartevse_1"))
+        smartevse_2_battery = self._state_display(self._configured_battery_entity("smartevse_2"))
 
         return {
             "force_charge": bool(self._mutable["force_charge"]),
@@ -447,7 +451,9 @@ class SmartEVSEDualChargerController:
             ATTR_LAST_EV_METER_PUSH: self._mutable["last_ev_meter_push"],
             ATTR_LAST_WLED_PUSH: self._mutable["last_wled_push"],
             ATTR_LAST_NOTIFICATION: self._mutable["last_notification"],
+            "wled_visuals": build_flow_card_visuals(),
             "smartevse_1_name": smartevse_1_name,
+            "smartevse_1_battery": smartevse_1_battery,
             "smartevse_1_available": smartevse_1.available,
             "smartevse_1_state": smartevse_1.state,
             "smartevse_1_plug_state": smartevse_1.plug_state,
@@ -458,6 +464,7 @@ class SmartEVSEDualChargerController:
             "smartevse_1_error": smartevse_1.error,
             "smartevse_1_session_complete": bool(self._mutable["smartevse_1_session_complete"]),
             "smartevse_2_name": smartevse_2_name,
+            "smartevse_2_battery": smartevse_2_battery,
             "smartevse_2_available": smartevse_2.available,
             "smartevse_2_state": smartevse_2.state,
             "smartevse_2_plug_state": smartevse_2.plug_state,
@@ -514,6 +521,16 @@ class SmartEVSEDualChargerController:
             ),
         }
         return configured_smartevse_name(values, smartevse_key)
+
+    def _configured_battery_entity(self, smartevse_key: str) -> str | None:
+        """Return the configured EV battery entity for one SmartEVSE."""
+        config_key = (
+            CONF_SMARTEVSE_1_BATTERY_ENTITY
+            if smartevse_key == "smartevse_1"
+            else CONF_SMARTEVSE_2_BATTERY_ENTITY
+        )
+        value = self._options.get(config_key, self._entry_data.get(config_key))
+        return str(value).strip() or None
 
     def _reset_charge_cycle(self, *, preserve_previous_active: bool = False) -> None:
         """Clear the active SmartEVSE so the next cycle restarts from policy."""
@@ -892,6 +909,21 @@ class SmartEVSEDualChargerController:
         if state is None or state.state in {"unknown", "unavailable", None}:
             return default
         return str(state.state)
+
+    def _state_display(self, entity_id: str | None) -> str | None:
+        """Read an entity state as a display string with unit if available."""
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in {"unknown", "unavailable", None}:
+            return None
+        raw = str(state.state).strip()
+        if not raw:
+            return None
+        unit = str(state.attributes.get("unit_of_measurement", "")).strip()
+        if not unit or raw.endswith(unit):
+            return raw
+        return f"{raw}{unit}" if unit in {"%", "°C"} else f"{raw} {unit}"
 
     def _state_float(self, entity_id: str | None, default: float = 0.0) -> float:
         """Read an entity state as a float."""
