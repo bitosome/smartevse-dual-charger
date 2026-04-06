@@ -131,9 +131,10 @@ Precedence is fixed:
 
 Practical result:
 
-- any force mode wins over schedule
+- force charge and timer override schedule
+- force charge by price runs immediately when the schedule gate is off, but honors the schedule gate when it is on
 - force modes are mutually exclusive
-- schedule is only used when no force mode is active
+- schedule-only mode is used when no force mode is active
 
 High-level controller states:
 
@@ -215,6 +216,7 @@ Price mode:
 - if the price sensor is missing or invalid, charging is blocked
 - invalid price data is not treated as `0`
 - charging starts only when `price <= acceptable_price`
+- if `Charge with schedule` is enabled, both `price <= acceptable_price` and an active schedule window are required
 
 Schedule mode:
 

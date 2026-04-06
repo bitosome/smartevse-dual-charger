@@ -593,6 +593,11 @@ class SmartEVSEDualChargerController:
                 return False, ControllerState.IDLE, "price_sensor_unavailable"
             if price_value is None:
                 return False, ControllerState.IDLE, "price_sensor_unavailable"
+            if self._mutable["schedule_enabled"]:
+                if not self._entry_data.get(CONF_SCHEDULE_ENTITY):
+                    return False, ControllerState.IDLE, "schedule_entity_unavailable"
+                if not schedule_window_active:
+                    return False, ControllerState.IDLE, "waiting_for_schedule_window"
             if price_value <= acceptable_price:
                 return True, ControllerState.PRICE, "acceptable_price"
             return False, ControllerState.IDLE, "waiting_for_acceptable_price"
