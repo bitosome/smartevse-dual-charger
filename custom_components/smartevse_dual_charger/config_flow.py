@@ -33,15 +33,15 @@ from .const import (
     CONF_PUSH_WLED,
     CONF_RECREATE_WLED_PRESETS,
     CONF_SCHEDULE_ENTITY,
-    CONF_SMARTEVSE_1_BATTERY_ENTITY,
-    CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY,
-    CONF_SMARTEVSE_1_NAME,
-    CONF_SMARTEVSE_2_NAME,
-    CONF_SMARTEVSE_2_BATTERY_ENTITY,
-    CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY,
     CONF_SMARTEVSE_1_BASE_URL,
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
+    CONF_VEHICLE_1_BATTERY_ENTITY,
+    CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY,
+    CONF_VEHICLE_1_NAME,
+    CONF_VEHICLE_2_BATTERY_ENTITY,
+    CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY,
+    CONF_VEHICLE_2_NAME,
     CONF_WLED_URL,
     CONF_WLED_LED_COUNT,
     CONF_WLED_LED_OFFSET,
@@ -55,16 +55,15 @@ from .const import (
     DEFAULT_PUSH_CURRENTS,
     DEFAULT_PUSH_EV_METER,
     DEFAULT_PUSH_WLED,
-    DEFAULT_SMARTEVSE_1_NAME,
-    DEFAULT_SMARTEVSE_2_NAME,
     DEFAULT_UPDATE_INTERVAL,
+    DEFAULT_VEHICLE_1_NAME,
+    DEFAULT_VEHICLE_2_NAME,
     DEFAULT_WLED_LED_COUNT,
     DEFAULT_WLED_LED_OFFSET,
     DOMAIN,
     LOGGER,
-    ChargePolicy,
 )
-from .naming import charge_policy_select_options, configured_smartevse_names, normalize_smartevse_name
+from .naming import charge_policy_select_options, normalize_vehicle_name
 from .wled import (
     WLEDPresetError,
     async_recreate_wled_assets,
@@ -73,14 +72,14 @@ from .wled import (
 )
 
 CONF_SETUP_WLED = "setup_wled"
-LEGACY_DEFAULTS: dict[str, Any] = {
+CONFIG_DEFAULTS: dict[str, Any] = {
     CONF_NAME: DEFAULT_NAME,
-    CONF_SMARTEVSE_1_NAME: DEFAULT_SMARTEVSE_1_NAME,
-    CONF_SMARTEVSE_2_NAME: DEFAULT_SMARTEVSE_2_NAME,
-    CONF_SMARTEVSE_1_BATTERY_ENTITY: "sensor.volvo_xc40_battery",
-    CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY: "sensor.volvo_xc40_charging_connection_status",
-    CONF_SMARTEVSE_2_BATTERY_ENTITY: "sensor.volvo_ex30_battery",
-    CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY: "sensor.volvo_ex30_charging_connection_status",
+    CONF_VEHICLE_1_NAME: DEFAULT_VEHICLE_1_NAME,
+    CONF_VEHICLE_2_NAME: DEFAULT_VEHICLE_2_NAME,
+    CONF_VEHICLE_1_BATTERY_ENTITY: "sensor.volvo_xc40_battery",
+    CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY: "sensor.volvo_xc40_charging_connection_status",
+    CONF_VEHICLE_2_BATTERY_ENTITY: "sensor.volvo_ex30_battery",
+    CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY: "sensor.volvo_ex30_charging_connection_status",
     CONF_SMARTEVSE_1_BASE_URL: "192.168.0.234",
     CONF_SMARTEVSE_2_BASE_URL: "192.168.0.44",
     CONF_WLED_URL: "192.168.0.81",
@@ -162,20 +161,20 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 form_data = dict(user_input)
                 setup_wled = bool(form_data.pop(CONF_SETUP_WLED, False))
-                form_data[CONF_SMARTEVSE_1_NAME] = normalize_smartevse_name(
-                    str(form_data.get(CONF_SMARTEVSE_1_NAME, "")),
-                    DEFAULT_SMARTEVSE_1_NAME,
+                form_data[CONF_VEHICLE_1_NAME] = normalize_vehicle_name(
+                    str(form_data.get(CONF_VEHICLE_1_NAME, "")),
+                    DEFAULT_VEHICLE_1_NAME,
                 )
-                form_data[CONF_SMARTEVSE_2_NAME] = normalize_smartevse_name(
-                    str(form_data.get(CONF_SMARTEVSE_2_NAME, "")),
-                    DEFAULT_SMARTEVSE_2_NAME,
+                form_data[CONF_VEHICLE_2_NAME] = normalize_vehicle_name(
+                    str(form_data.get(CONF_VEHICLE_2_NAME, "")),
+                    DEFAULT_VEHICLE_2_NAME,
                 )
                 form_data[CONF_SMARTEVSE_1_BASE_URL] = _url_or_host(form_data[CONF_SMARTEVSE_1_BASE_URL])
                 form_data[CONF_SMARTEVSE_2_BASE_URL] = _url_or_host(form_data[CONF_SMARTEVSE_2_BASE_URL])
                 if setup_wled:
                     self._pending_user_input = form_data
                     self._pending_wled_input = {
-                        CONF_WLED_URL: LEGACY_DEFAULTS[CONF_WLED_URL],
+                        CONF_WLED_URL: CONFIG_DEFAULTS[CONF_WLED_URL],
                         CONF_WLED_LED_COUNT: DEFAULT_WLED_LED_COUNT,
                         CONF_WLED_LED_OFFSET: DEFAULT_WLED_LED_OFFSET,
                         CONF_WLED_PRESETS_JSON: build_default_presets_json(),
@@ -293,27 +292,27 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     def _build_user_schema(self, user_input: dict[str, Any] | None) -> vol.Schema:
         """Build the user step schema."""
-        user_input = {**LEGACY_DEFAULTS, **(user_input or {})}
+        user_input = {**CONFIG_DEFAULTS, **(user_input or {})}
         return vol.Schema(
             {
                 vol.Required(CONF_NAME, default=user_input.get(CONF_NAME, DEFAULT_NAME)): selector.TextSelector(),
-                vol.Optional(CONF_SMARTEVSE_1_NAME, default=user_input.get(CONF_SMARTEVSE_1_NAME, DEFAULT_SMARTEVSE_1_NAME)): selector.TextSelector(),
-                vol.Optional(CONF_SMARTEVSE_2_NAME, default=user_input.get(CONF_SMARTEVSE_2_NAME, DEFAULT_SMARTEVSE_2_NAME)): selector.TextSelector(),
+                vol.Optional(CONF_VEHICLE_1_NAME, default=user_input.get(CONF_VEHICLE_1_NAME, DEFAULT_VEHICLE_1_NAME)): selector.TextSelector(),
+                vol.Optional(CONF_VEHICLE_2_NAME, default=user_input.get(CONF_VEHICLE_2_NAME, DEFAULT_VEHICLE_2_NAME)): selector.TextSelector(),
                 vol.Optional(
-                    CONF_SMARTEVSE_1_BATTERY_ENTITY,
-                    default=_optional_entity_default(user_input, CONF_SMARTEVSE_1_BATTERY_ENTITY),
+                    CONF_VEHICLE_1_BATTERY_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_VEHICLE_1_BATTERY_ENTITY),
                 ): _entity_selector("sensor"),
                 vol.Optional(
-                    CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY,
-                    default=_optional_entity_default(user_input, CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY),
+                    CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY),
                 ): _entity_selector("sensor"),
                 vol.Optional(
-                    CONF_SMARTEVSE_2_BATTERY_ENTITY,
-                    default=_optional_entity_default(user_input, CONF_SMARTEVSE_2_BATTERY_ENTITY),
+                    CONF_VEHICLE_2_BATTERY_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_VEHICLE_2_BATTERY_ENTITY),
                 ): _entity_selector("sensor"),
                 vol.Optional(
-                    CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY,
-                    default=_optional_entity_default(user_input, CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY),
+                    CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY),
                 ): _entity_selector("sensor"),
                 vol.Required(CONF_SMARTEVSE_1_BASE_URL, default=user_input.get(CONF_SMARTEVSE_1_BASE_URL, "")): selector.TextSelector(),
                 vol.Required(CONF_SMARTEVSE_2_BASE_URL, default=user_input.get(CONF_SMARTEVSE_2_BASE_URL, "")): selector.TextSelector(),
@@ -355,7 +354,7 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         user_input = user_input or {}
         return vol.Schema(
             {
-                vol.Required(CONF_WLED_URL, default=user_input.get(CONF_WLED_URL, LEGACY_DEFAULTS[CONF_WLED_URL])): selector.TextSelector(),
+                vol.Required(CONF_WLED_URL, default=user_input.get(CONF_WLED_URL, CONFIG_DEFAULTS[CONF_WLED_URL])): selector.TextSelector(),
                 vol.Required(
                     CONF_WLED_LED_COUNT,
                     default=int(user_input.get(CONF_WLED_LED_COUNT, DEFAULT_WLED_LED_COUNT)),
@@ -416,49 +415,48 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
 
     def _build_options_schema(self, values: dict[str, Any]) -> vol.Schema:
         """Build the options step schema."""
-        smartevse_1_name, smartevse_2_name = configured_smartevse_names({**self._config_entry.data, **values})
         return vol.Schema(
             {
                 vol.Optional(
-                    CONF_SMARTEVSE_1_NAME,
+                    CONF_VEHICLE_1_NAME,
                     default=values.get(
-                        CONF_SMARTEVSE_1_NAME,
-                        self._config_entry.data.get(CONF_SMARTEVSE_1_NAME, DEFAULT_SMARTEVSE_1_NAME),
+                        CONF_VEHICLE_1_NAME,
+                        self._config_entry.data.get(CONF_VEHICLE_1_NAME, DEFAULT_VEHICLE_1_NAME),
                     ),
                 ): selector.TextSelector(),
                 vol.Optional(
-                    CONF_SMARTEVSE_2_NAME,
+                    CONF_VEHICLE_2_NAME,
                     default=values.get(
-                        CONF_SMARTEVSE_2_NAME,
-                        self._config_entry.data.get(CONF_SMARTEVSE_2_NAME, DEFAULT_SMARTEVSE_2_NAME),
+                        CONF_VEHICLE_2_NAME,
+                        self._config_entry.data.get(CONF_VEHICLE_2_NAME, DEFAULT_VEHICLE_2_NAME),
                     ),
                 ): selector.TextSelector(),
                 vol.Optional(
-                    CONF_SMARTEVSE_1_BATTERY_ENTITY,
+                    CONF_VEHICLE_1_BATTERY_ENTITY,
                     default=_optional_entity_default(
                         values,
-                        CONF_SMARTEVSE_1_BATTERY_ENTITY,
+                        CONF_VEHICLE_1_BATTERY_ENTITY,
                     ),
                 ): _entity_selector("sensor"),
                 vol.Optional(
-                    CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY,
+                    CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY,
                     default=_optional_entity_default(
                         values,
-                        CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY,
+                        CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY,
                     ),
                 ): _entity_selector("sensor"),
                 vol.Optional(
-                    CONF_SMARTEVSE_2_BATTERY_ENTITY,
+                    CONF_VEHICLE_2_BATTERY_ENTITY,
                     default=_optional_entity_default(
                         values,
-                        CONF_SMARTEVSE_2_BATTERY_ENTITY,
+                        CONF_VEHICLE_2_BATTERY_ENTITY,
                     ),
                 ): _entity_selector("sensor"),
                 vol.Optional(
-                    CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY,
+                    CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY,
                     default=_optional_entity_default(
                         values,
-                        CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY,
+                        CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY,
                     ),
                 ): _entity_selector("sensor"),
                 vol.Required(
@@ -472,7 +470,7 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
                     ),
                 ): selector.SelectSelector(
                     selector.SelectSelectorConfig(
-                        options=charge_policy_select_options(smartevse_1_name, smartevse_2_name),
+                        options=charge_policy_select_options(),
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 ),
@@ -587,13 +585,13 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
 
         if user_input is not None:
             options_data = dict(user_input)
-            options_data[CONF_SMARTEVSE_1_NAME] = normalize_smartevse_name(
-                str(options_data.get(CONF_SMARTEVSE_1_NAME, "")),
-                DEFAULT_SMARTEVSE_1_NAME,
+            options_data[CONF_VEHICLE_1_NAME] = normalize_vehicle_name(
+                str(options_data.get(CONF_VEHICLE_1_NAME, "")),
+                DEFAULT_VEHICLE_1_NAME,
             )
-            options_data[CONF_SMARTEVSE_2_NAME] = normalize_smartevse_name(
-                str(options_data.get(CONF_SMARTEVSE_2_NAME, "")),
-                DEFAULT_SMARTEVSE_2_NAME,
+            options_data[CONF_VEHICLE_2_NAME] = normalize_vehicle_name(
+                str(options_data.get(CONF_VEHICLE_2_NAME, "")),
+                DEFAULT_VEHICLE_2_NAME,
             )
             recreate_wled_presets = bool(options_data.pop(CONF_RECREATE_WLED_PRESETS, False))
             if recreate_wled_presets:

@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.7.2`
+Version: `0.0.7.3`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -44,12 +44,12 @@ That means these SmartEVSE-side settings still matter and must be configured on 
 
 The config flow asks for:
 
-- optional SmartEVSE 1 display name
-- optional SmartEVSE 2 display name
-- optional SmartEVSE 1 EV battery sensor
-- optional SmartEVSE 2 EV battery sensor
-- optional SmartEVSE 1 EV connection-status sensor
-- optional SmartEVSE 2 EV connection-status sensor
+- optional Vehicle 1 name
+- optional Vehicle 2 name
+- optional Vehicle 1 battery sensor
+- optional Vehicle 2 battery sensor
+- optional Vehicle 1 connection-status sensor
+- optional Vehicle 2 connection-status sensor
 - SmartEVSE 1 base URL/IP
 - SmartEVSE 2 base URL/IP
 - whether WLED should be set up now
@@ -64,12 +64,12 @@ Current prefilled defaults:
 
 | Field | Default |
 | --- | --- |
-| SmartEVSE 1 display name | `Volvo XC40` |
-| SmartEVSE 2 display name | `Volvo EX30` |
-| SmartEVSE 1 EV battery sensor | `sensor.volvo_xc40_battery` |
-| SmartEVSE 1 EV connection-status sensor | `sensor.volvo_xc40_charging_connection_status` |
-| SmartEVSE 2 EV battery sensor | `sensor.volvo_ex30_battery` |
-| SmartEVSE 2 EV connection-status sensor | `sensor.volvo_ex30_charging_connection_status` |
+| Vehicle 1 name | `Volvo XC40` |
+| Vehicle 2 name | `Volvo EX30` |
+| Vehicle 1 battery sensor | `sensor.volvo_xc40_battery` |
+| Vehicle 1 connection-status sensor | `sensor.volvo_xc40_charging_connection_status` |
+| Vehicle 2 battery sensor | `sensor.volvo_ex30_battery` |
+| Vehicle 2 connection-status sensor | `sensor.volvo_ex30_charging_connection_status` |
 | SmartEVSE 1 base URL/IP | `192.168.0.234` |
 | SmartEVSE 2 base URL/IP | `192.168.0.44` |
 | WLED URL/IP | `192.168.0.81` |
@@ -88,7 +88,8 @@ Current prefilled defaults:
 Notes:
 
 - SmartEVSE MQTT entities are not required.
-- SmartEVSE display names are optional aliases used in Home Assistant UI surfaces such as the charge-policy dropdown, the active SmartEVSE sensor, and the example dashboard card.
+- SmartEVSE names are fixed in the integration: `SmartEVSE 1` and `SmartEVSE 2`.
+- Vehicle 1 and Vehicle 2 are known vehicle identities used only for EV mapping, battery display, and the connected-EV UI.
 - EV battery sensors are optional. If configured, their values are exposed on the controller-state attributes and shown on the EV node in the custom flow card.
 - EV connection-status sensors are optional, but they enable EV-to-SmartEVSE identity mapping and let the card show the actual connected vehicle name instead of `?`.
 - If WLED setup is enabled, the flow opens a dedicated second WLED step.
@@ -108,12 +109,12 @@ The WLED step validates the JSON and then performs the destructive WLED rebuild 
 
 The options flow controls the default behavior of the integration:
 
-- SmartEVSE 1 display name
-- SmartEVSE 2 display name
-- SmartEVSE 1 EV battery sensor
-- SmartEVSE 2 EV battery sensor
-- SmartEVSE 1 EV connection-status sensor
-- SmartEVSE 2 EV connection-status sensor
+- Vehicle 1 name
+- Vehicle 2 name
+- Vehicle 1 battery sensor
+- Vehicle 2 battery sensor
+- Vehicle 1 EV connection-status sensor
+- Vehicle 2 EV connection-status sensor
 - default charge policy
 - duty cycle
 - controller refresh interval
@@ -126,7 +127,7 @@ The options flow controls the default behavior of the integration:
 The runtime number entities reflect the live values and can be changed directly from Home Assistant without reopening the options dialog.
 
 The options flow does not edit WLED layout fields directly. If WLED is already configured, the recreate checkbox reuses the stored WLED URL/IP, LED count, LED offset, and presets JSON.
-Changing either SmartEVSE display name updates the charge-policy dropdown labels, the active SmartEVSE sensor value, and the example dashboard card after the entry reloads.
+Changing Vehicle 1 or Vehicle 2 updates the connected-EV labels after the entry reloads. It does not rename SmartEVSE 1 or SmartEVSE 2.
 
 ## Charge Triggers and Precedence
 
@@ -143,6 +144,8 @@ Precedence is fixed:
 2. `Force charge timer`
 3. `Force charge by price`
 4. `Charge with schedule`
+
+If `Charge with schedule` is enabled at the same time as `Force charge by price`, the schedule window is treated as an additional gate. Price-based charging will not run outside the schedule window.
 
 Practical result:
 
@@ -437,7 +440,7 @@ It shows:
 - force charge, price, and timer controls
 - charge policy and main tuning entities
 
-It expects Mushroom cards and reads detailed charger state from the stable `Controller state` sensor attributes, so the card does not depend on alias-derived per-SmartEVSE entity IDs.
+It expects Mushroom cards and reads detailed charger state from the stable `Controller state` sensor attributes, so the card does not depend on per-SmartEVSE entity-ID naming.
 
 The standalone flow card now lives in the separate [smartevse-dual-charger-card](https://github.com/bitosome/smartevse-dual-charger-card) repository. That repo contains:
 
@@ -448,7 +451,7 @@ The standalone flow card now lives in the separate [smartevse-dual-charger-card]
 
 ## Legacy Compatibility
 
-Do not run the legacy YAML automation and this integration at the same time.
+Do not run the old YAML automation and this integration at the same time.
 
 Both write SmartEVSE modes and will fight each other.
 

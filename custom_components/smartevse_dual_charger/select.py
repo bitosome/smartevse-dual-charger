@@ -29,10 +29,7 @@ class ChargePolicySelect(SmartEVSEDualChargerEntity, SelectEntity):
         """Initialize the selector."""
         super().__init__(entry)
         self._attr_unique_id = f"{entry.entry_id}_charge_policy"
-        self._policy_labels = charge_policy_labels(
-            self._configured_smartevse_name("smartevse_1"),
-            self._configured_smartevse_name("smartevse_2"),
-        )
+        self._policy_labels = charge_policy_labels()
         self._label_to_policy = {label: policy for policy, label in self._policy_labels.items()}
         self._attr_options = list(self._label_to_policy)
 

@@ -51,15 +51,15 @@ from .const import (
     CONF_PUSH_EV_METER,
     CONF_PUSH_WLED,
     CONF_SCHEDULE_ENTITY,
-    CONF_SMARTEVSE_1_BATTERY_ENTITY,
-    CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY,
-    CONF_SMARTEVSE_1_NAME,
-    CONF_SMARTEVSE_2_NAME,
-    CONF_SMARTEVSE_2_BATTERY_ENTITY,
-    CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY,
     CONF_SMARTEVSE_1_BASE_URL,
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
+    CONF_VEHICLE_1_BATTERY_ENTITY,
+    CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY,
+    CONF_VEHICLE_1_NAME,
+    CONF_VEHICLE_2_BATTERY_ENTITY,
+    CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY,
+    CONF_VEHICLE_2_NAME,
     CONF_WLED_URL,
     CONF_WLED_LED_COUNT,
     CONF_WLED_LED_OFFSET,
@@ -74,9 +74,9 @@ from .const import (
     DEFAULT_PUSH_CURRENTS,
     DEFAULT_PUSH_EV_METER,
     DEFAULT_PUSH_WLED,
-    DEFAULT_SMARTEVSE_1_NAME,
-    DEFAULT_SMARTEVSE_2_NAME,
     DEFAULT_UPDATE_INTERVAL,
+    DEFAULT_VEHICLE_1_NAME,
+    DEFAULT_VEHICLE_2_NAME,
     DEFAULT_WLED_LED_COUNT,
     DEFAULT_WLED_LED_OFFSET,
     LOGGER,
@@ -85,7 +85,7 @@ from .const import (
     STORAGE_VERSION,
     ChargePolicy,
 )
-from .naming import active_smartevse_label, configured_smartevse_name
+from .naming import active_smartevse_label, configured_vehicle_name, smartevse_name
 from .wled import build_flow_card_visuals, build_runtime_payload, normalize_wled_state_url, runtime_state_matches_payload
 
 MUTABLE_DEFAULTS: dict[str, Any] = {
@@ -123,8 +123,8 @@ MUTABLE_DEFAULTS: dict[str, Any] = {
     "smartevse_2_connected_ev": "unknown",
     "smartevse_2_last_connected": None,
     "smartevse_2_last_plug_connected": None,
-    "vehicle_1_last_connected": None,
-    "vehicle_2_last_connected": None,
+    "known_vehicle_1_last_connected": None,
+    "known_vehicle_2_last_connected": None,
 }
 
 MODE_NAME_TO_ID = {
@@ -433,8 +433,8 @@ class SmartEVSEDualChargerController:
         if timer_until is not None:
             timer_remaining = max(int((timer_until - now).total_seconds()), 0)
 
-        smartevse_1_name = self._configured_smartevse_name("smartevse_1")
-        smartevse_2_name = self._configured_smartevse_name("smartevse_2")
+        smartevse_1_name = smartevse_name("smartevse_1")
+        smartevse_2_name = smartevse_name("smartevse_2")
         smartevse_1_connected_ev = self._connected_ev_label("smartevse_1")
         smartevse_2_connected_ev = self._connected_ev_label("smartevse_2")
         smartevse_1_battery = self._connected_ev_battery("smartevse_1")
@@ -459,7 +459,7 @@ class SmartEVSEDualChargerController:
             ATTR_CONTROLLER_STATE: controller_state.value,
             ATTR_CHARGE_REASON: charge_reason,
             ATTR_MAINS_PEAK: None if mains_peak is None else round(mains_peak, 1),
-            ATTR_ACTIVE_SMARTEVSE: active_smartevse_label(active_smartevse, smartevse_1_name, smartevse_2_name),
+            ATTR_ACTIVE_SMARTEVSE: active_smartevse_label(active_smartevse),
             "active_smartevse_raw": active_smartevse,
             ATTR_ACTIVE_SMARTEVSE_SINCE: active_smartevse_since,
             ATTR_DUTY_CYCLE_REMAINING: duty_cycle_remaining,
@@ -532,28 +532,28 @@ class SmartEVSEDualChargerController:
         except ValueError:
             return DEFAULT_CHARGE_POLICY
 
-    def _configured_smartevse_name(self, smartevse_key: str) -> str:
-        """Return the configured alias for one SmartEVSE."""
+    def _configured_vehicle_name(self, vehicle_key: str) -> str:
+        """Return the configured name for one known vehicle."""
         values = {
             **self._entry_data,
             **self._options,
-            CONF_SMARTEVSE_1_NAME: self._options.get(
-                CONF_SMARTEVSE_1_NAME,
-                self._entry_data.get(CONF_SMARTEVSE_1_NAME, DEFAULT_SMARTEVSE_1_NAME),
+            CONF_VEHICLE_1_NAME: self._options.get(
+                CONF_VEHICLE_1_NAME,
+                self._entry_data.get(CONF_VEHICLE_1_NAME, DEFAULT_VEHICLE_1_NAME),
             ),
-            CONF_SMARTEVSE_2_NAME: self._options.get(
-                CONF_SMARTEVSE_2_NAME,
-                self._entry_data.get(CONF_SMARTEVSE_2_NAME, DEFAULT_SMARTEVSE_2_NAME),
+            CONF_VEHICLE_2_NAME: self._options.get(
+                CONF_VEHICLE_2_NAME,
+                self._entry_data.get(CONF_VEHICLE_2_NAME, DEFAULT_VEHICLE_2_NAME),
             ),
         }
-        return configured_smartevse_name(values, smartevse_key)
+        return configured_vehicle_name(values, vehicle_key)
 
-    def _configured_battery_entity(self, smartevse_key: str) -> str | None:
-        """Return the configured EV battery entity for one SmartEVSE."""
+    def _configured_battery_entity(self, vehicle_key: str) -> str | None:
+        """Return the configured EV battery entity for one known vehicle."""
         config_key = (
-            CONF_SMARTEVSE_1_BATTERY_ENTITY
-            if smartevse_key == "smartevse_1"
-            else CONF_SMARTEVSE_2_BATTERY_ENTITY
+            CONF_VEHICLE_1_BATTERY_ENTITY
+            if vehicle_key == "vehicle_1"
+            else CONF_VEHICLE_2_BATTERY_ENTITY
         )
         value = self._options.get(config_key, self._entry_data.get(config_key))
         return str(value).strip() or None
@@ -561,9 +561,9 @@ class SmartEVSEDualChargerController:
     def _configured_connection_status_entity(self, vehicle_key: str) -> str | None:
         """Return the configured EV connection-status entity for one known vehicle."""
         config_key = (
-            CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY
-            if vehicle_key == "smartevse_1"
-            else CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY
+            CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY
+            if vehicle_key == "vehicle_1"
+            else CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY
         )
         value = self._options.get(config_key, self._entry_data.get(config_key))
         return str(value).strip() or None
@@ -596,7 +596,7 @@ class SmartEVSEDualChargerController:
     def _mapped_vehicle_key(self, smartevse_key: str) -> str | None:
         """Return the mapped known-vehicle key for one SmartEVSE."""
         value = str(self._mutable.get(f"{smartevse_key}_connected_ev") or "").strip()
-        if value in {"smartevse_1", "smartevse_2"}:
+        if value in {"vehicle_1", "vehicle_2"}:
             return value
         return None
 
@@ -605,7 +605,7 @@ class SmartEVSEDualChargerController:
         vehicle_key = self._mapped_vehicle_key(smartevse_key)
         if not vehicle_key:
             return "unknown"
-        return self._configured_smartevse_name(vehicle_key)
+        return self._configured_vehicle_name(vehicle_key)
 
     def _connected_ev_battery(self, smartevse_key: str) -> str | None:
         """Return the mapped EV battery display for one SmartEVSE."""
@@ -653,7 +653,7 @@ class SmartEVSEDualChargerController:
 
     def _set_connected_vehicle(self, smartevse_key: str, vehicle_key: str | None) -> None:
         """Assign one known vehicle to one SmartEVSE."""
-        normalized = vehicle_key if vehicle_key in {"smartevse_1", "smartevse_2"} else "unknown"
+        normalized = vehicle_key if vehicle_key in {"vehicle_1", "vehicle_2"} else "unknown"
         if normalized != "unknown":
             other_smartevse = self._other_smartevse(smartevse_key)
             if self._mutable.get(f"{other_smartevse}_connected_ev") == normalized:
@@ -673,12 +673,12 @@ class SmartEVSEDualChargerController:
             "smartevse_2": smartevse_2,
         }
         vehicle_connected = {
-            "smartevse_1": self._vehicle_connection_state("smartevse_1"),
-            "smartevse_2": self._vehicle_connection_state("smartevse_2"),
+            "vehicle_1": self._vehicle_connection_state("vehicle_1"),
+            "vehicle_2": self._vehicle_connection_state("vehicle_2"),
         }
         vehicle_last_keys = {
-            "smartevse_1": "vehicle_1_last_connected",
-            "smartevse_2": "vehicle_2_last_connected",
+            "vehicle_1": "known_vehicle_1_last_connected",
+            "vehicle_2": "known_vehicle_2_last_connected",
         }
 
         for smartevse_key, status in statuses.items():
