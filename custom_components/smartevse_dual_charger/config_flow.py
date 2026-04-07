@@ -34,9 +34,11 @@ from .const import (
     CONF_RECREATE_WLED_PRESETS,
     CONF_SCHEDULE_ENTITY,
     CONF_SMARTEVSE_1_BATTERY_ENTITY,
+    CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY,
     CONF_SMARTEVSE_1_NAME,
     CONF_SMARTEVSE_2_NAME,
     CONF_SMARTEVSE_2_BATTERY_ENTITY,
+    CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY,
     CONF_SMARTEVSE_1_BASE_URL,
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
@@ -76,7 +78,9 @@ LEGACY_DEFAULTS: dict[str, Any] = {
     CONF_SMARTEVSE_1_NAME: DEFAULT_SMARTEVSE_1_NAME,
     CONF_SMARTEVSE_2_NAME: DEFAULT_SMARTEVSE_2_NAME,
     CONF_SMARTEVSE_1_BATTERY_ENTITY: "sensor.volvo_xc40_battery",
+    CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY: "sensor.volvo_xc40_charging_connection_status",
     CONF_SMARTEVSE_2_BATTERY_ENTITY: "sensor.volvo_ex30_battery",
+    CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY: "sensor.volvo_ex30_charging_connection_status",
     CONF_SMARTEVSE_1_BASE_URL: "192.168.0.234",
     CONF_SMARTEVSE_2_BASE_URL: "192.168.0.44",
     CONF_WLED_URL: "192.168.0.81",
@@ -300,8 +304,16 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     default=_optional_entity_default(user_input, CONF_SMARTEVSE_1_BATTERY_ENTITY),
                 ): _entity_selector("sensor"),
                 vol.Optional(
+                    CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY),
+                ): _entity_selector("sensor"),
+                vol.Optional(
                     CONF_SMARTEVSE_2_BATTERY_ENTITY,
                     default=_optional_entity_default(user_input, CONF_SMARTEVSE_2_BATTERY_ENTITY),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY),
                 ): _entity_selector("sensor"),
                 vol.Required(CONF_SMARTEVSE_1_BASE_URL, default=user_input.get(CONF_SMARTEVSE_1_BASE_URL, "")): selector.TextSelector(),
                 vol.Required(CONF_SMARTEVSE_2_BASE_URL, default=user_input.get(CONF_SMARTEVSE_2_BASE_URL, "")): selector.TextSelector(),
@@ -429,10 +441,24 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
                     ),
                 ): _entity_selector("sensor"),
                 vol.Optional(
+                    CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY,
+                    default=_optional_entity_default(
+                        values,
+                        CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY,
+                    ),
+                ): _entity_selector("sensor"),
+                vol.Optional(
                     CONF_SMARTEVSE_2_BATTERY_ENTITY,
                     default=_optional_entity_default(
                         values,
                         CONF_SMARTEVSE_2_BATTERY_ENTITY,
+                    ),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY,
+                    default=_optional_entity_default(
+                        values,
+                        CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY,
                     ),
                 ): _entity_selector("sensor"),
                 vol.Required(

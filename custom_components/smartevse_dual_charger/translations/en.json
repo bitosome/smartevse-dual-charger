@@ -9,7 +9,9 @@
           "smartevse_1_name": "SmartEVSE 1 display name",
           "smartevse_2_name": "SmartEVSE 2 display name",
           "smartevse_1_battery_entity": "SmartEVSE 1 EV battery sensor",
+          "smartevse_1_connection_status_entity": "SmartEVSE 1 EV connection status sensor",
           "smartevse_2_battery_entity": "SmartEVSE 2 EV battery sensor",
+          "smartevse_2_connection_status_entity": "SmartEVSE 2 EV connection status sensor",
           "smartevse_1_base_url": "SmartEVSE 1 base URL/IP",
           "smartevse_2_base_url": "SmartEVSE 2 base URL/IP",
           "setup_wled": "Set up WLED now",
@@ -59,7 +61,9 @@
           "smartevse_1_name": "SmartEVSE 1 display name",
           "smartevse_2_name": "SmartEVSE 2 display name",
           "smartevse_1_battery_entity": "SmartEVSE 1 EV battery sensor",
+          "smartevse_1_connection_status_entity": "SmartEVSE 1 EV connection status sensor",
           "smartevse_2_battery_entity": "SmartEVSE 2 EV battery sensor",
+          "smartevse_2_connection_status_entity": "SmartEVSE 2 EV connection status sensor",
           "charge_policy_default": "Default charge policy",
           "duty_cycle_minutes": "Duty cycle (minutes)",
           "update_interval": "Controller refresh interval (seconds)",
@@ -163,7 +167,7 @@
         "name": "SmartEVSE 1 mode"
       },
       "smartevse_1_charge_current": {
-        "name": "SmartEVSE 1 charging current"
+        "name": "SmartEVSE 1 offered current"
       },
       "smartevse_1_max_current": {
         "name": "SmartEVSE 1 max current"
@@ -173,6 +177,9 @@
       },
       "smartevse_1_error": {
         "name": "SmartEVSE 1 error"
+      },
+      "smartevse_1_connected_ev": {
+        "name": "SmartEVSE 1 connected EV"
       },
       "smartevse_2_state": {
         "name": "SmartEVSE 2 state"
@@ -184,7 +191,7 @@
         "name": "SmartEVSE 2 mode"
       },
       "smartevse_2_charge_current": {
-        "name": "SmartEVSE 2 charging current"
+        "name": "SmartEVSE 2 offered current"
       },
       "smartevse_2_max_current": {
         "name": "SmartEVSE 2 max current"
@@ -194,6 +201,9 @@
       },
       "smartevse_2_error": {
         "name": "SmartEVSE 2 error"
+      },
+      "smartevse_2_connected_ev": {
+        "name": "SmartEVSE 2 connected EV"
       },
       "timer_remaining": {
         "name": "Timer remaining"

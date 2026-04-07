@@ -66,25 +66,3 @@ def active_smartevse_label(active_smartevse: str | None, smartevse_1_name: str, 
     if active_smartevse == "smartevse_2":
         return smartevse_2_name
     return "None"
-
-
-def smartevse_sensor_name(translation_key: str, smartevse_1_name: str, smartevse_2_name: str) -> str | None:
-    """Return a dynamic name for per-SmartEVSE sensors."""
-    mapping = {
-        "state": "state",
-        "plug_state": "plug state",
-        "mode": "mode",
-        "charge_current": "charging current",
-        "max_current": "max current",
-        "override_current": "override current",
-        "error": "error",
-    }
-    for prefix, label in (
-        ("smartevse_1_", smartevse_1_name),
-        ("smartevse_2_", smartevse_2_name),
-    ):
-        if translation_key.startswith(prefix):
-            suffix = translation_key[len(prefix):]
-            if suffix in mapping:
-                return f"{label} {mapping[suffix]}"
-    return None

@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
-    from homeassistant.loader import Integration
 
     from .controller import SmartEVSEDualChargerController
     from .coordinator import SmartEVSEDualChargerCoordinator
@@ -19,8 +18,6 @@ class SmartEVSEDualChargerData:
 
     controller: SmartEVSEDualChargerController
     coordinator: SmartEVSEDualChargerCoordinator
-    integration: Integration
 
 
 type SmartEVSEDualChargerConfigEntry = ConfigEntry[SmartEVSEDualChargerData]
-

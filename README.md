@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.7.1`
+Version: `0.0.7.2`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -11,7 +11,8 @@ It is not a SmartEVSE `PWR SHARE` implementation.
 ## Repository Contents
 
 - Current integration: [`custom_components/smartevse_dual_charger`](custom_components/smartevse_dual_charger)
-- Current dashboard example: [`card_integration.yaml`](card_integration.yaml)
+- Standalone Lovelace card repo: [smartevse-dual-charger-card](https://github.com/bitosome/smartevse-dual-charger-card)
+- Upstream reference used for layout exploration: [`references/power-flux-card`](references/power-flux-card)
 
 ## Architecture
 
@@ -45,6 +46,10 @@ The config flow asks for:
 
 - optional SmartEVSE 1 display name
 - optional SmartEVSE 2 display name
+- optional SmartEVSE 1 EV battery sensor
+- optional SmartEVSE 2 EV battery sensor
+- optional SmartEVSE 1 EV connection-status sensor
+- optional SmartEVSE 2 EV connection-status sensor
 - SmartEVSE 1 base URL/IP
 - SmartEVSE 2 base URL/IP
 - whether WLED should be set up now
@@ -61,6 +66,10 @@ Current prefilled defaults:
 | --- | --- |
 | SmartEVSE 1 display name | `Volvo XC40` |
 | SmartEVSE 2 display name | `Volvo EX30` |
+| SmartEVSE 1 EV battery sensor | `sensor.volvo_xc40_battery` |
+| SmartEVSE 1 EV connection-status sensor | `sensor.volvo_xc40_charging_connection_status` |
+| SmartEVSE 2 EV battery sensor | `sensor.volvo_ex30_battery` |
+| SmartEVSE 2 EV connection-status sensor | `sensor.volvo_ex30_charging_connection_status` |
 | SmartEVSE 1 base URL/IP | `192.168.0.234` |
 | SmartEVSE 2 base URL/IP | `192.168.0.44` |
 | WLED URL/IP | `192.168.0.81` |
@@ -80,6 +89,8 @@ Notes:
 
 - SmartEVSE MQTT entities are not required.
 - SmartEVSE display names are optional aliases used in Home Assistant UI surfaces such as the charge-policy dropdown, the active SmartEVSE sensor, and the example dashboard card.
+- EV battery sensors are optional. If configured, their values are exposed on the controller-state attributes and shown on the EV node in the custom flow card.
+- EV connection-status sensors are optional, but they enable EV-to-SmartEVSE identity mapping and let the card show the actual connected vehicle name instead of `?`.
 - If WLED setup is enabled, the flow opens a dedicated second WLED step.
 - For WLED, enter only the base URL/IP. Do not include `/json/state`.
 - Only one config entry is supported.
@@ -99,6 +110,10 @@ The options flow controls the default behavior of the integration:
 
 - SmartEVSE 1 display name
 - SmartEVSE 2 display name
+- SmartEVSE 1 EV battery sensor
+- SmartEVSE 2 EV battery sensor
+- SmartEVSE 1 EV connection-status sensor
+- SmartEVSE 2 EV connection-status sensor
 - default charge policy
 - duty cycle
 - controller refresh interval
@@ -131,9 +146,10 @@ Precedence is fixed:
 
 Practical result:
 
-- any force mode wins over schedule
+- `Force charge` and `Force charge timer` override schedule
+- `Force charge by price` can also require the schedule window when schedule charging is enabled
 - force modes are mutually exclusive
-- schedule is only used when no force mode is active
+- `Force charge by price` uses price as an additional gate when schedule charging is also enabled
 
 High-level controller states:
 
@@ -204,7 +220,8 @@ If there is only one unfinished connected EV, duty cycle is not used.
 
 How session completion is detected:
 
-- an EV session is considered complete only after that same SmartEVSE was seen in `Charging` and later in `Charging Stopped`
+- if a mapped EV reports `charging_status = done` / `complete`, that session is considered complete immediately
+- otherwise the integration falls back to SmartEVSE-side state transitions and a short non-charging grace period
 - unplugging clears completion for that side
 - a new charging session clears completion again
 
@@ -215,6 +232,7 @@ Price mode:
 - if the price sensor is missing or invalid, charging is blocked
 - invalid price data is not treated as `0`
 - charging starts only when `price <= acceptable_price`
+- if schedule charging is also enabled, the schedule window must be active too
 
 Schedule mode:
 
@@ -335,17 +353,19 @@ All numeric inputs use Home Assistant number entities with box input.
 - `SmartEVSE 1 state`
 - `SmartEVSE 1 plug state`
 - `SmartEVSE 1 mode`
-- `SmartEVSE 1 charging current`
+- `SmartEVSE 1 offered current`
 - `SmartEVSE 1 max current`
 - `SmartEVSE 1 override current`
 - `SmartEVSE 1 error`
+- `SmartEVSE 1 connected EV`
 - `SmartEVSE 2 state`
 - `SmartEVSE 2 plug state`
 - `SmartEVSE 2 mode`
-- `SmartEVSE 2 charging current`
+- `SmartEVSE 2 offered current`
 - `SmartEVSE 2 max current`
 - `SmartEVSE 2 override current`
 - `SmartEVSE 2 error`
+- `SmartEVSE 2 connected EV`
 
 The `Controller state` sensor also exposes useful extra attributes such as:
 
@@ -381,9 +401,31 @@ These are service actions only. The integration no longer exposes separate butto
 - `smartevse_api_unavailable`
 - per-device API failures such as `smartevse_1_api_unavailable` or `smartevse_2_api_unavailable`
 
+## EV Identity Mapping
+
+The integration can map a known EV to each SmartEVSE using the configured connection-status sensors.
+
+Mapping behavior:
+
+- on each controller refresh, the integration watches SmartEVSE plug state and the configured EV connection-status sensors
+- when a SmartEVSE changes to connected, it correlates that with which EV connection-status sensor changed to connected
+- if the match is unambiguous, that EV is assigned to the SmartEVSE
+- unplugging either the SmartEVSE side or the EV-side sensor clears the mapping
+- if the match is ambiguous, the mapping stays `unknown`
+
+Exposed mapping surfaces:
+
+- `sensor.smartevse_dual_charger_smartevse_1_connected_ev`
+- `sensor.smartevse_dual_charger_smartevse_2_connected_ev`
+- matching controller-state attributes used by the standalone card
+
+Current limitation:
+
+- if Home Assistant starts while both EVs are already plugged in and there is no persisted mapping or fresh connection event, the integration may temporarily report `unknown` until the next unambiguous connect/disconnect event
+
 ## Dashboard
 
-[`card_integration.yaml`](card_integration.yaml) is the current dashboard example.
+[`card_integration.yaml`](card_integration.yaml) is the integration-only Mushroom example.
 
 It shows:
 
@@ -396,6 +438,13 @@ It shows:
 - charge policy and main tuning entities
 
 It expects Mushroom cards and reads detailed charger state from the stable `Controller state` sensor attributes, so the card does not depend on alias-derived per-SmartEVSE entity IDs.
+
+The standalone flow card now lives in the separate [smartevse-dual-charger-card](https://github.com/bitosome/smartevse-dual-charger-card) repository. That repo contains:
+
+- the custom `smartevse-flow-card` implementation
+- the HACS/frontend artifact
+- the visual flow dashboard example
+- the local preview page for card layout work
 
 ## Legacy Compatibility
 

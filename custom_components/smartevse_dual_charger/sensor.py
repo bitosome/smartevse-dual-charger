@@ -111,6 +111,11 @@ SENSOR_DESCRIPTIONS: tuple[ControllerSensorDescription, ...] = (
         value_key="smartevse_1_error",
     ),
     ControllerSensorDescription(
+        key="smartevse_1_connected_ev",
+        translation_key="smartevse_1_connected_ev",
+        value_key="smartevse_1_connected_ev",
+    ),
+    ControllerSensorDescription(
         key="smartevse_2_state",
         translation_key="smartevse_2_state",
         value_key="smartevse_2_state",
@@ -153,6 +158,11 @@ SENSOR_DESCRIPTIONS: tuple[ControllerSensorDescription, ...] = (
         key="smartevse_2_error",
         translation_key="smartevse_2_error",
         value_key="smartevse_2_error",
+    ),
+    ControllerSensorDescription(
+        key="smartevse_2_connected_ev",
+        translation_key="smartevse_2_connected_ev",
+        value_key="smartevse_2_connected_ev",
     ),
     ControllerSensorDescription(
         key="timer_remaining",
@@ -223,6 +233,9 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
             "active_smartevse_raw": self.coordinator.data.get("active_smartevse_raw"),
             "smartevse_1_name": self.coordinator.data.get("smartevse_1_name"),
             "smartevse_1_battery": self.coordinator.data.get("smartevse_1_battery"),
+            "smartevse_1_connected_ev": self.coordinator.data.get("smartevse_1_connected_ev"),
+            "smartevse_1_connected_ev_raw": self.coordinator.data.get("smartevse_1_connected_ev_raw"),
+            "smartevse_1_vehicle_charging_state": self.coordinator.data.get("smartevse_1_vehicle_charging_state"),
             "smartevse_1_available": self.coordinator.data.get("smartevse_1_available"),
             "smartevse_1_state": self.coordinator.data.get("smartevse_1_state"),
             "smartevse_1_plug_state": self.coordinator.data.get("smartevse_1_plug_state"),
@@ -234,6 +247,9 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
             "smartevse_1_session_complete": self.coordinator.data.get("smartevse_1_session_complete"),
             "smartevse_2_name": self.coordinator.data.get("smartevse_2_name"),
             "smartevse_2_battery": self.coordinator.data.get("smartevse_2_battery"),
+            "smartevse_2_connected_ev": self.coordinator.data.get("smartevse_2_connected_ev"),
+            "smartevse_2_connected_ev_raw": self.coordinator.data.get("smartevse_2_connected_ev_raw"),
+            "smartevse_2_vehicle_charging_state": self.coordinator.data.get("smartevse_2_vehicle_charging_state"),
             "smartevse_2_available": self.coordinator.data.get("smartevse_2_available"),
             "smartevse_2_state": self.coordinator.data.get("smartevse_2_state"),
             "smartevse_2_plug_state": self.coordinator.data.get("smartevse_2_plug_state"),

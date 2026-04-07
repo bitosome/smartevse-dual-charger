@@ -9,7 +9,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "smartevse_dual_charger"
 NAME = "SmartEVSE Dual Charger"
-VERSION = "0.0.7.1"
+VERSION = "0.0.7.2"
 
 LOGGER = logging.getLogger(__package__)
 
@@ -69,7 +69,9 @@ CONF_EV_METER_L1_ENTITY = "ev_meter_l1_entity"
 CONF_EV_METER_L2_ENTITY = "ev_meter_l2_entity"
 CONF_EV_METER_L3_ENTITY = "ev_meter_l3_entity"
 CONF_SMARTEVSE_1_BATTERY_ENTITY = "smartevse_1_battery_entity"
+CONF_SMARTEVSE_1_CONNECTION_STATUS_ENTITY = "smartevse_1_connection_status_entity"
 CONF_SMARTEVSE_2_BATTERY_ENTITY = "smartevse_2_battery_entity"
+CONF_SMARTEVSE_2_CONNECTION_STATUS_ENTITY = "smartevse_2_connection_status_entity"
 CONF_EV_METER_PUSH_INTERVAL = "ev_meter_push_interval"
 CONF_MAINS_L1_ENTITY = "mains_l1_entity"
 CONF_MAINS_L2_ENTITY = "mains_l2_entity"
