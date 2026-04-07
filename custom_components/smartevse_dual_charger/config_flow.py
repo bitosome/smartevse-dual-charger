@@ -152,7 +152,7 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._pending_wled_input: dict[str, Any] | None = None
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
-        """Handle the initial step."""
+        """Handle the infrastructure/controller step."""
         if self._async_current_entries():
             return self.async_abort(reason="already_configured")
 
@@ -160,33 +160,10 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 form_data = dict(user_input)
-                setup_wled = bool(form_data.pop(CONF_SETUP_WLED, False))
-                form_data[CONF_VEHICLE_1_NAME] = normalize_vehicle_name(
-                    str(form_data.get(CONF_VEHICLE_1_NAME, "")),
-                    DEFAULT_VEHICLE_1_NAME,
-                )
-                form_data[CONF_VEHICLE_2_NAME] = normalize_vehicle_name(
-                    str(form_data.get(CONF_VEHICLE_2_NAME, "")),
-                    DEFAULT_VEHICLE_2_NAME,
-                )
                 form_data[CONF_SMARTEVSE_1_BASE_URL] = _url_or_host(form_data[CONF_SMARTEVSE_1_BASE_URL])
                 form_data[CONF_SMARTEVSE_2_BASE_URL] = _url_or_host(form_data[CONF_SMARTEVSE_2_BASE_URL])
-                if setup_wled:
-                    self._pending_user_input = form_data
-                    self._pending_wled_input = {
-                        CONF_WLED_URL: CONFIG_DEFAULTS[CONF_WLED_URL],
-                        CONF_WLED_LED_COUNT: DEFAULT_WLED_LED_COUNT,
-                        CONF_WLED_LED_OFFSET: DEFAULT_WLED_LED_OFFSET,
-                        CONF_WLED_PRESETS_JSON: build_default_presets_json(),
-                    }
-                    return await self.async_step_wled()
-                if not errors:
-                    await self.async_set_unique_id(DOMAIN)
-                    self._abort_if_unique_id_configured()
-                    return self.async_create_entry(
-                        title=form_data[CONF_NAME],
-                        data=form_data,
-                    )
+                self._pending_user_input = form_data
+                return await self.async_step_vehicles()
             except vol.Invalid:
                 errors["base"] = "invalid_url"
 
@@ -194,6 +171,53 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=self._build_user_schema(user_input),
             errors=errors,
+        )
+
+    async def async_step_vehicles(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
+        """Handle the known-vehicle mapping step."""
+        if self._pending_user_input is None:
+            return await self.async_step_user()
+
+        if user_input is not None:
+            vehicle_data = dict(user_input)
+            vehicle_data[CONF_VEHICLE_1_NAME] = normalize_vehicle_name(
+                str(vehicle_data.get(CONF_VEHICLE_1_NAME, "")),
+                DEFAULT_VEHICLE_1_NAME,
+            )
+            vehicle_data[CONF_VEHICLE_2_NAME] = normalize_vehicle_name(
+                str(vehicle_data.get(CONF_VEHICLE_2_NAME, "")),
+                DEFAULT_VEHICLE_2_NAME,
+            )
+            pending_data = {**self._pending_user_input, **vehicle_data}
+            setup_wled = bool(pending_data.get(CONF_SETUP_WLED, False))
+            self._pending_user_input = pending_data
+            if setup_wled:
+                self._pending_wled_input = {
+                    CONF_WLED_URL: CONFIG_DEFAULTS[CONF_WLED_URL],
+                    CONF_WLED_LED_COUNT: DEFAULT_WLED_LED_COUNT,
+                    CONF_WLED_LED_OFFSET: DEFAULT_WLED_LED_OFFSET,
+                    CONF_WLED_PRESETS_JSON: build_default_presets_json(),
+                }
+                return await self.async_step_wled()
+
+            await self.async_set_unique_id(DOMAIN)
+            self._abort_if_unique_id_configured()
+            entry_data = dict(self._pending_user_input)
+            entry_data.pop(CONF_SETUP_WLED, None)
+            self._pending_user_input = None
+            return self.async_create_entry(
+                title=entry_data[CONF_NAME],
+                data=entry_data,
+            )
+
+        merged_input = {
+            **CONFIG_DEFAULTS,
+            **(self._pending_user_input or {}),
+        }
+        return self.async_show_form(
+            step_id="vehicles",
+            data_schema=self._build_vehicle_schema(merged_input),
+            errors={},
         )
 
     async def async_step_wled(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
@@ -274,6 +298,7 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 **pending_user_input,
                 **self._normalize_wled_input(pending_wled_input),
             }
+        pending_user_input.pop(CONF_SETUP_WLED, None)
 
         self._pending_user_input = None
         self._pending_wled_input = None
@@ -291,29 +316,11 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return SmartEVSEDualChargerOptionsFlow(config_entry)
 
     def _build_user_schema(self, user_input: dict[str, Any] | None) -> vol.Schema:
-        """Build the user step schema."""
+        """Build the infrastructure/controller step schema."""
         user_input = {**CONFIG_DEFAULTS, **(user_input or {})}
         return vol.Schema(
             {
                 vol.Required(CONF_NAME, default=user_input.get(CONF_NAME, DEFAULT_NAME)): selector.TextSelector(),
-                vol.Optional(CONF_VEHICLE_1_NAME, default=user_input.get(CONF_VEHICLE_1_NAME, DEFAULT_VEHICLE_1_NAME)): selector.TextSelector(),
-                vol.Optional(CONF_VEHICLE_2_NAME, default=user_input.get(CONF_VEHICLE_2_NAME, DEFAULT_VEHICLE_2_NAME)): selector.TextSelector(),
-                vol.Optional(
-                    CONF_VEHICLE_1_BATTERY_ENTITY,
-                    default=_optional_entity_default(user_input, CONF_VEHICLE_1_BATTERY_ENTITY),
-                ): _entity_selector("sensor"),
-                vol.Optional(
-                    CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY,
-                    default=_optional_entity_default(user_input, CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY),
-                ): _entity_selector("sensor"),
-                vol.Optional(
-                    CONF_VEHICLE_2_BATTERY_ENTITY,
-                    default=_optional_entity_default(user_input, CONF_VEHICLE_2_BATTERY_ENTITY),
-                ): _entity_selector("sensor"),
-                vol.Optional(
-                    CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY,
-                    default=_optional_entity_default(user_input, CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY),
-                ): _entity_selector("sensor"),
                 vol.Required(CONF_SMARTEVSE_1_BASE_URL, default=user_input.get(CONF_SMARTEVSE_1_BASE_URL, "")): selector.TextSelector(),
                 vol.Required(CONF_SMARTEVSE_2_BASE_URL, default=user_input.get(CONF_SMARTEVSE_2_BASE_URL, "")): selector.TextSelector(),
                 vol.Required(
@@ -346,6 +353,32 @@ class SmartEVSEDualChargerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_SCHEDULE_ENTITY,
                     default=_optional_entity_default(user_input, CONF_SCHEDULE_ENTITY),
                 ): _entity_selector("schedule"),
+            }
+        )
+
+    def _build_vehicle_schema(self, user_input: dict[str, Any] | None) -> vol.Schema:
+        """Build the vehicle mapping step schema."""
+        user_input = {**CONFIG_DEFAULTS, **(user_input or {})}
+        return vol.Schema(
+            {
+                vol.Optional(CONF_VEHICLE_1_NAME, default=user_input.get(CONF_VEHICLE_1_NAME, DEFAULT_VEHICLE_1_NAME)): selector.TextSelector(),
+                vol.Optional(
+                    CONF_VEHICLE_1_BATTERY_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_VEHICLE_1_BATTERY_ENTITY),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY),
+                ): _entity_selector("sensor"),
+                vol.Optional(CONF_VEHICLE_2_NAME, default=user_input.get(CONF_VEHICLE_2_NAME, DEFAULT_VEHICLE_2_NAME)): selector.TextSelector(),
+                vol.Optional(
+                    CONF_VEHICLE_2_BATTERY_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_VEHICLE_2_BATTERY_ENTITY),
+                ): _entity_selector("sensor"),
+                vol.Optional(
+                    CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY,
+                    default=_optional_entity_default(user_input, CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY),
+                ): _entity_selector("sensor"),
             }
         )
 

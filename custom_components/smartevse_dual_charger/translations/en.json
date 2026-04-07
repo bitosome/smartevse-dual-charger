@@ -3,15 +3,9 @@
     "step": {
       "user": {
         "title": "SmartEVSE Dual Charger",
-        "description": "Connect the controller to both SmartEVSE REST endpoints, Shelly mains and EV-meter sensors, define your known vehicles for EV mapping, and choose whether WLED should be set up.",
+        "description": "Connect the controller to both SmartEVSE REST endpoints, Shelly mains and EV-meter sensors, and choose whether WLED should be set up.",
         "data": {
           "name": "Name",
-          "vehicle_1_name": "Vehicle 1 name",
-          "vehicle_2_name": "Vehicle 2 name",
-          "vehicle_1_battery_entity": "Vehicle 1 battery sensor",
-          "vehicle_1_connection_status_entity": "Vehicle 1 connection status sensor",
-          "vehicle_2_battery_entity": "Vehicle 2 battery sensor",
-          "vehicle_2_connection_status_entity": "Vehicle 2 connection status sensor",
           "smartevse_1_base_url": "SmartEVSE 1 base URL/IP",
           "smartevse_2_base_url": "SmartEVSE 2 base URL/IP",
           "setup_wled": "Set up WLED now",
@@ -26,6 +20,18 @@
           "ev_meter_export_active_energy_entity": "EV meter export energy sensor",
           "price_sensor_entity": "Electricity price sensor",
           "schedule_entity": "Charge schedule entity"
+        }
+      },
+      "vehicles": {
+        "title": "Vehicle Mapping",
+        "description": "Define your known EVs for connection mapping. Vehicle 1 and Vehicle 2 are the cars you own, not SmartEVSE aliases.",
+        "data": {
+          "vehicle_1_name": "Vehicle 1 name",
+          "vehicle_1_battery_entity": "Vehicle 1 battery sensor",
+          "vehicle_1_connection_status_entity": "Vehicle 1 connection status sensor",
+          "vehicle_2_name": "Vehicle 2 name",
+          "vehicle_2_battery_entity": "Vehicle 2 battery sensor",
+          "vehicle_2_connection_status_entity": "Vehicle 2 connection status sensor"
         }
       },
       "wled": {
