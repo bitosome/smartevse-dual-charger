@@ -6,7 +6,7 @@ import asyncio
 from datetime import timedelta
 from typing import Any
 
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -52,8 +52,9 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ev_meter_push_lock = asyncio.Lock()
         self._currents_push_task: asyncio.Task[None] | None = None
         self._ev_meter_push_task: asyncio.Task[None] | None = None
+        self._unsub_started = None
         self._setup_state_listeners()
-        self._setup_push_loops()
+        self._schedule_push_loops_start()
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Run a controller cycle."""
@@ -94,6 +95,9 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _setup_push_loops(self) -> None:
         """Start dedicated meter-push loops independent of controller refreshes."""
+        if self._unsub_started:
+            self._unsub_started()
+            self._unsub_started = None
         self._cancel_push_tasks()
 
         if self._options.get(CONF_PUSH_CURRENTS, DEFAULT_PUSH_CURRENTS):
@@ -115,6 +119,26 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
     @callback
+    def _schedule_push_loops_start(self) -> None:
+        """Start push loops after HA startup so bootstrap does not wait on them."""
+        if self.hass.is_running:
+            self._setup_push_loops()
+            return
+
+        if self._unsub_started:
+            return
+
+        @callback
+        def _handle_started(_event) -> None:
+            self._unsub_started = None
+            self._setup_push_loops()
+
+        self._unsub_started = self.hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STARTED,
+            _handle_started,
+        )
+
+    @callback
     def _cancel_push_tasks(self) -> None:
         """Cancel active push loops."""
         if self._currents_push_task:
@@ -123,6 +147,9 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._ev_meter_push_task:
             self._ev_meter_push_task.cancel()
             self._ev_meter_push_task = None
+        if self._unsub_started:
+            self._unsub_started()
+            self._unsub_started = None
 
     def _ev_meter_initial_delay(self) -> float:
         """Offset EV meter pushes so they do not align with mains pushes."""
@@ -175,7 +202,7 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_timing_updated(self) -> None:
         """Apply updated runtime timing values immediately."""
         self.update_interval = timedelta(seconds=self._controller.get_update_interval())
-        self._setup_push_loops()
+        self._schedule_push_loops_start()
 
     async def _async_refresh_now(self, reason: str) -> None:
         """Refresh immediately and propagate updated data."""
