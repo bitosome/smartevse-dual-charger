@@ -782,12 +782,18 @@ class SmartEVSEDualChargerController:
             return
 
         mapped_vehicle_key = self._mapped_vehicle_key(status.key)
-        vehicle_reports_charging = (
-            self._vehicle_reports_charging(mapped_vehicle_key) if mapped_vehicle_key is not None else False
+        vehicle_charging_state = (
+            self._vehicle_charging_state(mapped_vehicle_key) if mapped_vehicle_key is not None else ""
         )
-        vehicle_reports_complete = (
-            self._vehicle_reports_complete(mapped_vehicle_key) if mapped_vehicle_key is not None else False
-        )
+        has_vehicle_charging_state = bool(vehicle_charging_state)
+        vehicle_reports_charging = vehicle_charging_state == "charging"
+        vehicle_reports_complete = vehicle_charging_state in {
+            "complete",
+            "completed",
+            "done",
+            "fully_charged",
+            "fully charged",
+        }
         is_actively_charging = vehicle_reports_charging or (
             status.state == "Charging" and status.charge_current > 0.1
         )
@@ -803,12 +809,16 @@ class SmartEVSEDualChargerController:
             self._mutable[non_charging_key] = now.isoformat()
             return
 
-        if self._mutable.get(seen_key) and status.state.startswith("Charging Stopped"):
+        if (
+            self._mutable.get(seen_key)
+            and not has_vehicle_charging_state
+            and status.state.startswith("Charging Stopped")
+        ):
             self._mutable[complete_key] = True
             self._mutable[non_charging_key] = now.isoformat()
             return
 
-        if mapped_vehicle_key is not None:
+        if mapped_vehicle_key is not None and has_vehicle_charging_state:
             self._mutable[non_charging_key] = None
             return
 

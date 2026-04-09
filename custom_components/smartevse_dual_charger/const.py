@@ -9,7 +9,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "smartevse_dual_charger"
 NAME = "SmartEVSE Dual Charger"
-VERSION = "0.0.7.6"
+VERSION = "0.0.7.7"
 
 LOGGER = logging.getLogger(__package__)
 
