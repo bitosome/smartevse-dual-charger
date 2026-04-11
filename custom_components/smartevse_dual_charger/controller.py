@@ -104,6 +104,8 @@ MUTABLE_DEFAULTS: dict[str, Any] = {
     "active_smartevse": None,
     "active_smartevse_since": None,
     "pending_previous_active_smartevse": None,
+    "handoff_target": None,
+    "handoff_started_at": None,
     "last_charge_allowed": False,
     "last_active_charge_reason": None,
     "last_schedule_window_active": False,
@@ -754,6 +756,18 @@ class SmartEVSEDualChargerController:
             self._mutable["pending_previous_active_smartevse"] = None
         self._mutable["active_smartevse"] = None
         self._mutable["active_smartevse_since"] = None
+        self._mutable["handoff_target"] = None
+        self._mutable["handoff_started_at"] = None
+
+    def _start_handoff(self, smartevse_key: str, *, now: datetime) -> None:
+        """Persist a pending handoff target so rotation remains sticky."""
+        self._mutable["handoff_target"] = smartevse_key
+        self._mutable["handoff_started_at"] = now.isoformat()
+
+    def _clear_handoff(self) -> None:
+        """Clear any pending handoff target."""
+        self._mutable["handoff_target"] = None
+        self._mutable["handoff_started_at"] = None
 
     def _clear_session_tracking(self) -> None:
         """Forget per-connector session completion state."""
@@ -794,9 +808,7 @@ class SmartEVSEDualChargerController:
             "fully_charged",
             "fully charged",
         }
-        is_actively_charging = vehicle_reports_charging or (
-            status.state == "Charging" and status.charge_current > 0.1
-        )
+        is_actively_charging = vehicle_reports_charging or status.state == "Charging"
 
         if is_actively_charging:
             self._mutable[seen_key] = True
@@ -822,7 +834,7 @@ class SmartEVSEDualChargerController:
             self._mutable[non_charging_key] = None
             return
 
-        if self._mutable.get(seen_key) and status.charge_current <= 0.1 and status.state in {"Connected to EV", "Ready to Charge"}:
+        if self._mutable.get(seen_key) and status.state in {"Connected to EV", "Ready to Charge"}:
             non_charging_since = self._parse_datetime(self._mutable.get(non_charging_key))
             if non_charging_since is None:
                 self._mutable[non_charging_key] = now.isoformat()
@@ -830,6 +842,13 @@ class SmartEVSEDualChargerController:
             grace_seconds = max(self.get_update_interval() * 2, 30)
             if int((now - non_charging_since).total_seconds()) >= grace_seconds:
                 self._mutable[complete_key] = True
+
+    def _status_reports_charging(self, status: SmartEVSEStatus) -> bool:
+        """Return whether a SmartEVSE currently appears to be charging."""
+        mapped_vehicle_key = self._mapped_vehicle_key(status.key)
+        if mapped_vehicle_key is not None and self._vehicle_reports_charging(mapped_vehicle_key):
+            return True
+        return status.state == "Charging"
 
     def _session_complete(self, smartevse_key: str) -> bool:
         """Return whether the current plugged session has already completed."""
@@ -910,12 +929,47 @@ class SmartEVSEDualChargerController:
             only_smartevse = eligible_smartevse[0]
             self._mutable["active_smartevse"] = only_smartevse
             self._mutable["active_smartevse_since"] = None
+            self._clear_handoff()
             return only_smartevse, None, 0, ""
 
         preferred_smartevse = self._preferred_smartevse(policy)
         active_smartevse = str(self._mutable.get("active_smartevse") or "")
         active_smartevse_since = self._parse_datetime(self._mutable.get("active_smartevse_since"))
+        handoff_target = str(self._mutable.get("handoff_target") or "")
+        handoff_started_at = self._parse_datetime(self._mutable.get("handoff_started_at"))
         interval_seconds = max(1, int(self._mutable["duty_cycle_minutes"])) * 60
+        handoff_grace_seconds = max(self.get_update_interval() * 3, 30)
+        observed_charging = [
+            smartevse_key
+            for smartevse_key in eligible_smartevse
+            if self._status_reports_charging(statuses[smartevse_key])
+        ]
+
+        if handoff_target and handoff_target not in eligible_smartevse:
+            self._clear_handoff()
+            handoff_target = ""
+            handoff_started_at = None
+        elif handoff_target and handoff_started_at is None:
+            self._clear_handoff()
+            handoff_target = ""
+
+        if handoff_target and handoff_started_at is not None:
+            handoff_elapsed = int((now - handoff_started_at).total_seconds())
+            if handoff_target in observed_charging or handoff_elapsed < handoff_grace_seconds:
+                self._mutable["active_smartevse"] = handoff_target
+                self._mutable["active_smartevse_since"] = handoff_started_at.isoformat()
+                if handoff_target in observed_charging:
+                    self._clear_handoff()
+                duty_cycle_remaining = max(
+                    interval_seconds - int((now - handoff_started_at).total_seconds()),
+                    0,
+                )
+                return handoff_target, handoff_started_at.isoformat(), duty_cycle_remaining, ""
+            self._clear_handoff()
+
+        if len(observed_charging) == 1 and active_smartevse != observed_charging[0]:
+            active_smartevse = observed_charging[0]
+            active_smartevse_since = now
 
         if active_smartevse not in eligible_smartevse:
             active_smartevse = (
@@ -932,6 +986,7 @@ class SmartEVSEDualChargerController:
             if elapsed >= interval_seconds and next_smartevse in eligible_smartevse:
                 active_smartevse = next_smartevse
                 active_smartevse_since = now
+                self._start_handoff(next_smartevse, now=now)
 
         duty_cycle_remaining = max(
             interval_seconds - int((now - active_smartevse_since).total_seconds()),
@@ -1022,6 +1077,9 @@ class SmartEVSEDualChargerController:
         settings = payload.get("settings") or {}
         connected = bool(payload.get("car_connected") or evse.get("connected"))
         plug_state = "Connected" if connected else "Disconnected"
+        state = str(evse.get("state") or ("Connected to EV" if connected else "Disconnected"))
+        if not connected:
+            state = "Disconnected"
 
         return SmartEVSEStatus(
             key=key,
@@ -1029,7 +1087,7 @@ class SmartEVSEDualChargerController:
             available=True,
             connected=connected,
             plug_state=plug_state,
-            state=str(evse.get("state") or ("Connected to EV" if connected else "Ready to Charge")),
+            state=state,
             mode=self._normalize_mode(payload.get("mode"), payload.get("mode_id")),
             charge_current=self._deciamp_to_amp(settings.get("charge_current")),
             max_current=self._to_float(settings.get("current_max") or settings.get("current_max_circuit")),
