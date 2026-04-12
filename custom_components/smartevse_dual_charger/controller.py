@@ -413,12 +413,6 @@ class SmartEVSEDualChargerController:
                 charge_reason = blocked_reason
                 controller_error = self._controller_error_for_reason(blocked_reason)
 
-        if (
-            previous_active_smartevse in {"smartevse_1", "smartevse_2"}
-            and active_smartevse in {"smartevse_1", "smartevse_2"}
-            and previous_active_smartevse != active_smartevse
-        ):
-            self._clear_smartevse_session_tracking(previous_active_smartevse)
         self._mutable["pending_previous_active_smartevse"] = None
 
         await self._apply_modes(
