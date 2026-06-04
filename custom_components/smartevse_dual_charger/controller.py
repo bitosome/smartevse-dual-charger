@@ -116,15 +116,21 @@ MUTABLE_DEFAULTS: dict[str, Any] = {
     "smartevse_1_seen_charging": False,
     "smartevse_1_session_complete": False,
     "smartevse_1_non_charging_since": None,
+    "smartevse_1_last_vehicle_charging_state": None,
     "smartevse_1_connected_ev": "unknown",
     "smartevse_1_last_connected": None,
     "smartevse_1_last_plug_connected": None,
+    "smartevse_1_last_observed_state": None,
+    "smartevse_1_recent_state_changes": [],
     "smartevse_2_seen_charging": False,
     "smartevse_2_session_complete": False,
     "smartevse_2_non_charging_since": None,
+    "smartevse_2_last_vehicle_charging_state": None,
     "smartevse_2_connected_ev": "unknown",
     "smartevse_2_last_connected": None,
     "smartevse_2_last_plug_connected": None,
+    "smartevse_2_last_observed_state": None,
+    "smartevse_2_recent_state_changes": [],
     "known_vehicle_1_last_connected": None,
     "known_vehicle_2_last_connected": None,
 }
@@ -177,6 +183,10 @@ class SmartEVSEDualChargerController:
         """Load persisted mutable state."""
         stored = await self._store.async_load() or {}
         self._mutable = {**MUTABLE_DEFAULTS, **stored}
+        for smartevse_key in ("smartevse_1", "smartevse_2"):
+            changes_key = f"{smartevse_key}_recent_state_changes"
+            if not isinstance(self._mutable.get(changes_key), list):
+                self._mutable[changes_key] = []
 
         try:
             self._mutable["charge_policy"] = ChargePolicy(self._mutable["charge_policy"]).value
@@ -328,6 +338,8 @@ class SmartEVSEDualChargerController:
             self._async_fetch_status("smartevse_1", self._entry_data[CONF_SMARTEVSE_1_BASE_URL]),
             self._async_fetch_status("smartevse_2", self._entry_data[CONF_SMARTEVSE_2_BASE_URL]),
         )
+        self._track_state_transitions(smartevse_1, now=now)
+        self._track_state_transitions(smartevse_2, now=now)
         self._update_connected_vehicle_mapping(
             now=now,
             smartevse_1=smartevse_1,
@@ -374,12 +386,26 @@ class SmartEVSEDualChargerController:
         )
         mains_peak = max(mains_currents) if mains_currents is not None else None
         controller_error = self._controller_error_for_reason(charge_reason)
+        statuses = {
+            "smartevse_1": smartevse_1,
+            "smartevse_2": smartevse_2,
+        }
 
         if self._options.get(CONF_PUSH_CURRENTS, DEFAULT_PUSH_CURRENTS) and mains_currents is None:
             charge_allowed = False
             controller_state = ControllerState.BLOCKED
             charge_reason = "mains_data_unavailable"
             controller_error = charge_reason
+
+        oscillation_reason = self._detect_active_smartevse_oscillation(
+            now=now,
+            charge_allowed=charge_allowed,
+            statuses=statuses,
+        )
+        if oscillation_reason is not None:
+            controller_error = oscillation_reason
+            self._clear_session_tracking()
+            self._reset_charge_cycle()
 
         previous_charge_allowed = bool(self._mutable.get("last_charge_allowed"))
         if charge_allowed and not previous_charge_allowed:
@@ -421,6 +447,8 @@ class SmartEVSEDualChargerController:
             active_smartevse=active_smartevse,
             charge_allowed=charge_allowed,
         )
+        if controller_error is None:
+            controller_error = self._vehicle_data_warning()
         await self._maybe_push_wled(smartevse_1=smartevse_1, smartevse_2=smartevse_2)
         await self._async_save_state()
 
@@ -647,6 +675,85 @@ class SmartEVSEDualChargerController:
             "fully charged",
         }
 
+    def _recent_state_change_key(self, smartevse_key: str) -> str:
+        """Return the mutable key used for recent state-change timestamps."""
+        return f"{smartevse_key}_recent_state_changes"
+
+    def _clear_state_change_tracking(self, smartevse_key: str) -> None:
+        """Clear transient state-change tracking for one SmartEVSE."""
+        self._mutable[f"{smartevse_key}_last_observed_state"] = None
+        self._mutable[self._recent_state_change_key(smartevse_key)] = []
+
+    def _trim_recent_state_changes(self, smartevse_key: str, *, now: datetime) -> list[str]:
+        """Trim state-change timestamps to the rolling oscillation window."""
+        changes_key = self._recent_state_change_key(smartevse_key)
+        window_started_at = now - timedelta(minutes=3)
+        timestamps = [
+            timestamp
+            for timestamp in self._mutable.get(changes_key, [])
+            if (parsed := self._parse_datetime(timestamp)) is not None and parsed >= window_started_at
+        ]
+        self._mutable[changes_key] = timestamps
+        return timestamps
+
+    def _track_state_transitions(self, status: SmartEVSEStatus, *, now: datetime) -> None:
+        """Track recent SmartEVSE charging-state transitions for oscillation detection."""
+        if not status.available or not status.connected:
+            self._clear_state_change_tracking(status.key)
+            return
+
+        relevant_states = {"Connected to EV", "Charging", "Charging Stopped", "Stop Charging", "Ready to Charge"}
+        last_state_key = f"{status.key}_last_observed_state"
+        previous_state = str(self._mutable.get(last_state_key) or "")
+        current_state = status.state
+        timestamps = self._trim_recent_state_changes(status.key, now=now)
+
+        if previous_state and previous_state != current_state:
+            if previous_state in relevant_states and current_state in relevant_states:
+                timestamps.append(now.isoformat())
+                self._mutable[self._recent_state_change_key(status.key)] = timestamps
+
+        self._mutable[last_state_key] = current_state
+
+    def _detect_active_smartevse_oscillation(
+        self,
+        *,
+        now: datetime,
+        charge_allowed: bool,
+        statuses: dict[str, SmartEVSEStatus],
+    ) -> str | None:
+        """Return an oscillation reason when the active SmartEVSE is flapping excessively."""
+        if not charge_allowed or self._mutable.get("handoff_target"):
+            return None
+
+        active_smartevse = str(self._mutable.get("active_smartevse") or "")
+        status = statuses.get(active_smartevse)
+        if status is None or not status.available or not status.connected:
+            return None
+
+        timestamps = self._trim_recent_state_changes(active_smartevse, now=now)
+        if len(timestamps) < 8:
+            return None
+
+        self._clear_state_change_tracking(active_smartevse)
+        return f"{active_smartevse}_state_oscillation"
+
+    def _vehicle_data_warning(self) -> str | None:
+        """Return a non-blocking warning when mapped vehicle telemetry is unavailable."""
+        for smartevse_key in ("smartevse_1", "smartevse_2"):
+            vehicle_key = self._mapped_vehicle_key(smartevse_key)
+            if vehicle_key is None:
+                continue
+
+            connection_entity = self._configured_connection_status_entity(vehicle_key)
+            charging_entity = self._derived_vehicle_charging_status_entity(vehicle_key)
+            connection_state = self._state_str(connection_entity).strip().lower()
+            charging_state = self._state_str(charging_entity).strip().lower()
+
+            if connection_state in {"unavailable", "unknown"} or charging_state in {"unavailable", "unknown"}:
+                return f"{smartevse_key}_vehicle_data_unavailable"
+        return None
+
     def _set_connected_vehicle(self, smartevse_key: str, vehicle_key: str | None) -> None:
         """Assign one known vehicle to one SmartEVSE."""
         normalized = vehicle_key if vehicle_key in {"vehicle_1", "vehicle_2"} else "unknown"
@@ -773,12 +880,14 @@ class SmartEVSEDualChargerController:
         self._mutable[f"{smartevse_key}_seen_charging"] = False
         self._mutable[f"{smartevse_key}_session_complete"] = False
         self._mutable[f"{smartevse_key}_non_charging_since"] = None
+        self._mutable[f"{smartevse_key}_last_vehicle_charging_state"] = None
 
     def _update_session_tracking(self, status: SmartEVSEStatus, *, now: datetime) -> None:
         """Track whether a connected EV has already completed one charge session."""
         seen_key = f"{status.key}_seen_charging"
         complete_key = f"{status.key}_session_complete"
         non_charging_key = f"{status.key}_non_charging_since"
+        last_vehicle_state_key = f"{status.key}_last_vehicle_charging_state"
 
         if not status.available:
             return
@@ -787,6 +896,7 @@ class SmartEVSEDualChargerController:
             self._mutable[seen_key] = False
             self._mutable[complete_key] = False
             self._mutable[non_charging_key] = None
+            self._mutable[last_vehicle_state_key] = None
             return
 
         mapped_vehicle_key = self._mapped_vehicle_key(status.key)
@@ -803,16 +913,30 @@ class SmartEVSEDualChargerController:
             "fully charged",
         }
         is_actively_charging = vehicle_reports_charging or status.state == "Charging"
+        previous_vehicle_state = str(self._mutable.get(last_vehicle_state_key) or "").strip().lower()
+        complete_states = {
+            "complete",
+            "completed",
+            "done",
+            "fully_charged",
+            "fully charged",
+        }
+        transitioned_to_complete = (
+            vehicle_reports_complete
+            and previous_vehicle_state not in complete_states
+        )
 
         if is_actively_charging:
             self._mutable[seen_key] = True
             self._mutable[complete_key] = False
             self._mutable[non_charging_key] = None
+            self._mutable[last_vehicle_state_key] = vehicle_charging_state or None
             return
 
-        if self._mutable.get(seen_key) and vehicle_reports_complete:
+        if self._mutable.get(seen_key) and transitioned_to_complete:
             self._mutable[complete_key] = True
             self._mutable[non_charging_key] = now.isoformat()
+            self._mutable[last_vehicle_state_key] = vehicle_charging_state or None
             return
 
         if (
@@ -826,6 +950,7 @@ class SmartEVSEDualChargerController:
 
         if mapped_vehicle_key is not None and has_vehicle_charging_state:
             self._mutable[non_charging_key] = None
+            self._mutable[last_vehicle_state_key] = vehicle_charging_state or None
             return
 
         if self._mutable.get(seen_key) and status.state in {"Connected to EV", "Ready to Charge"}:
@@ -932,7 +1057,7 @@ class SmartEVSEDualChargerController:
         handoff_target = str(self._mutable.get("handoff_target") or "")
         handoff_started_at = self._parse_datetime(self._mutable.get("handoff_started_at"))
         interval_seconds = max(1, int(self._mutable["duty_cycle_minutes"])) * 60
-        handoff_grace_seconds = max(self.get_update_interval() * 3, 30)
+        handoff_grace_seconds = max(self.get_update_interval() * 12, 120)
         observed_charging = [
             smartevse_key
             for smartevse_key in eligible_smartevse
