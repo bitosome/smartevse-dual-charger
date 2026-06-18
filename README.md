@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.7.8`
+Version: `0.0.8.1`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -39,6 +39,49 @@ That means these SmartEVSE-side settings still matter and must be configured on 
 - `current_max_circuit`
 - `current_min`
 - meter/API mode as required by your SmartEVSE setup
+
+## Control Model
+
+SmartEVSE state is the source of truth for charging control.
+
+The controller uses these sources this way:
+
+| Source | Used for | Control authority |
+| --- | --- | --- |
+| SmartEVSE `/settings` state | availability, plug connected/disconnected, charging/stopped state, current mode, current values, error state | authoritative |
+| Mains current sensors | feeder current push and safety gate when current pushing is enabled | authoritative for push safety |
+| EV-meter sensors | optional `/ev_meter` push to SmartEVSE | informational input to SmartEVSE |
+| Price sensor | acceptable-price gate | authoritative only for price mode |
+| Schedule entity | schedule-window gate | authoritative only for schedule modes |
+| EV connection-status sensors | known-vehicle identity mapping | fresh hint only |
+| Derived EV charging-status sensors | faster completion confirmation and mapping correction | fresh hint only |
+| EV battery sensors | dashboard/card display | display only |
+
+Important EV telemetry rule:
+
+- EV cloud telemetry never decides that charging is impossible.
+- EV cloud telemetry never clears or completes a SmartEVSE session by itself.
+- EV cloud telemetry is trusted only while the entity state is recent.
+- Current freshness window is `10 minutes`.
+- If EV telemetry is stale, `unknown`, or `unavailable`, the controller keeps using SmartEVSE-side behavior and exposes a non-blocking controller warning.
+
+## Controller Cycle
+
+Each controller refresh performs this sequence:
+
+1. Poll both SmartEVSE devices through `GET /settings`.
+2. Track SmartEVSE state transitions for oscillation detection.
+3. Update known-EV mapping from SmartEVSE plug events and fresh EV connection sensors.
+4. Update per-SmartEVSE session tracking.
+5. Expire force-timer mode when its timer has elapsed.
+6. Reset force modes and runtime policy if both EVs are unplugged.
+7. Resolve whether charging is allowed from force, price, and schedule gates.
+8. Resolve the active SmartEVSE from policy, plug state, completion flags, duty cycle, and handoff state.
+9. Write modes: active SmartEVSE gets `Smart`, the other SmartEVSE gets `Off`.
+10. Update Home Assistant entities and attributes.
+11. Push WLED state if WLED is enabled and the current WLED state does not already match the expected state.
+
+Mains current pushing and EV-meter pushing run in separate loops. They do not wait for the controller refresh cycle.
 
 ## Initial Setup
 
@@ -163,6 +206,18 @@ High-level controller states:
 - `schedule`
 - `blocked`
 
+Trigger behavior table:
+
+| Enabled controls | Charging allowed when | Notes |
+| --- | --- | --- |
+| None | Never | Controller remains `idle`. |
+| `Force charge` | Immediately | Ignores schedule and price. |
+| `Force charge timer` | Immediately until timer expires | Ignores schedule and price. Timer mode is cleared after expiry. |
+| `Force charge by price` | Price sensor value is `<= Acceptable price` | Requires a valid price sensor. |
+| `Charge with schedule` | Schedule entity is `on` | Requires a valid schedule entity. |
+| `Force charge by price` + `Charge with schedule` | Schedule entity is `on` and price is `<= Acceptable price` | Schedule becomes an additional gate for price charging. |
+| Multiple force modes accidentally enabled | First active force mode is kept, the rest are cleared | The controller enforces one active force mode. |
+
 Important trigger behavior:
 
 - timer mode is cleared on Home Assistant restart
@@ -207,26 +262,83 @@ If there is only one unfinished connected EV, duty cycle is not used.
 
 ### Charging Scenarios
 
+The tables below assume charging is allowed by the active trigger gate. If charging is not allowed, both SmartEVSE devices are kept out of charging mode.
+
+#### Base Connection Scenarios
+
+| SmartEVSE 1 | SmartEVSE 2 | Policy | Result |
+| --- | --- | --- | --- |
+| Disconnected | Disconnected | Any | No active SmartEVSE. Controller reason is `waiting_for_connected_ev` when charging is otherwise allowed. |
+| Connected and unfinished | Disconnected | Any first-policy | SmartEVSE 1 charges continuously. Duty cycle is not used. |
+| Disconnected | Connected and unfinished | Any first-policy | SmartEVSE 2 charges continuously. Duty cycle is not used. |
+| Connected and unfinished | Connected and unfinished | `SmartEVSE 1 first` | SmartEVSE 1 starts, then rotation follows duty cycle. |
+| Connected and unfinished | Connected and unfinished | `SmartEVSE 2 first` | SmartEVSE 2 starts, then rotation follows duty cycle. |
+| Connected and unfinished | Connected and unfinished | `SmartEVSE 1 only` | Only SmartEVSE 1 may charge. SmartEVSE 2 is ignored until policy changes. |
+| Connected and unfinished | Connected and unfinished | `SmartEVSE 2 only` | Only SmartEVSE 2 may charge. SmartEVSE 1 is ignored until policy changes. |
+| Connected but session complete | Connected and unfinished | First-policy | SmartEVSE 2 charges continuously. Duty cycle is not used. |
+| Connected and unfinished | Connected but session complete | First-policy | SmartEVSE 1 charges continuously. Duty cycle is not used. |
+| Connected but session complete | Connected but session complete | Any | Controller goes `blocked` with `all_connected_evs_complete`. |
+
+#### Fixed-Policy Scenarios
+
+| Policy | Selected SmartEVSE state | Other SmartEVSE state | Result |
+| --- | --- | --- | --- |
+| `SmartEVSE 1 only` | Available, connected, unfinished | Any | SmartEVSE 1 charges. SmartEVSE 2 stays `Off`. |
+| `SmartEVSE 2 only` | Available, connected, unfinished | Any | SmartEVSE 2 charges. SmartEVSE 1 stays `Off`. |
+| `SmartEVSE 1 only` | Disconnected | Connected or disconnected | Controller blocks with `smartevse_1_only_waiting_for_selected_ev`. |
+| `SmartEVSE 2 only` | Disconnected | Connected or disconnected | Controller blocks with `smartevse_2_only_waiting_for_selected_ev`. |
+| `SmartEVSE 1 only` | API unavailable | Any | Controller blocks with `smartevse_1_api_unavailable`. |
+| `SmartEVSE 2 only` | API unavailable | Any | Controller blocks with `smartevse_2_api_unavailable`. |
+| `SmartEVSE 1 only` | Connected but session complete | Any | Controller blocks with `smartevse_1_only_selected_ev_already_complete`. |
+| `SmartEVSE 2 only` | Connected but session complete | Any | Controller blocks with `smartevse_2_only_selected_ev_already_complete`. |
+
+#### Connection and Disconnection During Charging
+
+| Event | Result |
+| --- | --- |
+| Second EV connects while one EV is already charging | Next controller cycle sees two unfinished connected EVs and starts policy-based selection. Duty cycle begins only if both are unfinished. |
+| Waiting EV disconnects | Remaining unfinished EV continues continuously. Duty cycle is cancelled because there is no competing EV. |
+| Active EV disconnects | Completion state for that SmartEVSE is cleared. The other unfinished connected EV becomes active on the next controller cycle. |
+| Both EVs disconnect | Force modes are cleared, runtime charge policy resets to configured default, active SmartEVSE and session tracking are reset. |
+| EV reconnects after disconnect | It is treated as a new plug session. Completion state for that SmartEVSE starts fresh. |
+| Home Assistant starts while EVs are already plugged in | Charging control still works from SmartEVSE plug state. Known-EV identity may stay `unknown` until a fresh unambiguous EV connection event or charging correction exists. |
+
+#### Completion and Handoff Scenarios
+
 | Scenario | Result |
 | --- | --- |
-| No EV connected | No charging |
-| One unfinished EV connected on either charger | That SmartEVSE charges continuously in `Smart` |
-| Two unfinished EVs connected, policy `SmartEVSE 1 first` | SmartEVSE 1 starts, then rotates by duty cycle |
-| Two unfinished EVs connected, policy `SmartEVSE 2 first` | SmartEVSE 2 starts, then rotates by duty cycle |
-| Policy `SmartEVSE 1 only` | Only SmartEVSE 1 may charge |
-| Policy `SmartEVSE 2 only` | Only SmartEVSE 2 may charge |
-| Second EV connects while one EV is already charging | Controller reevaluates immediately on the next cycle and starts a fresh policy-based cycle |
-| Waiting EV disconnects | Remaining unfinished EV continues without rotation |
-| Active EV disconnects | Other unfinished connected EV takes over immediately on the next cycle |
-| Active EV finishes before duty cycle ends | Duty cycle for that EV is cancelled and the other unfinished connected EV starts on the next controller cycle |
-| Both connected EVs are already complete | Controller goes `blocked` until unplug, manual reset, or a new allowed charging window starts |
+| Active SmartEVSE reaches `Charging`, then later reports connected/ready/stopped/non-charging | Controller starts a non-charging grace timer for that same active turn. |
+| Fresh mapped EV charging-status says complete/done while SmartEVSE has stopped after charging | Session is marked complete after at least `max(2 * controller_refresh_interval, 30 seconds)`. |
+| EV telemetry is stale/unavailable, or no EV is mapped | Session can still complete, but only from SmartEVSE-side evidence after at least `max(12 * controller_refresh_interval, 180 seconds)`. |
+| Active EV finishes before duty cycle ends | Current duty-cycle turn is cancelled after completion is confirmed, and the other unfinished connected SmartEVSE becomes active on the next controller cycle. |
+| Active SmartEVSE never reaches `Charging` during the current active turn | That SmartEVSE is not marked complete. A failed handoff can fall back to the other eligible SmartEVSE. |
+| Duty-cycle handoff target does not reach `Charging` within `max(12 * controller_refresh_interval, 120 seconds)` | Handoff is treated as failed and the other eligible SmartEVSE is selected again. |
+| SmartEVSE reports an error while connected | WLED/card show error. Charging selection still follows SmartEVSE availability and controller mode writes; automations should use `Controller error` and per-SmartEVSE error sensors for notifications. |
+| User changes runtime policy while charging | Session tracking and active selection are reset immediately, then the new policy is applied. |
+| User changes duty cycle while charging | Active selection is reset immediately and the next cycle starts from the current policy. |
+| Charging gate turns off, then later turns on | Active selection is reset. When charging becomes allowed again, connected EVs start a fresh cycle. |
+
+#### Blocking and Fail-Safe Scenarios
+
+| Condition | Result |
+| --- | --- |
+| Both SmartEVSE APIs are unavailable | Charging is blocked with `smartevse_api_unavailable`. |
+| One SmartEVSE API is unavailable and policy needs that SmartEVSE | Charging is blocked with the per-device API error. |
+| One SmartEVSE API is unavailable but the other connected SmartEVSE is eligible under a first-policy | The available eligible SmartEVSE may charge. |
+| Mains current pushing is enabled and any mains phase sensor is invalid | Charging is blocked with `mains_data_unavailable`, and the integration does not push fake zero currents. |
+| Price mode is active and price sensor is missing or invalid | Charging is not allowed and `controller_error` is `price_sensor_unavailable`. |
+| Schedule mode is active and schedule entity is missing | Charging is not allowed and `controller_error` is `schedule_entity_unavailable`. |
+| Schedule is enabled, schedule window is off, and price force is enabled | Charging waits for schedule window before checking acceptable price. |
+| SmartEVSE state changes repeatedly while active | Controller exposes an oscillation warning, clears session tracking, and resets active selection. |
 
 How session completion is detected:
 
-- if a mapped EV reports `charging_status = done` / `complete`, that session is considered complete immediately
-- otherwise the integration falls back to SmartEVSE-side state transitions and a short non-charging grace period
-- unplugging clears completion for that side
-- a new charging session clears completion again
+- A SmartEVSE session can be marked complete only after that same SmartEVSE has reported `Charging` during the current active turn.
+- Fresh EV `charging_status` values such as `complete`, `completed`, `done`, `fully_charged`, or `fully charged` can shorten the grace period.
+- EV `idle`, stale EV data, unavailable EV data, or missing EV data does not complete a session.
+- SmartEVSE states treated as active non-charging evidence are `Connected to EV`, `Ready to Charge`, `Stop Charging`, and states starting with `Charging Stopped`.
+- Unplugging clears completion for that SmartEVSE.
+- Manual `reset_sessions`, a new allowed charging window, force-mode enablement, policy change, or duty-cycle change starts fresh session tracking.
 
 ## Price and Schedule Handling
 
@@ -285,6 +397,13 @@ Runtime visuals:
 - charging: green animated
 - SmartEVSE 1 charging animation runs in reverse direction
 - error: red
+
+Runtime update behavior:
+
+- the controller reads current WLED state on every controller refresh
+- if WLED already matches the expected two-segment state, no payload is posted
+- if WLED differs, the integration posts one `/json/state` payload with both SmartEVSE segments
+- runtime control does not activate WLED presets; presets are kept as reusable/bootstrap assets
 
 ### WLED Recreation Checkbox
 
@@ -403,6 +522,15 @@ These are service actions only. The integration no longer exposes separate butto
 - `schedule_entity_unavailable`
 - `smartevse_api_unavailable`
 - per-device API failures such as `smartevse_1_api_unavailable` or `smartevse_2_api_unavailable`
+- `vehicle_mapping_ambiguous`
+- `smartevse_1_vehicle_data_unavailable`
+- `smartevse_2_vehicle_data_unavailable`
+- `smartevse_1_vehicle_data_stale`
+- `smartevse_2_vehicle_data_stale`
+- `smartevse_1_state_oscillation`
+- `smartevse_2_state_oscillation`
+
+Vehicle mapping and vehicle data warnings are non-blocking. They are exposed so automations can notify about degraded identity/telemetry quality, but charging control continues from SmartEVSE state.
 
 ## EV Identity Mapping
 
@@ -413,8 +541,23 @@ Mapping behavior:
 - on each controller refresh, the integration watches SmartEVSE plug state and the configured EV connection-status sensors
 - when a SmartEVSE changes to connected, it correlates that with which EV connection-status sensor changed to connected
 - if the match is unambiguous, that EV is assigned to the SmartEVSE
-- unplugging either the SmartEVSE side or the EV-side sensor clears the mapping
+- unplugging the SmartEVSE side clears the mapping
+- a fresh EV-side disconnected state clears that EV from any SmartEVSE mapping
 - if the match is ambiguous, the mapping stays `unknown`
+- if exactly one SmartEVSE and exactly one known EV are freshly observed as charging, the mapping can be corrected from that charging evidence
+- stale or unavailable EV telemetry is ignored for mapping decisions
+
+Mapping scenario table:
+
+| Scenario | Mapping result |
+| --- | --- |
+| One SmartEVSE plug changes to connected and one fresh EV connection sensor changes to connected | That EV is mapped to that SmartEVSE. |
+| One SmartEVSE is connected, one fresh known EV is connected, and no other connected candidates exist | That EV is mapped to that SmartEVSE. |
+| Both SmartEVSE plugs are connected and both EV sensors are already connected with no fresh event | Mapping may remain `unknown` to avoid guessing. |
+| One SmartEVSE reports `Charging` and exactly one fresh known EV reports `charging` | Mapping is corrected to that EV. |
+| EV connection sensor becomes fresh `disconnected` | That EV is removed from any SmartEVSE mapping. |
+| SmartEVSE plug becomes disconnected | Mapping and session state for that SmartEVSE are cleared. |
+| EV connection or charging sensor is stale/unavailable | Mapping is not changed from that EV data. Controller exposes a non-blocking warning if the EV is already mapped. |
 
 Exposed mapping surfaces:
 
@@ -425,6 +568,8 @@ Exposed mapping surfaces:
 Current limitation:
 
 - if Home Assistant starts while both EVs are already plugged in and there is no persisted mapping or fresh connection event, the integration may temporarily report `unknown` until the next unambiguous connect/disconnect event
+
+Vehicle names are known-vehicle names only. They do not rename the SmartEVSE devices. Internally the chargers remain `SmartEVSE 1` and `SmartEVSE 2`.
 
 ## Dashboard
 
