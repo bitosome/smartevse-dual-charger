@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.8.1`
+Version: `0.0.8.2`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -56,6 +56,7 @@ The controller uses these sources this way:
 | EV connection-status sensors | known-vehicle identity mapping | fresh hint only |
 | Derived EV charging-status sensors | faster completion confirmation and mapping correction | fresh hint only |
 | EV battery sensors | dashboard/card display | display only |
+| EV-meter active power | local proof that the active EV is really drawing charging power | authoritative for no-power completion |
 
 Important EV telemetry rule:
 
@@ -64,6 +65,7 @@ Important EV telemetry rule:
 - EV cloud telemetry is trusted only while the entity state is recent.
 - Current freshness window is `10 minutes`.
 - If EV telemetry is stale, `unknown`, or `unavailable`, the controller keeps using SmartEVSE-side behavior and exposes a non-blocking controller warning.
+- If SmartEVSE reports `Charging` but the local EV meter stays below `500 W` for at least `180 seconds`, the active session is treated as not drawing real charging power and can be completed/switched without waiting for the duty-cycle end.
 
 ## Controller Cycle
 
@@ -310,6 +312,7 @@ The tables below assume charging is allowed by the active trigger gate. If charg
 | Active SmartEVSE reaches `Charging`, then later reports connected/ready/stopped/non-charging | Controller starts a non-charging grace timer for that same active turn. |
 | Fresh mapped EV charging-status says complete/done while SmartEVSE has stopped after charging | Session is marked complete after at least `max(2 * controller_refresh_interval, 30 seconds)`. |
 | EV telemetry is stale/unavailable, or no EV is mapped | Session can still complete, but only from SmartEVSE-side evidence after at least `max(12 * controller_refresh_interval, 180 seconds)`. |
+| SmartEVSE says `Charging`, but EV-meter active power stays below `500 W` for `180 seconds` | Session is marked complete from local no-power evidence. This handles a full EV repeatedly closing/opening the contactor while another EV still needs charging. |
 | Active EV finishes before duty cycle ends | Current duty-cycle turn is cancelled after completion is confirmed, and the other unfinished connected SmartEVSE becomes active on the next controller cycle. |
 | Active SmartEVSE never reaches `Charging` during the current active turn | That SmartEVSE is not marked complete. A failed handoff can fall back to the other eligible SmartEVSE. |
 | Duty-cycle handoff target does not reach `Charging` within `max(12 * controller_refresh_interval, 120 seconds)` | Handoff is treated as failed and the other eligible SmartEVSE is selected again. |
@@ -336,6 +339,7 @@ How session completion is detected:
 - A SmartEVSE session can be marked complete only after that same SmartEVSE has reported `Charging` during the current active turn.
 - Fresh EV `charging_status` values such as `complete`, `completed`, `done`, `fully_charged`, or `fully charged` can shorten the grace period.
 - EV `idle`, stale EV data, unavailable EV data, or missing EV data does not complete a session.
+- Local EV-meter no-power evidence can complete a session even when vehicle-cloud telemetry is stale.
 - SmartEVSE states treated as active non-charging evidence are `Connected to EV`, `Ready to Charge`, `Stop Charging`, and states starting with `Charging Stopped`.
 - Unplugging clears completion for that SmartEVSE.
 - Manual `reset_sessions`, a new allowed charging window, force-mode enablement, policy change, or duty-cycle change starts fresh session tracking.

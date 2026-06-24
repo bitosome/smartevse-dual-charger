@@ -117,6 +117,7 @@ MUTABLE_DEFAULTS: dict[str, Any] = {
     "smartevse_1_seen_charging": False,
     "smartevse_1_session_complete": False,
     "smartevse_1_non_charging_since": None,
+    "smartevse_1_low_power_since": None,
     "smartevse_1_last_vehicle_charging_state": None,
     "smartevse_1_connected_ev": "unknown",
     "smartevse_1_last_connected": None,
@@ -127,6 +128,7 @@ MUTABLE_DEFAULTS: dict[str, Any] = {
     "smartevse_2_seen_charging": False,
     "smartevse_2_session_complete": False,
     "smartevse_2_non_charging_since": None,
+    "smartevse_2_low_power_since": None,
     "smartevse_2_last_vehicle_charging_state": None,
     "smartevse_2_connected_ev": "unknown",
     "smartevse_2_last_connected": None,
@@ -149,6 +151,8 @@ MAPPING_CONNECT_WINDOW = timedelta(minutes=10)
 VEHICLE_TELEMETRY_MAX_AGE = timedelta(minutes=10)
 VEHICLE_COMPLETE_CONFIRMATION_GRACE_SECONDS = 30
 SMARTEVSE_COMPLETE_GRACE_SECONDS = 180
+LOW_EV_POWER_COMPLETE_GRACE_SECONDS = 180
+ACTUAL_CHARGING_POWER_THRESHOLD_WATTS = 500
 VEHICLE_COMPLETE_STATES = {
     "complete",
     "completed",
@@ -358,8 +362,9 @@ class SmartEVSEDualChargerController:
             smartevse_1=smartevse_1,
             smartevse_2=smartevse_2,
         )
-        self._update_session_tracking(smartevse_1, now=now)
-        self._update_session_tracking(smartevse_2, now=now)
+        ev_meter_power = self._state_float_or_none(self._entry_data.get(CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY))
+        self._update_session_tracking(smartevse_1, now=now, ev_meter_power=ev_meter_power)
+        self._update_session_tracking(smartevse_2, now=now, ev_meter_power=ev_meter_power)
 
         if self._mutable["force_timer"]:
             timer_until = self._timer_until()
@@ -976,6 +981,7 @@ class SmartEVSEDualChargerController:
         for smartevse_key in ("smartevse_1", "smartevse_2"):
             self._mutable[f"{smartevse_key}_active_seen_charging"] = False
             self._mutable[f"{smartevse_key}_non_charging_since"] = None
+            self._mutable[f"{smartevse_key}_low_power_since"] = None
 
     def _activate_smartevse(self, smartevse_key: str | None, active_since: datetime | None) -> None:
         """Persist the active SmartEVSE and reset tracking when a new active turn starts."""
@@ -1010,14 +1016,22 @@ class SmartEVSEDualChargerController:
         self._mutable[f"{smartevse_key}_seen_charging"] = False
         self._mutable[f"{smartevse_key}_session_complete"] = False
         self._mutable[f"{smartevse_key}_non_charging_since"] = None
+        self._mutable[f"{smartevse_key}_low_power_since"] = None
         self._mutable[f"{smartevse_key}_last_vehicle_charging_state"] = None
 
-    def _update_session_tracking(self, status: SmartEVSEStatus, *, now: datetime) -> None:
+    def _update_session_tracking(
+        self,
+        status: SmartEVSEStatus,
+        *,
+        now: datetime,
+        ev_meter_power: float | None,
+    ) -> None:
         """Track whether a connected EV has already completed one charge session."""
         seen_key = f"{status.key}_seen_charging"
         active_seen_key = f"{status.key}_active_seen_charging"
         complete_key = f"{status.key}_session_complete"
         non_charging_key = f"{status.key}_non_charging_since"
+        low_power_key = f"{status.key}_low_power_since"
         last_vehicle_state_key = f"{status.key}_last_vehicle_charging_state"
 
         if not status.available:
@@ -1028,6 +1042,7 @@ class SmartEVSEDualChargerController:
             self._mutable[seen_key] = False
             self._mutable[complete_key] = False
             self._mutable[non_charging_key] = None
+            self._mutable[low_power_key] = None
             self._mutable[last_vehicle_state_key] = None
             return
 
@@ -1052,6 +1067,23 @@ class SmartEVSEDualChargerController:
         if is_actively_charging:
             if is_selected:
                 self._mutable[active_seen_key] = True
+                low_power_since = self._parse_datetime(self._mutable.get(low_power_key))
+                if self._has_actual_ev_power(ev_meter_power):
+                    self._mutable[low_power_key] = None
+                elif self._has_low_ev_power_while_charging(status, ev_meter_power):
+                    if low_power_since is None:
+                        self._mutable[low_power_key] = now.isoformat()
+                    elif int((now - low_power_since).total_seconds()) >= LOW_EV_POWER_COMPLETE_GRACE_SECONDS:
+                        self._mutable[seen_key] = True
+                        self._mutable[complete_key] = True
+                        self._mutable[non_charging_key] = now.isoformat()
+                        if mapped_vehicle_key is not None and has_vehicle_charging_state:
+                            self._mutable[last_vehicle_state_key] = vehicle_charging_state or None
+                        return
+                else:
+                    self._mutable[low_power_key] = None
+            else:
+                self._mutable[low_power_key] = None
             self._mutable[seen_key] = True
             self._mutable[complete_key] = False
             self._mutable[non_charging_key] = None
@@ -1077,6 +1109,18 @@ class SmartEVSEDualChargerController:
 
         if mapped_vehicle_key is not None and has_vehicle_charging_state:
             self._mutable[last_vehicle_state_key] = vehicle_charging_state or None
+
+    def _has_actual_ev_power(self, ev_meter_power: float | None) -> bool:
+        """Return whether the EV meter shows meaningful charging power."""
+        return ev_meter_power is not None and abs(ev_meter_power) >= ACTUAL_CHARGING_POWER_THRESHOLD_WATTS
+
+    def _has_low_ev_power_while_charging(self, status: SmartEVSEStatus, ev_meter_power: float | None) -> bool:
+        """Return whether SmartEVSE reports charging while the local EV meter shows no real load."""
+        return (
+            ev_meter_power is not None
+            and abs(ev_meter_power) < ACTUAL_CHARGING_POWER_THRESHOLD_WATTS
+            and status.charge_current >= 6.0
+        )
 
     def _status_reports_charging(self, status: SmartEVSEStatus) -> bool:
         """Return whether the SmartEVSE itself reports active charging."""
