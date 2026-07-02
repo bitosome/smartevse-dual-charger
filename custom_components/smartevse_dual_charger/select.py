@@ -41,5 +41,6 @@ class ChargePolicySelect(SmartEVSEDualChargerEntity, SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         """Select a runtime option."""
-        await self._entry.runtime_data.controller.async_set_charge_policy(self._label_to_policy[option])
+        policy = self._label_to_policy.get(option, option)
+        await self._entry.runtime_data.controller.async_set_charge_policy(policy)
         await self._entry.runtime_data.coordinator._async_refresh_now("select_option")

@@ -355,6 +355,10 @@ class SmartEVSEDualChargerController:
             self._async_fetch_status("smartevse_1", self._entry_data[CONF_SMARTEVSE_1_BASE_URL]),
             self._async_fetch_status("smartevse_2", self._entry_data[CONF_SMARTEVSE_2_BASE_URL]),
         )
+        previous_any_connected = any(
+            bool(self._mutable.get(f"{smartevse_key}_last_connected"))
+            for smartevse_key in ("smartevse_1", "smartevse_2")
+        )
         self._track_state_transitions(smartevse_1, now=now)
         self._track_state_transitions(smartevse_2, now=now)
         self._update_connected_vehicle_mapping(
@@ -378,6 +382,7 @@ class SmartEVSEDualChargerController:
             and smartevse_2.available
             and not smartevse_1.connected
             and not smartevse_2.connected
+            and previous_any_connected
         ):
             self._clear_force_modes()
             self._mutable["charge_policy"] = self._configured_charge_policy()
@@ -1091,6 +1096,11 @@ class SmartEVSEDualChargerController:
             return
 
         if self._mutable.get(active_seen_key) and is_selected and active_non_charging_state:
+            if not vehicle_reports_complete and self._status_blocks_completion_detection(status):
+                self._mutable[non_charging_key] = None
+                if mapped_vehicle_key is not None and has_vehicle_charging_state:
+                    self._mutable[last_vehicle_state_key] = vehicle_charging_state or None
+                return
             non_charging_since = self._parse_datetime(self._mutable.get(non_charging_key))
             if non_charging_since is None:
                 self._mutable[non_charging_key] = now.isoformat()
@@ -1121,6 +1131,14 @@ class SmartEVSEDualChargerController:
             and abs(ev_meter_power) < ACTUAL_CHARGING_POWER_THRESHOLD_WATTS
             and status.charge_current >= 6.0
         )
+
+    def _status_blocks_completion_detection(self, status: SmartEVSEStatus) -> bool:
+        """Return whether a transient charger condition should not be treated as charge completion."""
+        error = str(status.error or "").strip().lower()
+        state = str(status.state or "").strip().lower()
+        if error and error not in {"none", "unknown", "unavailable"}:
+            return True
+        return "comm error" in state or "communication error" in state or "no power available" in state
 
     def _status_reports_charging(self, status: SmartEVSEStatus) -> bool:
         """Return whether the SmartEVSE itself reports active charging."""
