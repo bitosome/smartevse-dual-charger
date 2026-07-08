@@ -106,6 +106,7 @@ MUTABLE_DEFAULTS: dict[str, Any] = {
     "pending_previous_active_smartevse": None,
     "handoff_target": None,
     "handoff_started_at": None,
+    "policy_change_pending": False,
     "last_charge_allowed": False,
     "last_active_charge_reason": None,
     "last_schedule_window_active": False,
@@ -317,6 +318,9 @@ class SmartEVSEDualChargerController:
         self._mutable["charge_policy"] = ChargePolicy(value).value
         self._clear_session_tracking()
         self._reset_charge_cycle(preserve_previous_active=True)
+        # A manual policy change should take effect immediately, even mid-cycle,
+        # switching to the newly preferred SmartEVSE (see _resolve_active_smartevse).
+        self._mutable["policy_change_pending"] = True
         await self._async_save_state()
 
     async def async_set_duty_cycle_minutes(self, value: float) -> None:
@@ -1194,6 +1198,9 @@ class SmartEVSEDualChargerController:
             "smartevse_2": smartevse_2,
         }
         policy = ChargePolicy(self._mutable["charge_policy"])
+        policy_change_pending = bool(self._mutable.get("policy_change_pending"))
+        if policy_change_pending:
+            self._mutable["policy_change_pending"] = False
         available_smartevse = [smartevse_key for smartevse_key, status in statuses.items() if status.available]
         connected_smartevse = [
             smartevse_key for smartevse_key, status in statuses.items() if status.available and status.connected
@@ -1245,6 +1252,20 @@ class SmartEVSEDualChargerController:
         elif handoff_target and handoff_started_at is None:
             self._clear_handoff()
             handoff_target = ""
+
+        if (
+            policy_change_pending
+            and not handoff_target
+            and preferred_smartevse in eligible_smartevse
+            and preferred_smartevse not in observed_charging
+        ):
+            # A manual charge-policy change must switch to the newly preferred
+            # SmartEVSE right away. Start a handoff so the preferred charger takes
+            # over (and stays sticky through the grace window) instead of the
+            # controller re-adopting the EV that is still winding down.
+            self._start_handoff(preferred_smartevse, now=now)
+            handoff_target = preferred_smartevse
+            handoff_started_at = now
 
         if handoff_target and handoff_started_at is not None:
             handoff_elapsed = int((now - handoff_started_at).total_seconds())
