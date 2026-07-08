@@ -1199,8 +1199,14 @@ class SmartEVSEDualChargerController:
         }
         policy = ChargePolicy(self._mutable["charge_policy"])
         policy_change_pending = bool(self._mutable.get("policy_change_pending"))
-        if policy_change_pending:
+        if policy_change_pending and policy in (
+            ChargePolicy.SMARTEVSE_1_ONLY,
+            ChargePolicy.SMARTEVSE_2_ONLY,
+        ):
+            # Only-policies switch to the fixed charger directly below, so the
+            # pending change is already satisfied — consume the flag now.
             self._mutable["policy_change_pending"] = False
+            policy_change_pending = False
         available_smartevse = [smartevse_key for smartevse_key, status in statuses.items() if status.available]
         connected_smartevse = [
             smartevse_key for smartevse_key, status in statuses.items() if status.available and status.connected
@@ -1253,19 +1259,26 @@ class SmartEVSEDualChargerController:
             self._clear_handoff()
             handoff_target = ""
 
-        if (
-            policy_change_pending
-            and not handoff_target
-            and preferred_smartevse in eligible_smartevse
-            and preferred_smartevse not in observed_charging
-        ):
-            # A manual charge-policy change must switch to the newly preferred
-            # SmartEVSE right away. Start a handoff so the preferred charger takes
-            # over (and stays sticky through the grace window) instead of the
-            # controller re-adopting the EV that is still winding down.
-            self._start_handoff(preferred_smartevse, now=now)
-            handoff_target = preferred_smartevse
-            handoff_started_at = now
+        if policy_change_pending:
+            # Both chargers are eligible, so a pending policy change can finally be
+            # applied. Consume the flag only here (not on the earlier waiting/
+            # offline returns) so a change made while a charger was offline or only
+            # one EV was plugged in still takes effect once both are ready — and so
+            # a stale flag can never keep forcing the preferred EV after a normal
+            # rotation.
+            self._mutable["policy_change_pending"] = False
+            if (
+                not handoff_target
+                and preferred_smartevse in eligible_smartevse
+                and preferred_smartevse not in observed_charging
+            ):
+                # Switch to the newly preferred SmartEVSE right away via a handoff
+                # so the preferred charger takes over (staying sticky through the
+                # grace window) instead of the controller re-adopting the EV that
+                # is still winding down.
+                self._start_handoff(preferred_smartevse, now=now)
+                handoff_target = preferred_smartevse
+                handoff_started_at = now
 
         if handoff_target and handoff_started_at is not None:
             handoff_elapsed = int((now - handoff_started_at).total_seconds())
