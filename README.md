@@ -360,6 +360,71 @@ Schedule mode:
 
 The schedule reminder is implemented as a Home Assistant persistent notification, not as `notify.notify`.
 
+### Combining the schedule with force modes
+
+A common setup is to leave `Charge with schedule` permanently enabled as a "set and forget" safety net for the overnight window, and use the force switches for ad‑hoc daytime charging. Because `Charge with schedule` acts as an additional gate for `Force charge by price` (see the precedence rules above), the combinations behave as follows:
+
+| You want | Do this | Result |
+| --- | --- | --- |
+| Guaranteed overnight charge (set and forget) | Keep `Charge with schedule` on | Charges every day inside the schedule window, regardless of price. |
+| Daytime unconditional top‑up | Turn on `Force charge` | Charges immediately, 24/7, overriding the schedule and price. Does **not** auto‑expire — you must turn it off manually. Enabling it also clears `Force charge by price` / `Force charge timer`. The schedule stays enabled in the background and resumes when you turn `Force charge` off. |
+| Daytime charge only when price is acceptable | Turn `Charge with schedule` **off**, then turn `Force charge by price` on | Price charging is gated by the schedule window, so while the schedule is on it never charges outside the window. Turning the schedule off removes the gate and lets price charging run during the day. Re‑enable the schedule afterwards. |
+| Overnight, only when price is acceptable | Keep both `Charge with schedule` and `Force charge by price` on | Charges inside the schedule window only while `price <= acceptable_price`. |
+
+The daytime price case has friction: you must temporarily disable `Charge with schedule`, and if you forget to re‑enable it your guaranteed overnight charge is lost. The integration's built‑in persistent notification and the example automation below help catch this.
+
+### Example: reminder automation to re‑enable the schedule
+
+This automation reminds you (via `notify.notify`) one hour before and at the schedule start time when `Charge with schedule` was left off. Adjust the two `at:` times to match your schedule window's start (the example assumes a `00:00` start, so it reminds at `23:00` and `00:00`).
+
+```yaml
+- alias: SmartEVSE schedule reminder
+  description: Reminds to enable "Charge with schedule" one hour before and at the
+    schedule start time if it was forgotten.
+  triggers:
+  - trigger: time
+    at: "23:00:00"
+    id: schedule_reminder_1h
+  - trigger: time
+    at: "00:00:00"
+    id: schedule_reminder_now
+  conditions:
+  - condition: state
+    entity_id: switch.smartevse_dual_charger_charge_with_schedule
+    state: "off"
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - schedule_reminder_1h
+      sequence:
+      - action: notify.notify
+        data:
+          title: EV charge schedule
+          message: >-
+            Reminder: charge schedule starts in 1 hour (00:00) but "Charge with
+            schedule" is OFF. Enable it if you want the guaranteed overnight charge.
+    - conditions:
+      - condition: trigger
+        id:
+        - schedule_reminder_now
+      sequence:
+      - action: notify.notify
+        data:
+          title: EV charge schedule
+          message: >-
+            Charge schedule window has started (00:00) but "Charge with schedule"
+            is OFF. Enable it now to charge overnight.
+  mode: single
+```
+
+Notes:
+
+- The condition only fires the reminders when `Charge with schedule` is off, so you are not notified once it is enabled.
+- `notify.notify` targets your default notify service. Replace it with a specific service (for example a mobile app) to reach a particular device.
+- This complements the built‑in persistent notification, which fires when the schedule window is already active while the schedule gate is disabled.
+
 ## Controller Refresh and Meter Pushes
 
 The integration has three independent timings:
