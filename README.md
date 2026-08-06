@@ -196,7 +196,8 @@ Practical result:
 
 - `Force charge` and `Force charge timer` override schedule
 - `Force charge by price` can also require the schedule window when schedule charging is enabled
-- force modes are mutually exclusive
+- `Force charge timer` and `Force charge by price` can be combined for a time-limited, price-gated charge
+- plain `Force charge` remains mutually exclusive with timer and price modes
 - `Force charge by price` uses price as an additional gate when schedule charging is also enabled
 
 High-level controller states:
@@ -215,14 +216,16 @@ Trigger behavior table:
 | None | Never | Controller remains `idle`. |
 | `Force charge` | Immediately | Ignores schedule and price. |
 | `Force charge timer` | Immediately until timer expires | Ignores schedule and price. Timer mode is cleared after expiry. |
+| `Force charge timer` + `Force charge by price` | Until the timer expires, and only while price is `<= Acceptable price` | Ignores schedule. Both force controls are cleared when the timer expires. |
 | `Force charge by price` | Price sensor value is `<= Acceptable price` | Requires a valid price sensor. |
 | `Charge with schedule` | Schedule entity is `on` | Requires a valid schedule entity. |
 | `Force charge by price` + `Charge with schedule` | Schedule entity is `on` and price is `<= Acceptable price` | Schedule becomes an additional gate for price charging. |
-| Multiple force modes accidentally enabled | First active force mode is kept, the rest are cleared | The controller enforces one active force mode. |
+| `Force charge` plus another force mode | Immediately | Plain force charge wins and clears timer/price modes. |
 
 Important trigger behavior:
 
 - timer mode is cleared on Home Assistant restart
+- when a timer-plus-price plan expires, its price gate is cleared with the timer
 - if both EVs are unplugged, all force modes are cleared and the runtime charge policy resets to the configured default
 - when charging becomes allowed again after being disallowed, the controller starts a fresh cycle for still-plugged EVs
 - enabling a force mode starts a fresh manual cycle
