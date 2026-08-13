@@ -27,6 +27,7 @@ async def async_setup_entry(
             ControllerSwitchEntity(entry, "force_price", "force_price", controller.async_set_force_price),
             ControllerSwitchEntity(entry, "force_timer", "force_timer", controller.async_set_force_timer),
             ControllerSwitchEntity(entry, "schedule_enabled", "charge_with_schedule", controller.async_set_schedule_enabled),
+            ControllerSwitchEntity(entry, "schedule_price", "schedule_price", controller.async_set_schedule_price),
         ]
     )
 
@@ -62,4 +63,3 @@ class ControllerSwitchEntity(SmartEVSEDualChargerEntity, SwitchEntity):
         """Turn the switch off."""
         await self._setter(False)
         await self._entry.runtime_data.coordinator._async_refresh_now("switch_turn_off")
-

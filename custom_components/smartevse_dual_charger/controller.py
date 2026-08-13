@@ -93,6 +93,7 @@ MUTABLE_DEFAULTS: dict[str, Any] = {
     "force_price": False,
     "force_timer": False,
     "schedule_enabled": False,
+    "schedule_price": False,
     "acceptable_price": DEFAULT_ACCEPTABLE_PRICE,
     "force_charge_duration_minutes": DEFAULT_FORCE_CHARGE_DURATION_MINUTES,
     "charge_policy": DEFAULT_CHARGE_POLICY,
@@ -201,6 +202,19 @@ class SmartEVSEDualChargerController:
         """Load persisted mutable state."""
         stored = await self._store.async_load() or {}
         self._mutable = {**MUTABLE_DEFAULTS, **stored}
+        if (
+            "schedule_price" not in stored
+            and bool(stored.get("schedule_enabled"))
+            and bool(stored.get("force_price"))
+            and not bool(stored.get("force_charge"))
+            and not bool(stored.get("force_timer"))
+        ):
+            # Before 0.0.8.6 one price switch represented both schedule-price
+            # and price-only force plans. Preserve the safe schedule-gated
+            # interpretation during migration; users can explicitly re-enable
+            # the newly unambiguous Force plan afterward.
+            self._mutable["schedule_price"] = True
+            self._mutable["force_price"] = False
         for smartevse_key in ("smartevse_1", "smartevse_2"):
             changes_key = f"{smartevse_key}_recent_state_changes"
             if not isinstance(self._mutable.get(changes_key), list):
@@ -257,30 +271,38 @@ class SmartEVSEDualChargerController:
         await self._async_save_state()
 
     async def async_set_force_charge(self, value: bool) -> None:
-        """Enable or disable force charge."""
+        """Enable or disable the force-charge plan."""
         self._mutable["force_charge"] = value
         if value:
+            self._clear_session_tracking()
+            self._reset_charge_cycle(preserve_previous_active=True)
+        else:
+            # The force switch is the plan activation flag. Its option switches
+            # must not keep a force plan running after the user turns it off.
             self._mutable["force_price"] = False
             self._mutable["force_timer"] = False
             self._mutable["timer_until"] = None
-            self._clear_session_tracking()
             self._reset_charge_cycle(preserve_previous_active=True)
         await self._async_save_state()
 
+    async def async_set_schedule_price(self, value: bool) -> None:
+        """Enable or disable the schedule's acceptable-price option."""
+        self._mutable["schedule_price"] = value
+        self._reset_charge_cycle(preserve_previous_active=True)
+        await self._async_save_state()
+
     async def async_set_force_price(self, value: bool) -> None:
-        """Enable or disable price-based force charging."""
+        """Enable or disable the acceptable-price option."""
         self._mutable["force_price"] = value
         if value:
-            self._mutable["force_charge"] = False
             self._clear_session_tracking()
             self._reset_charge_cycle(preserve_previous_active=True)
         await self._async_save_state()
 
     async def async_set_force_timer(self, value: bool) -> None:
-        """Enable or disable timer-based force charging."""
+        """Enable or disable the force-charge timer option."""
         self._mutable["force_timer"] = value
         if value:
-            self._mutable["force_charge"] = False
             duration = int(self._mutable["force_charge_duration_minutes"])
             self._mutable["timer_until"] = (dt_util.utcnow() + timedelta(minutes=duration)).isoformat()
             self._clear_session_tracking()
@@ -374,6 +396,7 @@ class SmartEVSEDualChargerController:
         if self._mutable["force_timer"]:
             timer_until = self._timer_until()
             if timer_until is None or now >= timer_until:
+                self._mutable["force_charge"] = False
                 self._mutable["force_timer"] = False
                 # A timer + price plan is one combined force-charge request.
                 # When its timer expires, the accompanying price gate must not
@@ -501,6 +524,7 @@ class SmartEVSEDualChargerController:
             "force_price": bool(self._mutable["force_price"]),
             "force_timer": bool(self._mutable["force_timer"]),
             "schedule_enabled": bool(self._mutable["schedule_enabled"]),
+            "schedule_price": bool(self._mutable["schedule_price"]),
             "acceptable_price": float(self._mutable["acceptable_price"]),
             "force_charge_duration_minutes": int(self._mutable["force_charge_duration_minutes"]),
             "charge_policy": str(self._mutable["charge_policy"]),
@@ -557,10 +581,8 @@ class SmartEVSEDualChargerController:
         }
 
     def _sanitize_mutual_exclusion(self) -> None:
-        """Keep plain force charge exclusive while allowing timer + price."""
-        if self._mutable.get("force_charge"):
-            self._mutable["force_price"] = False
-            self._mutable["force_timer"] = False
+        """Normalize impossible timer state loaded from older storage."""
+        if not self._mutable.get("force_timer"):
             self._mutable["timer_until"] = None
 
     def _clear_force_modes(self) -> None:
@@ -1154,7 +1176,28 @@ class SmartEVSEDualChargerController:
         """Resolve high-level controller state."""
         acceptable_price = float(self._mutable["acceptable_price"])
         if self._mutable["force_charge"]:
+            if self._mutable["force_timer"] and self._timer_until() is not None:
+                if self._mutable["force_price"]:
+                    if not self._entry_data.get(CONF_PRICE_SENSOR_ENTITY):
+                        return False, ControllerState.IDLE, "price_sensor_unavailable"
+                    if price_value is None:
+                        return False, ControllerState.IDLE, "price_sensor_unavailable"
+                    if price_value > acceptable_price:
+                        return False, ControllerState.IDLE, "waiting_for_acceptable_price"
+                    return True, ControllerState.TIMER, "force_timer_acceptable_price"
+                return True, ControllerState.TIMER, "force_timer"
+            if self._mutable["force_price"]:
+                if not self._entry_data.get(CONF_PRICE_SENSOR_ENTITY):
+                    return False, ControllerState.IDLE, "price_sensor_unavailable"
+                if price_value is None:
+                    return False, ControllerState.IDLE, "price_sensor_unavailable"
+                if price_value <= acceptable_price:
+                    return True, ControllerState.PRICE, "acceptable_price"
+                return False, ControllerState.IDLE, "waiting_for_acceptable_price"
             return True, ControllerState.FORCE, "force_charge"
+
+        # Keep accepting the pre-0.0.8.6 direct timer/price switch behavior for
+        # automations that do not yet use Force charge as the activation flag.
         if self._mutable["force_timer"] and self._timer_until() is not None:
             if self._mutable["force_price"]:
                 if not self._entry_data.get(CONF_PRICE_SENSOR_ENTITY):
@@ -1166,11 +1209,6 @@ class SmartEVSEDualChargerController:
                 return True, ControllerState.TIMER, "force_timer_acceptable_price"
             return True, ControllerState.TIMER, "force_timer"
         if self._mutable["force_price"]:
-            if self._mutable["schedule_enabled"]:
-                if not self._entry_data.get(CONF_SCHEDULE_ENTITY):
-                    return False, ControllerState.IDLE, "schedule_entity_unavailable"
-                if not schedule_window_active:
-                    return False, ControllerState.IDLE, "waiting_for_schedule_window"
             if not self._entry_data.get(CONF_PRICE_SENSOR_ENTITY):
                 return False, ControllerState.IDLE, "price_sensor_unavailable"
             if price_value is None:
@@ -1181,9 +1219,17 @@ class SmartEVSEDualChargerController:
         if self._mutable["schedule_enabled"]:
             if not self._entry_data.get(CONF_SCHEDULE_ENTITY):
                 return False, ControllerState.IDLE, "schedule_entity_unavailable"
-            if schedule_window_active:
-                return True, ControllerState.SCHEDULE, "schedule"
-            return False, ControllerState.IDLE, "waiting_for_schedule_window"
+            if not schedule_window_active:
+                return False, ControllerState.IDLE, "waiting_for_schedule_window"
+            if self._mutable["schedule_price"]:
+                if not self._entry_data.get(CONF_PRICE_SENSOR_ENTITY):
+                    return False, ControllerState.IDLE, "price_sensor_unavailable"
+                if price_value is None:
+                    return False, ControllerState.IDLE, "price_sensor_unavailable"
+                if price_value > acceptable_price:
+                    return False, ControllerState.IDLE, "waiting_for_acceptable_price"
+                return True, ControllerState.SCHEDULE, "schedule_acceptable_price"
+            return True, ControllerState.SCHEDULE, "schedule"
         return False, ControllerState.IDLE, "idle"
 
     def _resolve_active_smartevse(

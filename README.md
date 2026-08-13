@@ -182,23 +182,25 @@ Available charging gates:
 - `Force charge timer`
 - `Force charge by price`
 - `Charge with schedule`
+- `Schedule acceptable price`
+
+`Force charge` is the global activation switch for the force plan. `Force charge timer`
+and `Force charge by price` are optional constraints on that plan. The schedule has
+its own independent `Schedule acceptable price` option.
 
 Precedence is fixed:
 
-1. `Force charge`
-2. `Force charge timer`
-3. `Force charge by price`
-4. `Charge with schedule`
+1. Active `Force charge`, with its selected timer and/or price constraints
+2. `Charge with schedule`, with its independent price constraint
 
-If `Charge with schedule` is enabled at the same time as `Force charge by price`, the schedule window is treated as an additional gate. Price-based charging will not run outside the schedule window.
+The schedule switch remains enabled while Force charge is active, but it is not
+evaluated until Force charge ends.
 
 Practical result:
 
-- `Force charge` and `Force charge timer` override schedule
-- `Force charge by price` can also require the schedule window when schedule charging is enabled
+- every active Force charge variant overrides schedule
 - `Force charge timer` and `Force charge by price` can be combined for a time-limited, price-gated charge
-- plain `Force charge` remains mutually exclusive with timer and price modes
-- `Force charge by price` uses price as an additional gate when schedule charging is also enabled
+- Force charge options remain independent from the schedule's acceptable-price option
 
 High-level controller states:
 
@@ -214,18 +216,18 @@ Trigger behavior table:
 | Enabled controls | Charging allowed when | Notes |
 | --- | --- | --- |
 | None | Never | Controller remains `idle`. |
-| `Force charge` | Immediately | Ignores schedule and price. |
-| `Force charge timer` | Immediately until timer expires | Ignores schedule and price. Timer mode is cleared after expiry. |
-| `Force charge timer` + `Force charge by price` | Until the timer expires, and only while price is `<= Acceptable price` | Ignores schedule. Both force controls are cleared when the timer expires. |
-| `Force charge by price` | Price sensor value is `<= Acceptable price` | Requires a valid price sensor. |
+| `Force charge` | Immediately | Ignores schedule when no force options are enabled. |
+| `Force charge` + `Force charge timer` | Immediately until timer expires | Ignores schedule. The force plan is cleared after expiry. |
+| `Force charge` + timer + price | Until the timer expires, and only while price is `<= Acceptable price` | Ignores schedule. The force plan is cleared when the timer expires. |
+| `Force charge` + `Force charge by price` | Price sensor value is `<= Acceptable price` | Ignores schedule and requires a valid price sensor. |
 | `Charge with schedule` | Schedule entity is `on` | Requires a valid schedule entity. |
-| `Force charge by price` + `Charge with schedule` | Schedule entity is `on` and price is `<= Acceptable price` | Schedule becomes an additional gate for price charging. |
-| `Force charge` plus another force mode | Immediately | Plain force charge wins and clears timer/price modes. |
+| `Charge with schedule` + `Schedule acceptable price` | Schedule entity is `on` and price is `<= Acceptable price` | Both standing schedule conditions must be satisfied. |
+| Force plan + Schedule plan | The selected Force constraints | Schedule remains on and resumes after Force charge ends. |
 
 Important trigger behavior:
 
 - timer mode is cleared on Home Assistant restart
-- when a timer-plus-price plan expires, its price gate is cleared with the timer
+- when a timed force plan expires, its activation and force options are cleared together
 - if both EVs are unplugged, all force modes are cleared and the runtime charge policy resets to the configured default
 - when charging becomes allowed again after being disallowed, the controller starts a fresh cycle for still-plugged EVs
 - enabling a force mode starts a fresh manual cycle
@@ -334,7 +336,7 @@ The tables below assume charging is allowed by the active trigger gate. If charg
 | Mains current pushing is enabled and any mains phase sensor is invalid | Charging is blocked with `mains_data_unavailable`, and the integration does not push fake zero currents. |
 | Price mode is active and price sensor is missing or invalid | Charging is not allowed and `controller_error` is `price_sensor_unavailable`. |
 | Schedule mode is active and schedule entity is missing | Charging is not allowed and `controller_error` is `schedule_entity_unavailable`. |
-| Schedule is enabled, schedule window is off, and price force is enabled | Charging waits for schedule window before checking acceptable price. |
+| Force charge with acceptable price is enabled outside the schedule window | Charging ignores the schedule and waits only for an acceptable price. |
 | SmartEVSE state changes repeatedly while active | Controller exposes an oscillation warning, clears session tracking, and resets active selection. |
 
 How session completion is detected:
@@ -365,16 +367,14 @@ The schedule reminder is implemented as a Home Assistant persistent notification
 
 ### Combining the schedule with force modes
 
-A common setup is to leave `Charge with schedule` permanently enabled as a "set and forget" safety net for the overnight window, and use the force switches for ad‑hoc daytime charging. Because `Charge with schedule` acts as an additional gate for `Force charge by price` (see the precedence rules above), the combinations behave as follows:
+A common setup is to leave `Charge with schedule` permanently enabled as a "set and forget" safety net for the overnight window, and use Force charge for ad-hoc daytime charging. The plans are independent:
 
 | You want | Do this | Result |
 | --- | --- | --- |
 | Guaranteed overnight charge (set and forget) | Keep `Charge with schedule` on | Charges every day inside the schedule window, regardless of price. |
-| Daytime unconditional top‑up | Turn on `Force charge` | Charges immediately, 24/7, overriding the schedule and price. Does **not** auto‑expire — you must turn it off manually. Enabling it also clears `Force charge by price` / `Force charge timer`. The schedule stays enabled in the background and resumes when you turn `Force charge` off. |
-| Daytime charge only when price is acceptable | Turn `Charge with schedule` **off**, then turn `Force charge by price` on | Price charging is gated by the schedule window, so while the schedule is on it never charges outside the window. Turning the schedule off removes the gate and lets price charging run during the day. Re‑enable the schedule afterwards. |
-| Overnight, only when price is acceptable | Keep both `Charge with schedule` and `Force charge by price` on | Charges inside the schedule window only while `price <= acceptable_price`. |
-
-The daytime price case has friction: you must temporarily disable `Charge with schedule`, and if you forget to re‑enable it your guaranteed overnight charge is lost. The integration's built‑in persistent notification and the example automation below help catch this.
+| Daytime unconditional top‑up | Turn on `Force charge` with both force options off | Charges immediately, 24/7. The schedule stays enabled underneath and resumes when Force charge is turned off. |
+| Daytime charge only when price is acceptable | Enable the Force acceptable-price option, then turn on `Force charge` | Waits only for `price <= acceptable_price`; the schedule window does not gate it. |
+| Overnight, only when price is acceptable | Keep `Charge with schedule` and `Schedule acceptable price` on | Charges inside the schedule window only while `price <= acceptable_price`. |
 
 ### Example: reminder automation to re‑enable the schedule
 
@@ -520,6 +520,7 @@ Presets are recreated mainly as a setup/bootstrap asset set. Runtime control is 
 - `Force charge by price`
 - `Force charge timer`
 - `Charge with schedule`
+- `Schedule acceptable price`
 
 ### Numbers
 

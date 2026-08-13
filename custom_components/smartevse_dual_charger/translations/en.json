@@ -109,6 +109,9 @@
       "force_price": {
         "name": "Force charge by price"
       },
+      "schedule_price": {
+        "name": "Schedule acceptable price"
+      },
       "force_timer": {
         "name": "Force charge timer"
       },
