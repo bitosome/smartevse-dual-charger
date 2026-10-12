@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>SmartEVSE Dual Charger</title>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#292b40"/>
+  <rect x="41" y="53" width="74" height="149" rx="19" fill="#d9dffd"/>
+  <rect x="141" y="53" width="74" height="149" rx="19" fill="#c4aff5"/>
+  <path d="m85 76-30 50h23l-7 34 30-50H78zM185 76l-30 50h23l-7 34 30-50h-23z" fill="#292b40"/>
+  <path d="M64 179h28m72 0h28M39 216h78m22 0h78" fill="none" stroke="#a0a9cc" stroke-width="8" stroke-linecap="round"/>
+</svg>

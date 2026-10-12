@@ -705,3 +705,10 @@ Known limitations:
 - no automated test suite yet
 - no dedicated Repairs flow yet
 - no reconfigure flow beyond the standard options flow
+
+## Integration icon
+
+Home Assistant 2026.3 and later displays the bundled integration icon from
+`custom_components/smartevse_dual_charger/brand/`. The editable artwork and export
+instructions are in [branding/](branding/README.md). Earlier Home Assistant
+versions retain their usual fallback icon.
