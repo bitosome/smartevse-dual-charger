@@ -52,3 +52,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.c._store=SimpleNamespace(async_save=AsyncMock())
         await self.c.async_reset_sessions()
         self.assertEqual(self.c._cost_ledger.data,before)
+
+    async def test_invalid_history_does_not_break_control_state_publication(self):
+        self.c._cost_ledger=MagicMock()
+        self.c._cost_ledger.snapshot.side_effect=ValueError('bad stored record')
+        with self.assertLogs('custom_components.smartevse_dual_charger',level='ERROR'):
+            result=self.c.charging_costs()
+        self.assertEqual(result['chargers'],{})
+        self.assertIn('could not be read',result['error'])

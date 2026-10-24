@@ -1449,7 +1449,13 @@ class SmartEVSEDualChargerController:
 
     def charging_costs(self):
         """Return observational accounting independently of charge-control errors."""
-        data = self._cost_ledger.snapshot() if self._cost_ledger else {"version": 1, "chargers": {}}
+        try:
+            data = self._cost_ledger.snapshot() if self._cost_ledger else {"version": 1, "chargers": {}}
+        except Exception:
+            # Accounting must never interrupt the existing charger-control loop.
+            self._cost_error = "Charging history could not be read. Check integration logs."
+            LOGGER.exception("Unable to read charging cost history")
+            data = {"version": 1, "chargers": {}}
         data["error"] = self._cost_error
         data["price_entity"] = self._entry_data.get(CONF_PRICE_SENSOR_ENTITY)
         data["power_entity"] = self._entry_data.get(CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY)
