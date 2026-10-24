@@ -181,12 +181,14 @@ async def async_setup_entry(
     async_add_entities,
 ) -> None:
     """Set up controller sensors."""
-    async_add_entities(ControllerSensor(entry, description) for description in SENSOR_DESCRIPTIONS)
+    async_add_entities([*(ControllerSensor(entry, description) for description in SENSOR_DESCRIPTIONS),
+                        *(ChargingCostSensor(entry, key) for key in ("smartevse_1", "smartevse_2"))])
 
 
 class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
     """Sensor bound to controller state."""
 
+    _unrecorded_attributes = frozenset({"charging_costs"})
     entity_description: ControllerSensorDescription
 
     def __init__(self, entry: SmartEVSEDualChargerConfigEntry, description: ControllerSensorDescription) -> None:
@@ -210,6 +212,7 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
         if self.entity_description.key != "controller_state":
             return None
         return {
+            "charging_costs": self.coordinator.data.get("charging_costs"),
             ATTR_CHARGE_ALLOWED: self.coordinator.data.get(ATTR_CHARGE_ALLOWED),
             ATTR_CHARGE_REASON: self.coordinator.data.get(ATTR_CHARGE_REASON),
             ATTR_CONTROLLER_ERROR: self.coordinator.data.get(ATTR_CONTROLLER_ERROR),
@@ -260,3 +263,37 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
             "smartevse_2_error": self.coordinator.data.get("smartevse_2_error"),
             "smartevse_2_session_complete": self.coordinator.data.get("smartevse_2_session_complete"),
         }
+
+
+class ChargingCostSensor(SmartEVSEDualChargerEntity, SensorEntity):
+    """Current/last session estimate, with recorder history and quality metadata."""
+
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_icon = "mdi:cash-clock"
+
+    def __init__(self, entry, key):
+        super().__init__(entry)
+        self.key = key
+        self._attr_unique_id = f"{entry.entry_id}_{key}_session_cost"
+        self._attr_name = f"SmartEVSE {key[-1]} session cost"
+
+    @property
+    def record(self):
+        return (self.coordinator.data.get("charging_costs") or {}).get("chargers", {}).get(self.key, {}).get("session")
+
+    @property
+    def native_value(self):
+        r = self.record
+        return round(r["cost"], 4) if r and r["currency"] and (r["priced_kwh"] > 0 or r["energy_kwh"] == 0) else None
+
+    @property
+    def native_unit_of_measurement(self):
+        return self.record.get("currency") if self.record else None
+
+    @property
+    def extra_state_attributes(self):
+        r = self.record
+        return {"estimated": True, "session_id": r["id"], "started_at": r["started_at"],
+                "ended_at": r["ended_at"], "energy_kwh": r["energy_kwh"],
+                "partial": r["partial"], "unpriced_kwh": r["unpriced_kwh"],
+                "unobserved_seconds": r["unobserved_seconds"], "issues": r["issues"]} if r else {"estimated": True}

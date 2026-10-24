@@ -712,3 +712,33 @@ Home Assistant 2026.3 and later displays the bundled integration icon from
 `custom_components/smartevse_dual_charger/brand/`. The editable artwork and export
 instructions are in [branding/](branding/README.md). Earlier Home Assistant
 versions retain their usual fallback icon.
+
+## Charging costs and history
+
+Each outlet now has a **session cost** sensor. The companion card displays the
+current/last session estimate beneath the vehicle battery level. Its settings
+contain the latest 100 sessions per charger, including date, vehicle, estimated
+kWh, cost, weighted average price and any missing-data warnings.
+
+Accounting observes the configured EV power meter and price sensor (use **Real
+Electricity Price — current price**, which already includes its configured
+fees/taxes). It integrates measured W/kW at the tariff observed at each poll;
+negative prices are supported. This is a power-based estimate, not a billing
+meter. The shared meter is assigned only when exactly one available charger
+reports Charging. Never configure a whole-house power sensor here.
+
+A session starts when charging is observed and remains the same through pauses,
+price gates and duty-cycle handovers until unplugging. Session completion remains
+visible while plugged in. History and checkpoints are stored by the integration
+in a separate HA storage file, shared by every user and retained through restarts
+and upgrades. Resetting charging-control sessions does not delete the ledger.
+Tracking starts at installation; earlier charges are not reconstructed.
+
+Unavailable power/prices, ambiguous shared-meter use and time while Home Assistant
+was stopped are flagged as partial. Unobserved intervals are **not** filled with
+the last power value or today's tariff. The estimated cost is the known subtotal;
+expand a history entry to see its gaps. Keep the HA storage directory in backups.
+
+Developer checks: Python 3.14 with `requirements-test.txt`, then
+`python -m unittest discover -s test -v`. Tests use synthetic samples and mocked
+storage only; they never issue charger commands.

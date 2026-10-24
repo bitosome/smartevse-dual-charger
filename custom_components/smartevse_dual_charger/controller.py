@@ -85,6 +85,7 @@ from .const import (
     STORAGE_VERSION,
     ChargePolicy,
 )
+from .charging_cost import ChargingLedger, power_kw, tariff
 from .naming import active_smartevse_label, configured_vehicle_name, smartevse_name
 from .wled import build_flow_card_visuals, build_runtime_payload, normalize_wled_state_url, runtime_state_matches_payload
 
@@ -197,9 +198,17 @@ class SmartEVSEDualChargerController:
         )
         self._mutable: dict[str, Any] = {}
         self._endpoint_failures: dict[str, str] = {}
+        self._cost_store = Store(hass, 1, f"{STORAGE_KEY}.{entry_data['entry_id']}.charging_costs")
+        self._cost_ledger = None
+        self._cost_error = None
 
     async def async_initialize(self) -> None:
         """Load persisted mutable state."""
+        try:
+            self._cost_ledger = ChargingLedger(await self._cost_store.async_load())
+        except Exception:
+            self._cost_error = "Charging history could not be loaded; existing storage has not been overwritten."
+            LOGGER.exception("Unable to load charging cost history")
         stored = await self._store.async_load() or {}
         self._mutable = {**MUTABLE_DEFAULTS, **stored}
         if (
@@ -393,6 +402,8 @@ class SmartEVSEDualChargerController:
         self._update_session_tracking(smartevse_1, now=now, ev_meter_power=ev_meter_power)
         self._update_session_tracking(smartevse_2, now=now, ev_meter_power=ev_meter_power)
 
+        await self._observe_charging_costs(smartevse_1, smartevse_2, now=dt_util.utcnow())
+
         if self._mutable["force_timer"]:
             timer_until = self._timer_until()
             if timer_until is None or now >= timer_until:
@@ -520,6 +531,7 @@ class SmartEVSEDualChargerController:
         smartevse_2_vehicle_charging_state = self._connected_ev_charging_state_display("smartevse_2")
 
         return {
+            "charging_costs": self.charging_costs(),
             "force_charge": bool(self._mutable["force_charge"]),
             "force_price": bool(self._mutable["force_price"]),
             "force_timer": bool(self._mutable["force_timer"]),
@@ -1434,6 +1446,33 @@ class SmartEVSEDualChargerController:
             urljoin(self._normalize_url(status.base_url), "settings"),
             params=params,
         )
+
+    def charging_costs(self):
+        """Return observational accounting independently of charge-control errors."""
+        data = self._cost_ledger.snapshot() if self._cost_ledger else {"version": 1, "chargers": {}}
+        data["error"] = self._cost_error
+        data["price_entity"] = self._entry_data.get(CONF_PRICE_SENSOR_ENTITY)
+        data["power_entity"] = self._entry_data.get(CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY)
+        return data
+
+    async def _observe_charging_costs(self, *statuses, now):
+        if self._cost_ledger is None:
+            return
+        try:
+            power_id = self._entry_data.get(CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY)
+            price_id = self._entry_data.get(CONF_PRICE_SENSOR_ENTITY)
+            power = power_kw(self.hass.states.get(power_id)) if power_id else None
+            price, currency = tariff(self.hass.states.get(price_id)) if price_id else (None, None)
+            self._cost_ledger.observe(now, {s.key: {
+                "available": s.available, "connected": s.connected,
+                "charging": s.state == "Charging", "complete": self._session_complete(s.key),
+                "vehicle": self._connected_ev_label(s.key),
+            } for s in statuses}, power, price, currency, [power_id, price_id])
+            await self._cost_store.async_save(self._cost_ledger.data)
+            self._cost_error = None
+        except Exception:
+            self._cost_error = "Charging history could not be updated. Recorded costs may be incomplete."
+            LOGGER.exception("Unable to update charging cost history")
 
     async def _async_fetch_status(self, key: str, base_url: str) -> SmartEVSEStatus:
         """Fetch status from one SmartEVSE."""
