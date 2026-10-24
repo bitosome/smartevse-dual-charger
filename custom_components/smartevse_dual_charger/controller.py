@@ -86,6 +86,7 @@ from .const import (
     ChargePolicy,
 )
 from .charging_cost import ChargingLedger, power_kw, tariff
+from .storage import StrictStore
 from .naming import active_smartevse_label, configured_vehicle_name, smartevse_name
 from .wled import build_flow_card_visuals, build_runtime_payload, normalize_wled_state_url, runtime_state_matches_payload
 
@@ -198,7 +199,7 @@ class SmartEVSEDualChargerController:
         )
         self._mutable: dict[str, Any] = {}
         self._endpoint_failures: dict[str, str] = {}
-        self._cost_store = Store(hass, 1, f"{STORAGE_KEY}.{entry_data['entry_id']}.charging_costs")
+        self._cost_store = StrictStore(hass, 1, f"{STORAGE_KEY}.{entry_data['entry_id']}.charging_costs")
         self._cost_ledger = None
         self._cost_error = None
 

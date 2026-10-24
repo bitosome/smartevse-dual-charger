@@ -742,3 +742,10 @@ expand a history entry to see its gaps. Keep the HA storage directory in backups
 Developer checks: Python 3.14 with `requirements-test.txt`, then
 `python -m unittest discover -s test -v`. Tests use synthetic samples and mocked
 storage only; they never issue charger commands.
+
+## Charging history reliability (0.0.8.10)
+
+History writes are atomic and propagate disk/serialization failures to the card.
+Accounting failures remain separate from charger control. Corrupt nested history
+or checkpoints are rejected without overwriting the stored ledger. A charge
+first observed after a restart or telemetry gap is explicitly a partial estimate.

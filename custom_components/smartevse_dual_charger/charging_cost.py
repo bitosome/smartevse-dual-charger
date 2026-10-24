@@ -14,6 +14,84 @@ from uuid import uuid4
 KEYS = ("smartevse_1", "smartevse_2")
 MAX_GAP_SECONDS = 120
 HISTORY_LIMIT = 100  # Per outlet, including the current session.
+_STATUSES = {"charging", "paused", "complete", "finished", "unavailable"}
+_CURRENCIES = {"EUR", "USD", "GBP", "SEK", "NOK", "DKK"}
+
+
+def _valid_number(value, *, nonnegative=False):
+    return (type(value) in (int, float) and math.isfinite(value)
+            and (not nonnegative or value >= 0))
+
+
+def _valid_time(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value).utcoffset() is not None
+    except ValueError:
+        return False
+
+
+def _validate_stored(data):
+    """Reject damaged history before any observation can mutate or save it.
+
+    Store schema versions alone do not validate nested values. In particular,
+    invalid checkpoints must not repeatedly integrate the same interval, and an
+    orphaned active ID must not silently replace the user's session history.
+    Additive fields remain compatible with version 1.
+    """
+    valid = (isinstance(data, dict) and data.get("version") == 1
+             and isinstance(data.get("records"), list)
+             and isinstance(data.get("active"), dict))
+    if not valid:
+        raise ValueError("Unsupported or invalid charging ledger; do not overwrite")
+    records = {}
+    for record in data["records"]:
+        valid = (isinstance(record, dict)
+                 and {"id", "charger", "status", "started_at", "ended_at", "currency", "cost",
+                      "energy_kwh", "priced_kwh", "unpriced_kwh", "unobserved_seconds", "issues"} <= record.keys()
+                 and isinstance(record.get("id"), str)
+                 and bool(record["id"]) and record["id"] not in records
+                 and record.get("charger") in KEYS
+                 and isinstance(record.get("status"), str) and record["status"] in _STATUSES
+                 and _valid_time(record.get("started_at"))
+                 and (record.get("ended_at") is None or _valid_time(record["ended_at"]))
+                 and (record.get("currency") is None or
+                      isinstance(record["currency"], str) and record["currency"] in _CURRENCIES)
+                 and _valid_number(record.get("cost"))
+                 and all(_valid_number(record.get(k), nonnegative=True) for k in
+                         ("energy_kwh", "priced_kwh", "unpriced_kwh", "unobserved_seconds"))
+                 and isinstance(record.get("issues"), list)
+                 and all(isinstance(issue, str) for issue in record["issues"]))
+        if not valid:
+            raise ValueError("Invalid charging history record; do not overwrite")
+        records[record["id"]] = record
+    for key, ident in data["active"].items():
+        if (key not in KEYS or not isinstance(ident, str) or ident not in records
+                or records[ident]["charger"] != key or records[ident]["status"] == "finished"):
+            raise ValueError("Invalid active charging session; do not overwrite")
+    sample = data.get("sample")
+    if sample is None:
+        return
+    valid = (isinstance(sample, dict)
+             and {"at", "sessions", "available", "exclusive", "power_kw", "price", "currency", "sources"} <= sample.keys()
+             and _valid_time(sample.get("at"))
+             and isinstance(sample.get("sessions"), list)
+             and all(isinstance(ident, str) and ident in data["active"].values()
+                     for ident in sample["sessions"])
+             and len(sample["sessions"]) == len(set(sample["sessions"]))
+             and isinstance(sample.get("available"), dict)
+             and set(sample["available"]) == set(KEYS)
+             and all(type(value) is bool for value in sample["available"].values())
+             and type(sample.get("exclusive")) is bool
+             and (sample.get("power_kw") is None or _valid_number(sample["power_kw"], nonnegative=True))
+             and (sample.get("price") is None or _valid_number(sample["price"]))
+             and (sample.get("currency") is None or
+                  isinstance(sample["currency"], str) and sample["currency"] in _CURRENCIES)
+             and isinstance(sample.get("sources"), list) and len(sample["sources"]) == 2
+             and all(value is None or isinstance(value, str) for value in sample["sources"]))
+    if not valid:
+        raise ValueError("Invalid charging checkpoint; do not overwrite")
 
 
 def finite(value):
@@ -49,10 +127,8 @@ class ChargingLedger:
     """One record per plug-in session; pauses and price gates do not split it."""
 
     def __init__(self, stored=None):
-        if stored is not None and (not isinstance(stored, dict) or stored.get("version") != 1
-                                   or not isinstance(stored.get("records"), list)
-                                   or not isinstance(stored.get("active"), dict)):
-            raise ValueError("Unsupported or invalid charging ledger; do not overwrite")
+        if stored is not None:
+            _validate_stored(stored)
         self.data = deepcopy(stored) if stored is not None else {
             "version": 1, "records": [], "active": {}, "sample": None,
         }
@@ -72,6 +148,7 @@ class ChargingLedger:
         """Close the preceding measured interval, then retain the new sample."""
         timestamp = now.isoformat()
         previous = self.data.get("sample")
+        gap = self.restored
         if previous:
             seconds = (now - datetime.fromisoformat(previous["at"])).total_seconds()
             records = [r for ident in previous["sessions"] if (r := self._record(ident))]
@@ -137,7 +214,7 @@ class ChargingLedger:
                               "unobserved_seconds": 0.0, "issues": [], "method": "power_integration"}
                     self.data["records"].append(record)
                     self.data["active"][key] = record["id"]
-                    if previous is None or not previous.get("available", {}).get(key, False):
+                    if previous is None or gap or not previous.get("available", {}).get(key, False):
                         self._issue(record, "start_not_observed")
                 record["status"] = "charging"
                 record["ended_at"] = None

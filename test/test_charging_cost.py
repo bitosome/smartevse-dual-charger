@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from datetime import datetime, UTC, timedelta
 from types import SimpleNamespace
+from copy import deepcopy
 import unittest
 
 spec = importlib.util.spec_from_file_location('charging_cost', Path(__file__).parents[1]/'custom_components/smartevse_dual_charger/charging_cost.py')
@@ -81,6 +82,15 @@ class LedgerTests(unittest.TestCase):
     def test_already_charging_first_install_marks_partial(self):
         self.ledger=m.ChargingLedger();self.start()
         self.assertIn('start_not_observed',self.record()['issues'])
+    def test_charge_started_during_restart_or_long_gap_is_partial(self):
+        for restart in (True, False):
+            with self.subTest(restart=restart):
+                self.setUp()
+                if restart:self.ledger=m.ChargingLedger(deepcopy(self.ledger.data))
+                self.states['smartevse_1'].update(connected=True,charging=True)
+                self.observe(30 if restart else 600)
+                self.assertIn('start_not_observed',self.record()['issues'])
+                self.assertEqual(self.record()['energy_kwh'],0)
     def test_currency_and_source_changes_are_not_mixed(self):
         self.start();self.observe(60,currency='USD');self.observe(60)
         self.assertEqual(self.record()['cost'],.024);self.assertIn('currency_changed',self.record()['issues'])
@@ -98,6 +108,38 @@ class LedgerTests(unittest.TestCase):
         self.observe(5);self.assertEqual(self.record()['cost'],.024)
     def test_unknown_schema_is_not_silently_reset(self):
         with self.assertRaises(ValueError): m.ChargingLedger({'version':2})
+    def test_damaged_nested_history_is_rejected_without_mutation(self):
+        self.start();self.observe(60)
+        for section, key, value in [
+            ('record','cost',float('nan')), ('record','priced_kwh',-1),
+            ('record','issues',None), ('record','status',[]),
+            ('record','currency',[]), ('record','started_at','2026-10-24T12:00:00'),
+            ('sample','at','invalid'), ('sample','sessions',['missing-session']),
+            ('sample','available',{'smartevse_1':True}), ('sample','power_kw',-1),
+            ('sample','price',float('inf')), ('sample','sources',None),
+        ]:
+            with self.subTest(section=section,key=key):
+                stored=deepcopy(self.ledger.data)
+                target=stored['records'][0] if section=='record' else stored['sample']
+                target[key]=value
+                before=repr(stored)
+                with self.assertRaises(ValueError): m.ChargingLedger(stored)
+                self.assertEqual(repr(stored),before)
+    def test_missing_checkpoint_fields_and_orphan_active_ids_are_rejected(self):
+        self.start()
+        for key in ('power_kw','price','currency'):
+            stored=deepcopy(self.ledger.data);del stored['sample'][key]
+            with self.assertRaises(ValueError): m.ChargingLedger(stored)
+        stored=deepcopy(self.ledger.data);stored['active']['smartevse_1']='missing'
+        with self.assertRaises(ValueError): m.ChargingLedger(stored)
+        stored=deepcopy(self.ledger.data);stored['records'].append(deepcopy(stored['records'][0]))
+        with self.assertRaises(ValueError): m.ChargingLedger(stored)
+    def test_valid_additive_fields_and_paused_sessions_restore(self):
+        self.start();self.observe(60);self.states['smartevse_1']['charging']=False;self.observe(30)
+        stored=deepcopy(self.ledger.data);stored['future_metadata']={'example':1}
+        self.ledger=m.ChargingLedger(stored);self.observe(30)
+        self.assertEqual(self.record()['cost'],.036)
+        self.assertIn('restart_or_telemetry_gap',self.record()['issues'])
     def test_supported_units_and_invalid_inputs(self):
         def state(value,unit):return SimpleNamespace(state=value,attributes={'unit_of_measurement':unit})
         self.assertEqual(m.tariff(state('200','EUR/MWh')),(.2,'EUR'))
