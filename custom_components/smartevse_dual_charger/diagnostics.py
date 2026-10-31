@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.diagnostics import async_redact_data
 
 from .const import (
+    CONF_SCHEDULE_NOTIFICATION_TARGETS,
     CONF_SMARTEVSE_1_BASE_URL,
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_WLED_URL,
@@ -14,6 +15,7 @@ from .const import (
 from .data import SmartEVSEDualChargerConfigEntry
 
 TO_REDACT = {
+    CONF_SCHEDULE_NOTIFICATION_TARGETS,
     CONF_SMARTEVSE_1_BASE_URL,
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_WLED_URL,
@@ -24,7 +26,7 @@ async def async_get_config_entry_diagnostics(hass, entry: SmartEVSEDualChargerCo
     """Return diagnostics for a config entry."""
     return {
         "entry": async_redact_data(dict(entry.data), TO_REDACT),
-        "options": dict(entry.options),
+        "options": async_redact_data(dict(entry.options), TO_REDACT),
         "runtime_state": entry.runtime_data.coordinator.data,
     }
 

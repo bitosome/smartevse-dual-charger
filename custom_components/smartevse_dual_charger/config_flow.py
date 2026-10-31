@@ -27,6 +27,9 @@ from .const import (
     CONF_MAINS_L2_ENTITY,
     CONF_MAINS_L3_ENTITY,
     CONF_NOTIFY_ON_SCHEDULE_WINDOW,
+    CONF_SCHEDULE_NOTIFICATION_SERVICE,
+    CONF_SCHEDULE_NOTIFICATION_TARGETS,
+    CONF_SCHEDULE_REMINDER_MINUTES,
     CONF_PRICE_SENSOR_ENTITY,
     CONF_PUSH_CURRENTS,
     CONF_PUSH_EV_METER,
@@ -52,6 +55,7 @@ from .const import (
     DEFAULT_EV_METER_PUSH_INTERVAL,
     DEFAULT_NAME,
     DEFAULT_NOTIFY_ON_SCHEDULE_WINDOW,
+    DEFAULT_SCHEDULE_REMINDER_MINUTES,
     DEFAULT_PUSH_CURRENTS,
     DEFAULT_PUSH_EV_METER,
     DEFAULT_PUSH_WLED,
@@ -64,6 +68,7 @@ from .const import (
     LOGGER,
 )
 from .naming import charge_policy_select_options, normalize_vehicle_name
+from .schedule_reminders import validate_notification_options
 from .wled import (
     WLEDPresetError,
     async_recreate_wled_assets,
@@ -599,6 +604,21 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
                     CONF_NOTIFY_ON_SCHEDULE_WINDOW,
                     default=values.get(CONF_NOTIFY_ON_SCHEDULE_WINDOW, DEFAULT_NOTIFY_ON_SCHEDULE_WINDOW),
                 ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_SCHEDULE_NOTIFICATION_SERVICE,
+                    default=values.get(CONF_SCHEDULE_NOTIFICATION_SERVICE, ""),
+                ): selector.TextSelector(),
+                vol.Optional(
+                    CONF_SCHEDULE_NOTIFICATION_TARGETS,
+                    default=values.get(CONF_SCHEDULE_NOTIFICATION_TARGETS, []),
+                ): selector.TextSelector(selector.TextSelectorConfig(multiple=True)),
+                vol.Required(
+                    CONF_SCHEDULE_REMINDER_MINUTES,
+                    default=values.get(CONF_SCHEDULE_REMINDER_MINUTES, DEFAULT_SCHEDULE_REMINDER_MINUTES),
+                ): selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=0, max=1440, step=1, mode=selector.NumberSelectorMode.BOX,
+                    unit_of_measurement="min",
+                )),
             }
         )
 
@@ -618,6 +638,13 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
 
         if user_input is not None:
             options_data = dict(user_input)
+            options_data[CONF_SCHEDULE_NOTIFICATION_SERVICE] = str(
+                options_data.get(CONF_SCHEDULE_NOTIFICATION_SERVICE) or ""
+            ).strip()
+            try:
+                validate_notification_options(options_data)
+            except ValueError as err:
+                errors[CONF_SCHEDULE_NOTIFICATION_SERVICE] = str(err)
             options_data[CONF_VEHICLE_1_NAME] = normalize_vehicle_name(
                 str(options_data.get(CONF_VEHICLE_1_NAME, "")),
                 DEFAULT_VEHICLE_1_NAME,
@@ -627,7 +654,7 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
                 DEFAULT_VEHICLE_2_NAME,
             )
             recreate_wled_presets = bool(options_data.pop(CONF_RECREATE_WLED_PRESETS, False))
-            if recreate_wled_presets:
+            if recreate_wled_presets and not errors:
                 wled_url = self._config_entry.data.get(CONF_WLED_URL)
                 if not wled_url:
                     errors["base"] = "wled_url_required"

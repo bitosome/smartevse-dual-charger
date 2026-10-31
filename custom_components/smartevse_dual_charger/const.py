@@ -9,7 +9,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "smartevse_dual_charger"
 NAME = "SmartEVSE Dual Charger"
-VERSION = "0.0.8.10"
+VERSION = "0.0.8.11"
 
 LOGGER = logging.getLogger(__package__)
 
@@ -31,6 +31,7 @@ DEFAULT_ACCEPTABLE_PRICE = 0.10
 DEFAULT_FORCE_CHARGE_DURATION_MINUTES = 120
 DEFAULT_DUTY_CYCLE_MINUTES = 60
 DEFAULT_NOTIFY_ON_SCHEDULE_WINDOW = True
+DEFAULT_SCHEDULE_REMINDER_MINUTES = 60
 DEFAULT_CHARGE_POLICY = "smartevse_1_first"
 DEFAULT_PUSH_CURRENTS = True
 DEFAULT_PUSH_EV_METER = True
@@ -79,6 +80,9 @@ CONF_MAINS_L1_ENTITY = "mains_l1_entity"
 CONF_MAINS_L2_ENTITY = "mains_l2_entity"
 CONF_MAINS_L3_ENTITY = "mains_l3_entity"
 CONF_NOTIFY_ON_SCHEDULE_WINDOW = "notify_on_schedule_window"
+CONF_SCHEDULE_NOTIFICATION_SERVICE = "schedule_notification_service"
+CONF_SCHEDULE_NOTIFICATION_TARGETS = "schedule_notification_targets"
+CONF_SCHEDULE_REMINDER_MINUTES = "schedule_reminder_minutes"
 CONF_PRICE_SENSOR_ENTITY = "price_sensor_entity"
 CONF_PUSH_CURRENTS = "push_currents"
 CONF_PUSH_EV_METER = "push_ev_meter"

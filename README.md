@@ -167,7 +167,7 @@ The options flow controls the default behavior of the integration:
 - EV meter push enable + interval
 - WLED push enable
 - destructive WLED recreation checkbox
-- schedule-window notification toggle
+- schedule-window notification toggle, optional notify action/targets, and advance lead time
 
 The runtime number entities reflect the live values and can be changed directly from Home Assistant without reopening the options dialog.
 
@@ -363,7 +363,7 @@ Schedule mode:
 - if the schedule entity is missing, charging is blocked
 - if the schedule window is active while the schedule gate is disabled, the integration can create a persistent notification
 
-The schedule reminder is implemented as a Home Assistant persistent notification, not as `notify.notify`.
+The built-in persistent schedule warning remains enabled by default. Optional notification delivery and an advance reminder are configured in the integration options; no separate automation is needed.
 
 ### Combining the schedule with force modes
 
@@ -376,57 +376,20 @@ A common setup is to leave `Charge with schedule` permanently enabled as a "set 
 | Daytime charge only when price is acceptable | Enable the Force acceptable-price option, then turn on `Force charge` | Waits only for `price <= acceptable_price`; the schedule window does not gate it. |
 | Overnight, only when price is acceptable | Keep `Charge with schedule` and `Schedule acceptable price` on | Charges inside the schedule window only while `price <= acceptable_price`. |
 
-### Example: reminder automation to re‑enable the schedule
+### Native schedule reminders
 
-This automation reminds you (via `notify.notify`) one hour before and at the schedule start time when `Charge with schedule` was left off. Adjust the two `at:` times to match your schedule window's start (the example assumes a `00:00` start, so it reminds at `23:00` and `00:00`).
+In **Settings → Devices & services → SmartEVSE Dual Charger → Configure**:
 
-```yaml
-- alias: SmartEVSE schedule reminder
-  description: Reminds to enable "Charge with schedule" one hour before and at the
-    schedule start time if it was forgotten.
-  triggers:
-  - trigger: time
-    at: "23:00:00"
-    id: schedule_reminder_1h
-  - trigger: time
-    at: "00:00:00"
-    id: schedule_reminder_now
-  conditions:
-  - condition: state
-    entity_id: switch.smartevse_dual_charger_charge_with_schedule
-    state: "off"
-  actions:
-  - choose:
-    - conditions:
-      - condition: trigger
-        id:
-        - schedule_reminder_1h
-      sequence:
-      - action: notify.notify
-        data:
-          title: EV charge schedule
-          message: >-
-            Reminder: charge schedule starts in 1 hour (00:00) but "Charge with
-            schedule" is OFF. Enable it if you want the guaranteed overnight charge.
-    - conditions:
-      - condition: trigger
-        id:
-        - schedule_reminder_now
-      sequence:
-      - action: notify.notify
-        data:
-          title: EV charge schedule
-          message: >-
-            Charge schedule window has started (00:00) but "Charge with schedule"
-            is OFF. Enable it now to charge overnight.
-  mode: single
-```
+- Keep **Schedule-disabled reminders** enabled for the existing persistent notice.
+- Set **Notification action** to `notify.notify` for the default notifier or a specific `notify.mobile_app_*` action for a phone. Leave it empty to keep only the persistent warning (the backward-compatible default).
+- Alternatively use `notify.send_message` and add one or more `notify.*` entity IDs under **Notification targets**. Legacy notify actions can use provider-specific targets; mobile-app-specific actions usually need none.
+- **Advance reminder** defaults to 60 minutes; set it to 0 to send only the window-open notification. Reminders are sent only while **Charge with schedule** is off.
 
-Notes:
+The next opening comes from the configured native schedule helper's `next_event`, not a hardcoded clock time. The helper already applies the Home Assistant time zone and daylight-saving rules. At window opening the integration reads `schedule.get_schedule` to recognize adjacent blocks as one continuous window. If Home Assistant restarts during an active window, it sends a missed window-open reminder once; it never sends an overdue advance reminder.
 
-- The condition only fires the reminders when `Charge with schedule` is off, so you are not notified once it is enabled.
-- `notify.notify` targets your default notify service. Replace it with a specific service (for example a mobile app) to reach a particular device.
-- This complements the built‑in persistent notification, which fires when the schedule window is already active while the schedule gate is disabled.
+Successful delivery receipts survive restarts and integration updates. Delivery is claimed on disk before calling the notifier, so interruption during an uncertain send does not create a repeat on restart. A provider timeout is treated as uncertain delivery and is not retried for that window. Other notification failures retry after five minutes while the reminder remains applicable. Storage failure stops only phone reminders and leaves the existing storage intact. Notification work runs independently and cannot hold up charger control or meter pushes.
+
+After enabling this feature, remove the old fixed-time **SmartEVSE schedule reminder** automation to avoid duplicate phone notifications. There is no change to charge policies or the **Charge with schedule** switch.
 
 ## Controller Refresh and Meter Pushes
 

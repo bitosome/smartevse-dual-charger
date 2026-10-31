@@ -75,6 +75,8 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         @callback
         def _handle_state_change(_event) -> None:
+            if self._shutdown_requested:
+                return
             self.hass.async_create_task(self._async_refresh_now("state_change"))
 
         self._unsub_state_changes = async_track_state_change_event(
@@ -85,16 +87,16 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         @callback
         def _handle_stop(_event) -> None:
-            if self._unsub_state_changes:
-                self._unsub_state_changes()
-                self._unsub_state_changes = None
-            self._cancel_push_tasks()
+            self._unsub_stop = None
+            self.hass.async_create_task(self.async_shutdown())
 
         self._unsub_stop = self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _handle_stop)
 
     @callback
     def _setup_push_loops(self) -> None:
         """Start dedicated meter-push loops independent of controller refreshes."""
+        if self._shutdown_requested:
+            return
         if self._unsub_started:
             self._unsub_started()
             self._unsub_started = None
@@ -121,6 +123,8 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _schedule_push_loops_start(self) -> None:
         """Start push loops after HA startup so bootstrap does not wait on them."""
+        if self._shutdown_requested:
+            return
         if self.hass.is_running:
             self._setup_push_loops()
             return
@@ -177,27 +181,37 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_push_currents(self) -> None:
         """Push mains currents without overlapping the previous push."""
-        if self._currents_push_lock.locked():
+        if self._shutdown_requested or self._currents_push_lock.locked():
             return
         async with self._currents_push_lock:
             await self._controller.async_push_currents()
 
     async def _async_push_ev_meter(self) -> None:
         """Push EV meter data without overlapping the previous push."""
-        if self._ev_meter_push_lock.locked():
+        if self._shutdown_requested or self._ev_meter_push_lock.locked():
             return
         async with self._ev_meter_push_lock:
             await self._controller.async_push_ev_meter()
 
     async def async_shutdown(self) -> None:
-        """Release listeners on unload."""
+        """Stop new work and drain in-flight equipment I/O before unloading."""
+        await super().async_shutdown()
+        self._pending_refresh_reason = None
         if self._unsub_state_changes:
             self._unsub_state_changes()
             self._unsub_state_changes = None
+        push_tasks = [task for task in (self._currents_push_task, self._ev_meter_push_task) if task]
         self._cancel_push_tasks()
         if self._unsub_stop:
             self._unsub_stop()
             self._unsub_stop = None
+        if push_tasks:
+            await asyncio.gather(*push_tasks, return_exceptions=True)
+        # Let an already-started cycle finish; abandoning it between control
+        # writes could leave a charger handoff half applied. No follow-up cycle
+        # is allowed once shutdown has been requested.
+        async with self._refresh_lock, self._currents_push_lock, self._ev_meter_push_lock:
+            await self._controller.async_shutdown()
 
     async def async_timing_updated(self) -> None:
         """Apply updated runtime timing values immediately."""
@@ -206,12 +220,16 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_refresh_now(self, reason: str) -> None:
         """Refresh immediately and propagate updated data."""
+        if self._shutdown_requested:
+            return
         data = await self._async_run_controller_cycle(reason)
-        if data is not None:
+        if data is not None and not self._shutdown_requested:
             self.async_set_updated_data(data)
 
     async def _async_run_controller_cycle(self, reason: str) -> dict[str, Any] | None:
         """Run the controller without allowing overlapping refresh storms."""
+        if self._shutdown_requested:
+            return None
         if self._refresh_lock.locked():
             self._pending_refresh_reason = reason
             return None
@@ -219,9 +237,9 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         async with self._refresh_lock:
             next_reason = reason
             data: dict[str, Any] | None = None
-            while True:
+            while not self._shutdown_requested:
                 data = await self._controller.async_run_cycle(reason=next_reason)
-                if self._pending_refresh_reason is None:
+                if self._shutdown_requested or self._pending_refresh_reason is None:
                     return data
                 next_reason = self._pending_refresh_reason
                 self._pending_refresh_reason = None

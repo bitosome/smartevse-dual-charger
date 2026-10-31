@@ -79,7 +79,16 @@
           "ev_meter_push_interval": "EV meter push interval (seconds)",
           "push_wled": "Manage WLED directly",
           "recreate_wled_presets": "Delete all WLED presets and segments, then recreate the SmartEVSE layout and LED map",
-          "notify_on_schedule_window": "Create a notification when schedule window starts while disabled"
+          "notify_on_schedule_window": "Schedule-disabled reminders",
+          "schedule_notification_service": "Notification action (optional)",
+          "schedule_notification_targets": "Notification targets (optional)",
+          "schedule_reminder_minutes": "Advance reminder (minutes)"
+        },
+        "data_description": {
+          "notify_on_schedule_window": "Keep a persistent notice when a charging window starts with Charge with schedule disabled. Also enables optional notification delivery below.",
+          "schedule_notification_service": "Leave empty for persistent notices only. Use notify.notify, notify.mobile_app_your_phone, or notify.send_message. Reminders follow the selected schedule helper, including schedule edits and local daylight-saving changes.",
+          "schedule_notification_targets": "For notify.send_message, add one or more notify entity IDs. For legacy notify actions, use provider-specific target IDs if needed; a mobile-app-specific action usually needs none.",
+          "schedule_reminder_minutes": "Send one notification this many minutes before the next window (default 60), plus one while it opens. Zero disables advance delivery. Requires a notification action and Charge with schedule to be off."
         }
       }
     },
@@ -88,7 +97,9 @@
     },
     "error": {
       "wled_url_required": "A WLED URL/IP is required before presets can be recreated.",
-      "wled_preset_setup_failed": "Unable to recreate WLED presets. Check Home Assistant logs."
+      "wled_preset_setup_failed": "Unable to recreate WLED presets. Check Home Assistant logs.",
+      "invalid_notification_service": "Use a notify action such as notify.notify or notify.mobile_app_your_phone, or leave it empty.",
+      "notification_targets_required": "notify.send_message requires at least one notify entity ID in Notification targets."
     },
     "selector": {
       "charge_policy_default": {

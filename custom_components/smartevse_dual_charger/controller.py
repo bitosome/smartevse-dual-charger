@@ -87,6 +87,7 @@ from .const import (
 )
 from .charging_cost import ChargingLedger, power_kw, tariff
 from .storage import StrictStore
+from .schedule_reminders import ScheduleReminders
 from .naming import active_smartevse_label, configured_vehicle_name, smartevse_name
 from .wled import build_flow_card_visuals, build_runtime_payload, normalize_wled_state_url, runtime_state_matches_payload
 
@@ -202,9 +203,14 @@ class SmartEVSEDualChargerController:
         self._cost_store = StrictStore(hass, 1, f"{STORAGE_KEY}.{entry_data['entry_id']}.charging_costs")
         self._cost_ledger = None
         self._cost_error = None
+        self._schedule_reminders = ScheduleReminders(
+            hass, entry_data["entry_id"], entry_data.get(CONF_SCHEDULE_ENTITY), options,
+            lambda: bool(self._mutable.get("schedule_enabled")),
+        )
 
     async def async_initialize(self) -> None:
         """Load persisted mutable state."""
+        await self._schedule_reminders.async_initialize()
         try:
             self._cost_ledger = ChargingLedger(await self._cost_store.async_load())
         except Exception:
@@ -279,6 +285,10 @@ class SmartEVSEDualChargerController:
         self._mutable["charge_policy"] = self._configured_charge_policy()
         self._reset_charge_cycle()
         await self._async_save_state()
+
+    async def async_shutdown(self) -> None:
+        """Stop independent notification delivery before unloading."""
+        await self._schedule_reminders.async_shutdown()
 
     async def async_set_force_charge(self, value: bool) -> None:
         """Enable or disable the force-charge plan."""
@@ -1628,10 +1638,11 @@ class SmartEVSEDualChargerController:
             )
             self._mutable["last_notification"] = dt_util.utcnow().isoformat()
 
-        if not schedule_window_active or schedule_enabled:
+        if not notify_enabled or not schedule_window_active or schedule_enabled:
             persistent_notification.async_dismiss(self.hass, SCHEDULE_NOTIFICATION_ID)
 
         self._mutable["last_schedule_window_active"] = schedule_window_active
+        self._schedule_reminders.async_check()
 
     def _preferred_smartevse(self, policy: ChargePolicy) -> str:
         """Return the preferred SmartEVSE for alternating policies."""
