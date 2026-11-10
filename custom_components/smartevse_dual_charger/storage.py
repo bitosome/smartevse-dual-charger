@@ -69,3 +69,21 @@ class StrictStore(Store):
             raise HomeAssistantError("Persistent storage write failed") from err
         if cancelled:
             raise asyncio.CancelledError
+
+
+class ModelStore(StrictStore):
+    """Store for the Intelligent charging model (private, atomic writes).
+
+    Like StrictStore, a disk or serialisation failure raises instead of being
+    logged and swallowed, so the caller keeps its data dirty and reports the
+    problem, and a corrupt, empty or foreign file is never renamed away and
+    replaced: loading raises and every later save is refused. Unlike
+    StrictStore, a save while Home Assistant is stopping is not refused: native
+    Store defers it to the final write, which is how the model is flushed on
+    shutdown (the learning is not a safety hold that must be acknowledged).
+    """
+
+    async def async_save(self, data):
+        if self._strict_load_failed:
+            raise HomeAssistantError("Persistent storage could not be loaded; save refused")
+        await Store.async_save(self, data)

@@ -110,14 +110,27 @@ def power_kw(state):
     return value * factor if factor is not None else None
 
 
+def price_unit(unit):
+    """Return (factor to currency/kWh, ISO currency) for a price unit such as "€/kWh".
+
+    Unsupported or missing units give (None, None); a price in such a unit is
+    never interpreted. Price-list sensors carry the unit even while their state
+    is ``unknown``, so this is usable without a numeric state.
+    """
+    unit = str(unit if unit is not None else "").replace(" ", "")
+    numerator, _, denominator = unit.partition("/")
+    currency = {"€": "EUR", "EUR": "EUR", "USD": "USD", "GBP": "GBP", "£": "GBP", "SEK": "SEK", "NOK": "NOK", "DKK": "DKK"}.get(numerator)
+    factor = {"kWh": 1, "MWh": .001, "Wh": 1000}.get(denominator)
+    if currency is None or factor is None:
+        return None, None
+    return factor, currency
+
+
 def tariff(state):
     """Normalize full Real Electricity Price (including its configured fees)."""
     if state is None or (value := finite(state.state)) is None:
         return None, None
-    unit = str(state.attributes.get("unit_of_measurement", "")).replace(" ", "")
-    numerator, _, denominator = unit.partition("/")
-    currency = {"€": "EUR", "EUR": "EUR", "USD": "USD", "GBP": "GBP", "£": "GBP", "SEK": "SEK", "NOK": "NOK", "DKK": "DKK"}.get(numerator)
-    factor = {"kWh": 1, "MWh": .001, "Wh": 1000}.get(denominator)
+    factor, currency = price_unit(state.attributes.get("unit_of_measurement", ""))
     if currency is None or factor is None:
         return None, None
     return value * factor, currency

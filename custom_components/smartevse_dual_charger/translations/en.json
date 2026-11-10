@@ -62,7 +62,7 @@
     "step": {
       "init": {
         "title": "Controller options",
-        "description": "Tune SmartEVSE rotation, known-vehicle mapping, meter push cadence, notifications, and optional WLED preset management.",
+        "description": "Tune SmartEVSE rotation, known-vehicle mapping, battery capacities for Intelligent charging, meter push cadence, notifications, and optional WLED preset management.",
         "data": {
           "vehicle_1_name": "Vehicle 1 name",
           "vehicle_2_name": "Vehicle 2 name",
@@ -70,6 +70,8 @@
           "vehicle_1_connection_status_entity": "Vehicle 1 connection status sensor",
           "vehicle_2_battery_entity": "Vehicle 2 battery sensor",
           "vehicle_2_connection_status_entity": "Vehicle 2 connection status sensor",
+          "vehicle_1_battery_capacity_kwh": "Vehicle 1 battery capacity (kWh)",
+          "vehicle_2_battery_capacity_kwh": "Vehicle 2 battery capacity (kWh)",
           "charge_policy_default": "Default charge policy",
           "duty_cycle_minutes": "Duty cycle (minutes)",
           "update_interval": "Controller refresh interval (seconds)",
@@ -85,6 +87,8 @@
           "schedule_reminder_minutes": "Advance reminder (minutes)"
         },
         "data_description": {
+          "vehicle_1_battery_capacity_kwh": "Usable battery capacity used by Intelligent charging until it has learned the energy per percent from real charges. 0 = automatic: the Volvo battery-capacity sensor next to the battery sensor, else 75 kWh.",
+          "vehicle_2_battery_capacity_kwh": "Usable battery capacity used by Intelligent charging until it has learned the energy per percent from real charges. 0 = automatic: the Volvo battery-capacity sensor next to the battery sensor, else 75 kWh.",
           "notify_on_schedule_window": "Keep a persistent notice when a charging window starts with Charge with schedule disabled. Also enables optional notification delivery below.",
           "schedule_notification_service": "Leave empty for persistent notices only. Use notify.notify, notify.mobile_app_your_phone, or notify.send_message. Reminders follow the selected schedule helper, including schedule edits and local daylight-saving changes.",
           "schedule_notification_targets": "For notify.send_message, add one or more notify entity IDs. For legacy notify actions, use provider-specific target IDs if needed; a mobile-app-specific action usually needs none.",
@@ -99,7 +103,8 @@
       "wled_url_required": "A WLED URL/IP is required before presets can be recreated.",
       "wled_preset_setup_failed": "Unable to recreate WLED presets. Check Home Assistant logs.",
       "invalid_notification_service": "Use a notify action such as notify.notify or notify.mobile_app_your_phone, or leave it empty.",
-      "notification_targets_required": "notify.send_message requires at least one notify entity ID in Notification targets."
+      "notification_targets_required": "notify.send_message requires at least one notify entity ID in Notification targets.",
+      "invalid_battery_capacity": "Enter 0 for automatic, or a usable battery capacity between 10 and 300 kWh."
     },
     "selector": {
       "charge_policy_default": {
@@ -128,6 +133,12 @@
       },
       "charge_with_schedule": {
         "name": "Charge with schedule"
+      },
+      "intelligent_charge": {
+        "name": "Intelligent charging"
+      },
+      "intelligent_top_up": {
+        "name": "Intelligent top-up"
       }
     },
     "number": {
@@ -148,6 +159,12 @@
       },
       "ev_meter_push_interval": {
         "name": "EV meter push interval"
+      },
+      "intelligent_top_up_price": {
+        "name": "Intelligent top-up price"
+      },
+      "vehicle_minimum_charge": {
+        "name": "{vehicle} minimum charge"
       }
     },
     "select": {
@@ -159,6 +176,14 @@
           "smartevse_1_only": "SmartEVSE 1 only",
           "smartevse_2_only": "SmartEVSE 2 only"
         }
+      }
+    },
+    "time": {
+      "vehicle_ready_by": {
+        "name": "{vehicle} ready by"
+      },
+      "other_vehicle_ready_by": {
+        "name": "Unidentified vehicle ready by"
       }
     },
     "sensor": {
@@ -227,6 +252,30 @@
       },
       "timer_remaining": {
         "name": "Timer remaining"
+      },
+      "intelligent_status": {
+        "name": "Intelligent charging status",
+        "state": {
+          "disabled": "Disabled",
+          "overridden": "Overridden by force charge",
+          "no_ev": "No vehicle connected",
+          "identifying": "Identifying vehicle",
+          "planned": "Planned",
+          "charging": "Charging",
+          "reached": "Minimum charge reached",
+          "at_risk": "Minimum at risk",
+          "not_accepting": "Car not accepting charge",
+          "no_price_data": "No price data"
+        }
+      },
+      "intelligent_planned_cost": {
+        "name": "Intelligent planned cost"
+      },
+      "intelligent_planned_saving": {
+        "name": "Intelligent planned saving"
+      },
+      "intelligent_next_charge": {
+        "name": "Intelligent next charge"
       }
     }
   }

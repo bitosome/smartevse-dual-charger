@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 from urllib.parse import urlparse
 
@@ -39,9 +40,11 @@ from .const import (
     CONF_SMARTEVSE_1_BASE_URL,
     CONF_SMARTEVSE_2_BASE_URL,
     CONF_UPDATE_INTERVAL,
+    CONF_VEHICLE_1_BATTERY_CAPACITY_KWH,
     CONF_VEHICLE_1_BATTERY_ENTITY,
     CONF_VEHICLE_1_CONNECTION_STATUS_ENTITY,
     CONF_VEHICLE_1_NAME,
+    CONF_VEHICLE_2_BATTERY_CAPACITY_KWH,
     CONF_VEHICLE_2_BATTERY_ENTITY,
     CONF_VEHICLE_2_CONNECTION_STATUS_ENTITY,
     CONF_VEHICLE_2_NAME,
@@ -49,6 +52,7 @@ from .const import (
     CONF_WLED_LED_COUNT,
     CONF_WLED_LED_OFFSET,
     CONF_WLED_PRESETS_JSON,
+    DEFAULT_BATTERY_CAPACITY_KWH,
     DEFAULT_CHARGE_POLICY,
     DEFAULT_CURRENTS_PUSH_INTERVAL,
     DEFAULT_DUTY_CYCLE_MINUTES,
@@ -77,6 +81,11 @@ from .wled import (
 )
 
 CONF_SETUP_WLED = "setup_wled"
+# Usable battery capacity override for Intelligent charging: 0 = automatic,
+# otherwise a realistic car battery size.
+BATTERY_CAPACITY_OPTION_KEYS = (CONF_VEHICLE_1_BATTERY_CAPACITY_KWH, CONF_VEHICLE_2_BATTERY_CAPACITY_KWH)
+BATTERY_CAPACITY_MIN_KWH = 10.0
+BATTERY_CAPACITY_MAX_KWH = 300.0
 CONFIG_DEFAULTS: dict[str, Any] = {
     CONF_NAME: DEFAULT_NAME,
     CONF_VEHICLE_1_NAME: DEFAULT_VEHICLE_1_NAME,
@@ -137,6 +146,53 @@ def _parse_presets_json(value: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise vol.Invalid("invalid_json")
     return payload
+
+
+def _battery_capacity_kwh(value: Any) -> float:
+    """Validate a battery-capacity option: 0 (automatic) or 10-300 kWh."""
+    if value is None or value == "":
+        return float(DEFAULT_BATTERY_CAPACITY_KWH)
+    if isinstance(value, bool):
+        raise vol.Invalid("invalid_battery_capacity")
+    try:
+        capacity = float(value)
+    except (TypeError, ValueError) as err:
+        raise vol.Invalid("invalid_battery_capacity") from err
+    if capacity == 0:
+        return 0.0
+    if not BATTERY_CAPACITY_MIN_KWH <= capacity <= BATTERY_CAPACITY_MAX_KWH:
+        raise vol.Invalid("invalid_battery_capacity")
+    return round(capacity, 1)
+
+
+def _battery_capacity_default(values: dict[str, Any], key: str) -> float:
+    """Selector-friendly default for a battery-capacity option (0 = automatic).
+
+    A rejected value is shown again as typed when it fits the selector range.
+    """
+    value = values.get(key, DEFAULT_BATTERY_CAPACITY_KWH)
+    if isinstance(value, bool):
+        return float(DEFAULT_BATTERY_CAPACITY_KWH)
+    try:
+        capacity = float(value)
+    except (TypeError, ValueError):
+        return float(DEFAULT_BATTERY_CAPACITY_KWH)
+    if not math.isfinite(capacity) or not 0 <= capacity <= BATTERY_CAPACITY_MAX_KWH:
+        return float(DEFAULT_BATTERY_CAPACITY_KWH)
+    return capacity
+
+
+def _battery_capacity_selector() -> selector.NumberSelector:
+    """Box input for a usable battery capacity in kWh."""
+    return selector.NumberSelector(
+        selector.NumberSelectorConfig(
+            min=0,
+            max=BATTERY_CAPACITY_MAX_KWH,
+            step=0.1,
+            mode=selector.NumberSelectorMode.BOX,
+            unit_of_measurement="kWh",
+        )
+    )
 
 
 def _optional_entity_default(values: dict[str, Any], key: str) -> str | None:
@@ -498,6 +554,14 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
                     ),
                 ): _entity_selector("sensor"),
                 vol.Required(
+                    CONF_VEHICLE_1_BATTERY_CAPACITY_KWH,
+                    default=_battery_capacity_default(values, CONF_VEHICLE_1_BATTERY_CAPACITY_KWH),
+                ): _battery_capacity_selector(),
+                vol.Required(
+                    CONF_VEHICLE_2_BATTERY_CAPACITY_KWH,
+                    default=_battery_capacity_default(values, CONF_VEHICLE_2_BATTERY_CAPACITY_KWH),
+                ): _battery_capacity_selector(),
+                vol.Required(
                     CONF_CHARGE_POLICY_DEFAULT,
                     default=values.get(
                         CONF_CHARGE_POLICY_DEFAULT,
@@ -653,6 +717,13 @@ class SmartEVSEDualChargerOptionsFlow(config_entries.OptionsFlowWithReload):
                 str(options_data.get(CONF_VEHICLE_2_NAME, "")),
                 DEFAULT_VEHICLE_2_NAME,
             )
+            for capacity_key in BATTERY_CAPACITY_OPTION_KEYS:
+                try:
+                    options_data[capacity_key] = _battery_capacity_kwh(
+                        options_data.get(capacity_key, DEFAULT_BATTERY_CAPACITY_KWH)
+                    )
+                except vol.Invalid:
+                    errors[capacity_key] = "invalid_battery_capacity"
             recreate_wled_presets = bool(options_data.pop(CONF_RECREATE_WLED_PRESETS, False))
             if recreate_wled_presets and not errors:
                 wled_url = self._config_entry.data.get(CONF_WLED_URL)

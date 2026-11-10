@@ -71,7 +71,14 @@ class SmartEVSEDualChargerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._entry_data.get(CONF_PRICE_SENSOR_ENTITY),
             self._entry_data.get(CONF_SCHEDULE_ENTITY),
         ]
-        entity_ids = [entity_id for entity_id in entity_ids if entity_id]
+        try:
+            # Intelligent charging: hourly price lists and vehicle batteries.
+            entity_ids.extend(self._controller.intelligent_source_entity_ids())
+        except Exception:  # noqa: BLE001 - a missing registry must not stop the listener
+            LOGGER.debug("Unable to add Intelligent charging source entities", exc_info=True)
+        entity_ids = list(dict.fromkeys(
+            entity_id for entity_id in entity_ids if isinstance(entity_id, str) and entity_id
+        ))
 
         @callback
         def _handle_state_change(_event) -> None:

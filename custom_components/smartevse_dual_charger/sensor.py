@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import math
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorEntityDescription, SensorStateClass
 from homeassistant.const import UnitOfElectricCurrent, UnitOfTime
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .const import (
     ATTR_ACTIVE_SMARTEVSE,
@@ -25,6 +28,7 @@ from .const import (
     ATTR_SCHEDULE_WINDOW_ACTIVE,
     ATTR_TIMER_REMAINING,
     ATTR_TIMER_UNTIL,
+    INTELLIGENT_STATUSES,
 )
 from .data import SmartEVSEDualChargerConfigEntry
 from .entity import SmartEVSEDualChargerEntity
@@ -175,6 +179,53 @@ SENSOR_DESCRIPTIONS: tuple[ControllerSensorDescription, ...] = (
 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class IntelligentSensorDescription(SensorEntityDescription):
+    """Description for an Intelligent charging result sensor (flat cycle-dict keys)."""
+
+    value_key: str
+    unit_key: str | None = None
+
+
+INTELLIGENT_SENSOR_DESCRIPTIONS: tuple[IntelligentSensorDescription, ...] = (
+    IntelligentSensorDescription(
+        key="intelligent_status",
+        translation_key="intelligent_status",
+        value_key="intelligent_status",
+        device_class=SensorDeviceClass.ENUM,
+        options=list(INTELLIGENT_STATUSES),
+        icon="mdi:brain",
+    ),
+    # Money sensors: no state_class (MONETARY allows only TOTAL, and a plan is
+    # not a running total); the unit follows the price lists' currency.
+    IntelligentSensorDescription(
+        key="intelligent_planned_cost",
+        translation_key="intelligent_planned_cost",
+        value_key="intelligent_planned_cost",
+        unit_key="intelligent_currency",
+        device_class=SensorDeviceClass.MONETARY,
+        suggested_display_precision=2,
+        icon="mdi:cash-clock",
+    ),
+    IntelligentSensorDescription(
+        key="intelligent_planned_saving",
+        translation_key="intelligent_planned_saving",
+        value_key="intelligent_planned_saving",
+        unit_key="intelligent_currency",
+        device_class=SensorDeviceClass.MONETARY,
+        suggested_display_precision=2,
+        icon="mdi:piggy-bank-outline",
+    ),
+    IntelligentSensorDescription(
+        key="intelligent_next_charge",
+        translation_key="intelligent_next_charge",
+        value_key="intelligent_next_charge",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:clock-start",
+    ),
+)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: SmartEVSEDualChargerConfigEntry,
@@ -182,13 +233,15 @@ async def async_setup_entry(
 ) -> None:
     """Set up controller sensors."""
     async_add_entities([*(ControllerSensor(entry, description) for description in SENSOR_DESCRIPTIONS),
-                        *(ChargingCostSensor(entry, key) for key in ("smartevse_1", "smartevse_2"))])
+                        *(ChargingCostSensor(entry, key) for key in ("smartevse_1", "smartevse_2")),
+                        *(IntelligentSensor(entry, description) for description in INTELLIGENT_SENSOR_DESCRIPTIONS)])
 
 
 class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
     """Sensor bound to controller state."""
 
-    _unrecorded_attributes = frozenset({"charging_costs"})
+    # Large, frequently changing structures stay out of the recorder.
+    _unrecorded_attributes = frozenset({"charging_costs", "intelligent"})
     entity_description: ControllerSensorDescription
 
     def __init__(self, entry: SmartEVSEDualChargerConfigEntry, description: ControllerSensorDescription) -> None:
@@ -213,6 +266,7 @@ class ControllerSensor(SmartEVSEDualChargerEntity, SensorEntity):
             return None
         return {
             "charging_costs": self.coordinator.data.get("charging_costs"),
+            "intelligent": self.coordinator.data.get("intelligent"),
             ATTR_CHARGE_ALLOWED: self.coordinator.data.get(ATTR_CHARGE_ALLOWED),
             ATTR_CHARGE_REASON: self.coordinator.data.get(ATTR_CHARGE_REASON),
             ATTR_CONTROLLER_ERROR: self.coordinator.data.get(ATTR_CONTROLLER_ERROR),
@@ -297,3 +351,59 @@ class ChargingCostSensor(SmartEVSEDualChargerEntity, SensorEntity):
                 "ended_at": r["ended_at"], "energy_kwh": r["energy_kwh"],
                 "partial": r["partial"], "unpriced_kwh": r["unpriced_kwh"],
                 "unobserved_seconds": r["unobserved_seconds"], "issues": r["issues"]} if r else {"estimated": True}
+
+
+class IntelligentSensor(SmartEVSEDualChargerEntity, SensorEntity):
+    """Intelligent charging status, planned cost/saving and next planned start.
+
+    Values are validated before publication: an ENUM state outside its options,
+    a non-finite amount, an amount without a currency or a naive timestamp
+    reads as unknown instead of raising on every coordinator update.
+    """
+
+    entity_description: IntelligentSensorDescription
+
+    def __init__(self, entry: SmartEVSEDualChargerConfigEntry, description: IntelligentSensorDescription) -> None:
+        """Initialize the sensor."""
+        super().__init__(entry)
+        self.entity_description = description
+        self._attr_translation_key = description.translation_key
+        self._attr_unique_id = f"{entry.entry_id}_{description.key}"
+
+    @property
+    def _currency(self) -> str | None:
+        unit_key = self.entity_description.unit_key
+        if unit_key is None:
+            return None
+        currency = self.coordinator.data.get(unit_key)
+        return currency if isinstance(currency, str) and currency else None
+
+    @property
+    def native_value(self) -> Any:
+        """Return the validated sensor value."""
+        value = self.coordinator.data.get(self.entity_description.value_key)
+        device_class = self.entity_description.device_class
+        if device_class == SensorDeviceClass.ENUM:
+            return value if value in (self.entity_description.options or ()) else None
+        if device_class == SensorDeviceClass.MONETARY:
+            if self._currency is None or value is None or isinstance(value, bool):
+                return None
+            try:
+                amount = float(value)
+            except (TypeError, ValueError):
+                return None
+            return round(amount, 2) if math.isfinite(amount) else None
+        if device_class == SensorDeviceClass.TIMESTAMP:
+            if isinstance(value, str):
+                value = dt_util.parse_datetime(value)
+            if isinstance(value, datetime) and value.tzinfo is not None:
+                return value
+            return None
+        return value
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        """Currency of the money sensors (None until prices are known)."""
+        if self.entity_description.unit_key is not None:
+            return self._currency
+        return self.entity_description.native_unit_of_measurement

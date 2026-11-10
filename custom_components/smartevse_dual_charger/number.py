@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from functools import partial
+from typing import Any
 
 from homeassistant.components.number import NumberDeviceClass, NumberEntity, NumberMode
-from homeassistant.const import UnitOfTime
+from homeassistant.const import PERCENTAGE, UnitOfTime
 from homeassistant.core import HomeAssistant
 
 from .const import (
@@ -13,13 +15,51 @@ from .const import (
     CONF_DUTY_CYCLE_MINUTES,
     CONF_EV_METER_PUSH_INTERVAL,
     CONF_UPDATE_INTERVAL,
+    INTELLIGENT_MINIMUM_KEYS,
+    MINIMUM_CHARGE_MAX,
+    MINIMUM_CHARGE_MIN,
 )
 from .data import SmartEVSEDualChargerConfigEntry
 from .entity import SmartEVSEDualChargerEntity
+from .naming import configured_vehicle_names
 
 
 type NumberSetter = Callable[[float], Awaitable[None]]
 type AfterSetHook = Callable[[], Awaitable[None]]
+
+
+def entry_vehicle_names(entry: SmartEVSEDualChargerConfigEntry) -> dict[str, str]:
+    """Configured known-vehicle names (options override entry data) by vehicle key."""
+    values: dict[str, Any] = {
+        **dict(getattr(entry, "data", None) or {}),
+        **dict(getattr(entry, "options", None) or {}),
+    }
+    vehicle_1_name, vehicle_2_name = configured_vehicle_names(values)
+    return {"vehicle_1": vehicle_1_name, "vehicle_2": vehicle_2_name}
+
+
+def _minimum_charge_entity(
+    entry: SmartEVSEDualChargerConfigEntry,
+    controller: Any,
+    settings_key: str,
+    vehicle_names: Mapping[str, str],
+) -> ControllerNumberEntity:
+    """Minimum charge (%) for one detected vehicle or the unidentified vehicle."""
+    data_key = INTELLIGENT_MINIMUM_KEYS[settings_key]
+    known_vehicle = settings_key in vehicle_names
+    return ControllerNumberEntity(
+        entry,
+        data_key=data_key,
+        translation_key="vehicle_minimum_charge" if known_vehicle else "other_vehicle_minimum_charge",
+        unique_key=data_key,
+        translation_placeholders={"vehicle": vehicle_names[settings_key]} if known_vehicle else None,
+        setter=partial(controller.async_set_vehicle_minimum_charge, settings_key),
+        native_min_value=MINIMUM_CHARGE_MIN,
+        native_max_value=MINIMUM_CHARGE_MAX,
+        native_step=1,
+        native_unit_of_measurement=PERCENTAGE,
+        mode=NumberMode.BOX,
+    )
 
 
 async def async_setup_entry(
@@ -30,6 +70,7 @@ async def async_setup_entry(
     """Set up controller numbers."""
     controller = entry.runtime_data.controller
     coordinator = entry.runtime_data.coordinator
+    vehicle_names = entry_vehicle_names(entry)
     async_add_entities(
         [
             ControllerNumberEntity(
@@ -110,6 +151,23 @@ async def async_setup_entry(
                 device_class=NumberDeviceClass.DURATION,
                 mode=NumberMode.BOX,
             ),
+            ControllerNumberEntity(
+                entry,
+                data_key="intelligent_top_up_price",
+                translation_key="intelligent_top_up_price",
+                setter=controller.async_set_intelligent_top_up_price,
+                native_min_value=-1.0,
+                native_max_value=5.0,
+                native_step=0.001,
+                native_unit_of_measurement="EUR/kWh",
+                mode=NumberMode.BOX,
+            ),
+            *(
+                _minimum_charge_entity(entry, controller, settings_key, vehicle_names)
+                # No minimum for an unidentified car: without a battery level it is planned
+                # by its learned session energy, so such a setting would do nothing.
+                for settings_key in ("vehicle_1", "vehicle_2")
+            ),
         ]
     )
 
@@ -124,6 +182,8 @@ class ControllerNumberEntity(SmartEVSEDualChargerEntity, NumberEntity):
         data_key: str,
         translation_key: str,
         setter: NumberSetter,
+        unique_key: str | None = None,
+        translation_placeholders: Mapping[str, str] | None = None,
         native_min_value: float,
         native_max_value: float,
         native_step: float,
@@ -133,14 +193,20 @@ class ControllerNumberEntity(SmartEVSEDualChargerEntity, NumberEntity):
         options_key: str | None = None,
         mode: NumberMode | None = None,
     ) -> None:
-        """Initialize the number."""
+        """Initialize the number.
+
+        The unique id stays ``f"{entry_id}_{translation_key}"`` unless an
+        explicit ``unique_key`` is given (entities sharing a translation key).
+        """
         super().__init__(entry)
         self._data_key = data_key
         self._setter = setter
         self._after_set = after_set
         self._options_key = options_key
         self._attr_translation_key = translation_key
-        self._attr_unique_id = f"{entry.entry_id}_{translation_key}"
+        if translation_placeholders is not None:
+            self._attr_translation_placeholders = dict(translation_placeholders)
+        self._attr_unique_id = f"{entry.entry_id}_{unique_key or translation_key}"
         self._attr_native_min_value = native_min_value
         self._attr_native_max_value = native_max_value
         self._attr_native_step = native_step
@@ -149,9 +215,15 @@ class ControllerNumberEntity(SmartEVSEDualChargerEntity, NumberEntity):
         self._attr_mode = mode
 
     @property
-    def native_value(self) -> float:
-        """Return the current value."""
-        return float(self.coordinator.data.get(self._data_key, 0))
+    def native_value(self) -> float | None:
+        """Return the current value (None when the controller has no valid value)."""
+        value = self.coordinator.data.get(self._data_key, 0)
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the number value."""

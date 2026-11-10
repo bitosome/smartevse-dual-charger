@@ -9,7 +9,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "smartevse_dual_charger"
 NAME = "SmartEVSE Dual Charger"
-VERSION = "0.0.8.11"
+VERSION = "0.0.9.0"
 
 LOGGER = logging.getLogger(__package__)
 
@@ -18,6 +18,7 @@ PLATFORMS: list[Platform] = [
     Platform.SWITCH,
     Platform.NUMBER,
     Platform.SELECT,
+    Platform.TIME,
 ]
 
 STORAGE_VERSION = 1
@@ -96,8 +97,89 @@ CONF_WLED_URL = "wled_url"
 CONF_WLED_LED_COUNT = "wled_led_count"
 CONF_WLED_LED_OFFSET = "wled_led_offset"
 CONF_WLED_PRESETS_JSON = "wled_presets_json"
+# Optional usable battery capacity per vehicle (kWh); 0 = automatic (Volvo
+# capacity sensor, else the model default).
+CONF_VEHICLE_1_BATTERY_CAPACITY_KWH = "vehicle_1_battery_capacity_kwh"
+CONF_VEHICLE_2_BATTERY_CAPACITY_KWH = "vehicle_2_battery_capacity_kwh"
+DEFAULT_BATTERY_CAPACITY_KWH = 0
 
 SCHEDULE_NOTIFICATION_ID = f"{DOMAIN}_schedule_disabled"
+
+# --- Intelligent charging ---------------------------------------------------
+INTELLIGENT_STORAGE_KEY = f"{STORAGE_KEY}.{{entry_id}}.intelligent"
+PRICE_INTEGRATION_DOMAIN = "real_electricity_price"
+VEHICLE_INTEGRATION_DOMAIN = "volvo"
+DEFAULT_READY_BY = "07:00"
+DEFAULT_MINIMUM_CHARGE = 80
+MINIMUM_CHARGE_MIN = 10
+MINIMUM_CHARGE_MAX = 100
+OTHER_VEHICLE_NAME = "Unidentified vehicle"
+# Settings keys: a detected vehicle uses its own, an unmapped outlet "other".
+INTELLIGENT_SETTINGS_KEYS = ("vehicle_1", "vehicle_2", "other")
+INTELLIGENT_READY_BY_KEYS = {
+    "vehicle_1": "vehicle_1_ready_by",
+    "vehicle_2": "vehicle_2_ready_by",
+    "other": "other_vehicle_ready_by",
+}
+INTELLIGENT_MINIMUM_KEYS = {
+    "vehicle_1": "vehicle_1_minimum_charge",
+    "vehicle_2": "vehicle_2_minimum_charge",
+    "other": "other_vehicle_minimum_charge",
+}
+
+# Overall status (ENUM sensor options, in this order).
+INTELLIGENT_STATUS_DISABLED = "disabled"
+INTELLIGENT_STATUS_OVERRIDDEN = "overridden"
+INTELLIGENT_STATUS_NO_EV = "no_ev"
+INTELLIGENT_STATUS_IDENTIFYING = "identifying"
+INTELLIGENT_STATUS_PLANNED = "planned"
+INTELLIGENT_STATUS_CHARGING = "charging"
+INTELLIGENT_STATUS_REACHED = "reached"
+INTELLIGENT_STATUS_AT_RISK = "at_risk"
+INTELLIGENT_STATUS_NOT_ACCEPTING = "not_accepting"
+INTELLIGENT_STATUS_NO_PRICE_DATA = "no_price_data"
+INTELLIGENT_STATUSES = (
+    INTELLIGENT_STATUS_DISABLED,
+    INTELLIGENT_STATUS_OVERRIDDEN,
+    INTELLIGENT_STATUS_NO_EV,
+    INTELLIGENT_STATUS_IDENTIFYING,
+    INTELLIGENT_STATUS_PLANNED,
+    INTELLIGENT_STATUS_CHARGING,
+    INTELLIGENT_STATUS_REACHED,
+    INTELLIGENT_STATUS_AT_RISK,
+    INTELLIGENT_STATUS_NOT_ACCEPTING,
+    INTELLIGENT_STATUS_NO_PRICE_DATA,
+)
+
+# Stable charge reasons (never change every cycle).
+REASON_INTELLIGENT_CHARGING = "intelligent_charging"
+REASON_INTELLIGENT_TOP_UP = "intelligent_top_up"
+REASON_INTELLIGENT_CATCH_UP = "intelligent_catch_up"
+REASON_INTELLIGENT_NO_PRICE_DATA = "intelligent_no_price_data"
+REASON_INTELLIGENT_WAITING = "intelligent_waiting_for_planned_slot"
+REASON_INTELLIGENT_TARGETS_REACHED = "intelligent_targets_reached"
+REASON_INTELLIGENT_NO_EV = "intelligent_waiting_for_connected_ev"
+REASON_INTELLIGENT_IDENTIFYING = "intelligent_identifying_vehicle"
+REASON_INTELLIGENT_OUTLET_UNAVAILABLE = "intelligent_planned_outlet_unavailable"
+# Nothing left to plan although a car is below its minimum: it does not draw
+# (§6.4), or its session completed below the target (retries used, unknown SoC).
+REASON_INTELLIGENT_NOT_ACCEPTING = "intelligent_vehicle_not_accepting"
+REASON_INTELLIGENT_CHARGING_COMPLETE = "intelligent_charging_complete"
+# The only connected car is on the outlet a "SmartEVSE N only" policy excludes
+# (the controller's existing reason for that policy, N = the selected outlet).
+REASON_ONLY_WAITING_FOR_SELECTED_EV = "{smartevse_key}_only_waiting_for_selected_ev"
+INTELLIGENT_ALLOWED_REASONS = frozenset({
+    REASON_INTELLIGENT_CHARGING,
+    REASON_INTELLIGENT_TOP_UP,
+    REASON_INTELLIGENT_CATCH_UP,
+    REASON_INTELLIGENT_NO_PRICE_DATA,
+})
+
+# Warning-level controller_error values (non-blocking).
+ERROR_INTELLIGENT_PRICE_DATA_UNAVAILABLE = "intelligent_price_data_unavailable"
+ERROR_INTELLIGENT_PLANNER_FAILED = "intelligent_planner_failed"
+ERROR_INTELLIGENT_MODEL_UNAVAILABLE = "intelligent_model_unavailable"
+ERROR_VEHICLE_TIMER_BLOCKS_CHARGING = "{smartevse_key}_vehicle_timer_blocks_charging"
 
 
 class ChargePolicy(StrEnum):
@@ -118,3 +200,4 @@ class ControllerState(StrEnum):
     FORCE = "force"
     TIMER = "timer"
     BLOCKED = "blocked"
+    INTELLIGENT = "intelligent"

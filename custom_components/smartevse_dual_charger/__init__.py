@@ -21,7 +21,9 @@ from .const import (
     CONF_PUSH_EV_METER,
     CONF_PUSH_WLED,
     CONF_UPDATE_INTERVAL,
+    CONF_VEHICLE_1_BATTERY_CAPACITY_KWH,
     CONF_VEHICLE_1_NAME,
+    CONF_VEHICLE_2_BATTERY_CAPACITY_KWH,
     CONF_VEHICLE_2_NAME,
     DOMAIN,
     LOGGER,
@@ -45,6 +47,8 @@ OPTION_KEYS = {
     CONF_PUSH_WLED,
     CONF_VEHICLE_1_NAME,
     CONF_VEHICLE_2_NAME,
+    CONF_VEHICLE_1_BATTERY_CAPACITY_KWH,
+    CONF_VEHICLE_2_BATTERY_CAPACITY_KWH,
     CONF_UPDATE_INTERVAL,
 }
 
@@ -105,6 +109,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: SmartEVSEDualChargerConf
     )
     await coordinator.async_config_entry_first_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # The first refresh ran before the platforms registered their entities, so its
+    # payload has no Intelligent entity ids and the card would hide the feature
+    # until the next scheduled cycle. Rebuild it now that the registry has them
+    # (a normal entry task: an unload waits for the cycle instead of cancelling it
+    # between two charger writes; the coordinator skips it once shutting down).
+    entry.async_create_task(
+        hass,
+        coordinator._async_refresh_now("platforms_ready"),
+        "platforms ready refresh",
+    )
     LOGGER.debug("Set up SmartEVSE Dual Charger entry %s", entry.entry_id)
     return True
 

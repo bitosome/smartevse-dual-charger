@@ -2,11 +2,15 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.8.2`
+Version: `0.0.9.0`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
 It is not a SmartEVSE `PWR SHARE` implementation.
+
+Since 0.0.9.0 it can also plan the charging itself: [Intelligent charging](#intelligent-charging)
+charges each connected car in the cheapest hours that still reach its minimum charge by its
+ready-by time, using a model it learns locally from your chargers, cars and house.
 
 ## Repository Contents
 
@@ -22,7 +26,7 @@ The integration coordinates both chargers as one controller:
 - writes SmartEVSE state via `POST /settings`
 - can push `/currents` and `/ev_meter` to both SmartEVSE devices
 - can mirror charger state to one WLED ring
-- exposes one Home Assistant control surface for charging policy, force modes, schedule gating, diagnostics, and per-charger state
+- exposes one Home Assistant control surface for charging policy, force modes, schedule gating, Intelligent charging, diagnostics, and per-charger state
 
 The integration no longer calculates charging current budgets in Home Assistant.
 
@@ -52,10 +56,11 @@ The controller uses these sources this way:
 | Mains current sensors | feeder current push and safety gate when current pushing is enabled | authoritative for push safety |
 | EV-meter sensors | optional `/ev_meter` push to SmartEVSE | informational input to SmartEVSE |
 | Price sensor | acceptable-price gate | authoritative only for price mode |
+| Real Electricity Price hourly price lists | Intelligent charging plan prices | planning input for Intelligent charging only |
 | Schedule entity | schedule-window gate | authoritative only for schedule modes |
 | EV connection-status sensors | known-vehicle identity mapping | fresh hint only |
 | Derived EV charging-status sensors | faster completion confirmation and mapping correction | fresh hint only |
-| EV battery sensors | dashboard/card display | display only |
+| EV battery sensors | dashboard/card display, Intelligent charging energy need | display, and planning input for Intelligent charging |
 | EV-meter active power | local proof that the active EV is really drawing charging power | authoritative for no-power completion |
 
 Important EV telemetry rule:
@@ -66,6 +71,7 @@ Important EV telemetry rule:
 - Current freshness window is `10 minutes`.
 - If EV telemetry is stale, `unknown`, or `unavailable`, the controller keeps using SmartEVSE-side behavior and exposes a non-blocking controller warning.
 - If SmartEVSE reports `Charging` but the local EV meter stays below `500 W` for at least `180 seconds`, the active session is treated as not drawing real charging power and can be completed/switched without waiting for the duty-cycle end.
+- Intelligent charging uses the battery level to plan: a car at or above its minimum gets no planned charge, but it is not marked complete from that reading. A battery-level rise seen while that car's charger was not charging never counts as "reached".
 
 ## Controller Cycle
 
@@ -77,11 +83,12 @@ Each controller refresh performs this sequence:
 4. Update per-SmartEVSE session tracking.
 5. Expire force-timer mode when its timer has elapsed.
 6. Reset force modes and runtime policy if both EVs are unplugged.
-7. Resolve whether charging is allowed from force, price, and schedule gates.
-8. Resolve the active SmartEVSE from policy, plug state, completion flags, duty cycle, and handoff state.
-9. Write modes: active SmartEVSE gets `Smart`, the other SmartEVSE gets `Off`.
-10. Update Home Assistant entities and attributes.
-11. Push WLED state if WLED is enabled and the current WLED state does not already match the expected state.
+7. Update the Intelligent charging model (in every mode) and, when Intelligent charging is on, re-plan.
+8. Resolve whether charging is allowed from force, price, Intelligent charging, and schedule gates.
+9. Resolve the active SmartEVSE from policy, plug state, completion flags, duty cycle, handoff state, or the Intelligent plan.
+10. Write modes: active SmartEVSE gets `Smart`, the other SmartEVSE gets `Off` (outgoing charger first on a hand-off).
+11. Update Home Assistant entities and attributes.
+12. Push WLED state if WLED is enabled and the current WLED state does not already match the expected state.
 
 Mains current pushing and EV-meter pushing run in separate loops. They do not wait for the controller refresh cycle.
 
@@ -134,7 +141,7 @@ Notes:
 
 - SmartEVSE MQTT entities are not required.
 - SmartEVSE names are fixed in the integration: `SmartEVSE 1` and `SmartEVSE 2`.
-- Vehicle 1 and Vehicle 2 are known vehicle identities used only for EV mapping, battery display, and the connected-EV UI.
+- Vehicle 1 and Vehicle 2 are known vehicle identities used for EV mapping, battery display, the connected-EV UI, and their own Intelligent charging settings.
 - EV battery sensors are optional. If configured, their values are exposed on the controller-state attributes and shown on the EV node in the custom flow card.
 - EV connection-status sensors are optional, but they enable EV-to-SmartEVSE identity mapping and let the card show the actual connected vehicle name instead of `?`.
 - If WLED setup is enabled, the flow opens a dedicated second WLED step.
@@ -160,6 +167,7 @@ The options flow controls the default behavior of the integration:
 - Vehicle 2 battery sensor
 - Vehicle 1 EV connection-status sensor
 - Vehicle 2 EV connection-status sensor
+- Vehicle 1 / Vehicle 2 battery capacity in kWh for Intelligent charging (`0` = automatic: the Volvo battery-capacity sensor, else 75 kWh; otherwise 10–300 kWh)
 - default charge policy
 - duty cycle
 - controller refresh interval
@@ -183,24 +191,33 @@ Available charging gates:
 - `Force charge by price`
 - `Charge with schedule`
 - `Schedule acceptable price`
+- `Intelligent charging`, with its optional `Intelligent top-up`
 
 `Force charge` is the global activation switch for the force plan. `Force charge timer`
 and `Force charge by price` are optional constraints on that plan. The schedule has
-its own independent `Schedule acceptable price` option.
+its own independent `Schedule acceptable price` option. `Intelligent charging` is a
+standing plan of its own; see [Intelligent charging](#intelligent-charging).
 
 Precedence is fixed:
 
 1. Active `Force charge`, with its selected timer and/or price constraints
-2. `Charge with schedule`, with its independent price constraint
+2. `Force charge timer` or `Force charge by price` switched on without `Force charge`
+   (the pre-0.0.8.6 direct behaviour, kept for older automations)
+3. `Intelligent charging`
+4. `Charge with schedule`, with its independent price constraint
 
-The schedule switch remains enabled while Force charge is active, but it is not
-evaluated until Force charge ends.
+The schedule and Intelligent switches remain enabled while Force charge is active, but
+they are not evaluated until Force charge ends. While `Intelligent charging` is on, the
+schedule is not evaluated at all. The two are independent: turning one on or off never
+changes the other's switch, so a schedule that is still on takes over again when
+Intelligent charging is turned off.
 
 Practical result:
 
-- every active Force charge variant overrides schedule
+- every active Force charge variant overrides Intelligent charging and the schedule
 - `Force charge timer` and `Force charge by price` can be combined for a time-limited, price-gated charge
 - Force charge options remain independent from the schedule's acceptable-price option
+- Intelligent charging outranks the schedule without turning it off; schedule-disabled reminders are not sent while it is on
 
 High-level controller states:
 
@@ -208,6 +225,7 @@ High-level controller states:
 - `force`
 - `timer`
 - `price`
+- `intelligent`
 - `schedule`
 - `blocked`
 
@@ -223,14 +241,19 @@ Trigger behavior table:
 | `Charge with schedule` | Schedule entity is `on` | Requires a valid schedule entity. |
 | `Charge with schedule` + `Schedule acceptable price` | Schedule entity is `on` and price is `<= Acceptable price` | Both standing schedule conditions must be satisfied. |
 | Force plan + Schedule plan | The selected Force constraints | Schedule remains on and resumes after Force charge ends. |
+| `Intelligent charging` | In the planned 15-minute units: the cheapest plan that brings each connected car to its minimum by its ready-by time | Schedule is not evaluated. The planned charger gets `Smart`, the other `Off`. |
+| `Intelligent charging` + `Intelligent top-up` | The planned units, plus known-price units at or below `Intelligent top-up price` for cars that already have their minimum | Top-up stops at the car's own charge limit and never runs past the ready-by time. |
+| Force plan + `Intelligent charging` | The selected Force constraints | Intelligent status is `overridden`; the plan resumes after Force charge ends. |
+| `Intelligent charging` + `Charge with schedule` | The Intelligent plan | The schedule stays on but is not evaluated. |
 
 Important trigger behavior:
 
 - timer mode is cleared on Home Assistant restart
 - when a timed force plan expires, its activation and force options are cleared together
 - if both EVs are unplugged, all force modes are cleared and the runtime charge policy resets to the configured default
-- when charging becomes allowed again after being disallowed, the controller starts a fresh cycle for still-plugged EVs
+- when charging becomes allowed again after being disallowed, the controller starts a fresh cycle for still-plugged EVs; Intelligent charging keeps completed sessions complete between its planned blocks
 - enabling a force mode starts a fresh manual cycle
+- `Intelligent charging` and its settings survive unplugging and restarts; per-car plan state (deadline, catch-up, not-accepting) is cleared when that car is unplugged
 
 ## Charge Policy
 
@@ -347,7 +370,7 @@ How session completion is detected:
 - Local EV-meter no-power evidence can complete a session even when vehicle-cloud telemetry is stale.
 - SmartEVSE states treated as active non-charging evidence are `Connected to EV`, `Ready to Charge`, `Stop Charging`, and states starting with `Charging Stopped`.
 - Unplugging clears completion for that SmartEVSE.
-- Manual `reset_sessions`, a new allowed charging window, force-mode enablement, policy change, or duty-cycle change starts fresh session tracking.
+- Manual `reset_sessions`, a new allowed charging window, force-mode enablement, policy change, or duty-cycle change starts fresh session tracking. The start of an Intelligent charging block is not a new window: a completed session stays complete.
 
 ## Price and Schedule Handling
 
@@ -390,6 +413,386 @@ The next opening comes from the configured native schedule helper's `next_event`
 Successful delivery receipts survive restarts and integration updates. Delivery is claimed on disk before calling the notifier, so interruption during an uncertain send does not create a repeat on restart. A provider timeout is treated as uncertain delivery and is not retried for that window. Other notification failures retry after five minutes while the reminder remains applicable. Storage failure stops only phone reminders and leaves the existing storage intact. Notification work runs independently and cannot hold up charger control or meter pushes.
 
 After enabling this feature, remove the old fixed-time **SmartEVSE schedule reminder** automation to avoid duplicate phone notifications. There is no change to charge policies or the **Charge with schedule** switch.
+
+## Intelligent charging
+
+Intelligent charging (0.0.9.0) is a standing plan, like `Charge with schedule`. Turn
+on `Intelligent charging` once and it stays on through restarts and unplugs. For every
+connected car it then charges in the cheapest 15-minute units that still bring the car
+to its **minimum charge** by its **ready-by** time:
+
+- It knows how many cars are connected (zero, one or two outlets). Only one charger
+  charges at a time, because both share one feeder.
+- It uses the consumer prices from Real Electricity Price (fees and taxes included).
+- It reads each car's battery level from the configured vehicle battery sensor.
+- Each detected car has its own ready-by time and minimum. A car the integration
+  cannot identify uses the **Unidentified vehicle** ready-by time. Its battery level is
+  unknown, so the plan charges the learned session energy (at least 30 kWh) by that
+  time. There is no minimum setting for it.
+- It predicts how much power SmartEVSE Smart mode will actually give the car in each
+  hour of the night, from what it has learned about the household load.
+- It learns locally, inside the integration: charging power, energy per percent,
+  household load per hour, departure habits and a price forecast for hours that are
+  not published yet. Nothing is sent to a cloud service, and no language model is used.
+
+The integration still never writes charging currents. It only chooses which SmartEVSE
+is in `Smart` and which is `Off`; SmartEVSE keeps adapting the current to the feeder.
+
+Optional **top-up**: with `Intelligent top-up` on, a car that has reached its minimum
+also charges, up to the car's own charge limit, in hours whose known price is at or
+below `Intelligent top-up price`. Top-up never uses forecast prices and never moves
+the minimum plan.
+
+### What it needs
+
+- **Price sensor**: the Real Electricity Price `current_price` sensor, configured as
+  the integration's price sensor. Its `hourly_prices` lists for yesterday, today and
+  tomorrow are found through the entity registry, so they must stay enabled.
+  Tomorrow's prices are usually published between 14:00 and 15:00.
+- **Vehicle battery sensors** in the integration options. For the Volvo integration,
+  the battery-capacity and target-charge-level sensors next to the battery sensor are
+  found automatically. The optional **battery capacity** options override the
+  capacity (0 = automatic).
+- **Vehicle connection-status sensors**, so a plugged-in car is identified and its own
+  settings are used.
+- **SmartEVSE in `Smart` mode**, with `current_main` (MaxMains), `current_min` and
+  `current_max` set on the chargers. The integration reads them from `/settings`;
+  16 A / 6 A / 16 A are assumed when they are missing.
+- The companion card 0.3.0 or later for the Intelligent page, the plan list and the
+  charger-tile lines. Older cards ignore the new attribute.
+
+**Rolling back** to an integration version before 0.0.9.0: older versions ignore
+`Intelligent charging`, so only `Charge with schedule` (if it is on) plans charging after
+the rollback. Turn the schedule on first if the cars should still charge overnight.
+
+### Entities
+
+| Entity | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `Intelligent charging` | switch | off | Turns the plan on or off. Persists across restarts and unplugs. |
+| `Intelligent top-up` | switch | off | Allows charging above the minimum in cheap hours. |
+| `Intelligent top-up price` | number, currency/kWh | copy of `Acceptable price` | Top-up price limit. |
+| `<Vehicle 1> ready by`, `<Vehicle 2> ready by` | time | 07:00 | When that car must have its minimum. |
+| `Unidentified vehicle ready by` | time | 07:00 | Ready-by for a car that is not identified. |
+| `<Vehicle 1> minimum charge`, `<Vehicle 2> minimum charge` | number, %, 10–100 | 80 % | Minimum charge level by the ready-by time. |
+| `Intelligent charging status` | sensor (enum) | | Overall status, see below. |
+| `Intelligent planned cost` | sensor (monetary) | | Planned cost of the connected cars' sessions: cost so far plus remaining planned cost. |
+| `Intelligent planned saving` | sensor (monetary) | | Planned saving against charging at plug-in. Can be negative. |
+| `Intelligent next charge` | sensor (timestamp) | | Start of the current or next planned charge (while a block runs, the time it started), or unknown. |
+
+`<Vehicle 1>` and `<Vehicle 2>` are the configured vehicle names, for example
+`time.smartevse_dual_charger_volvo_xc40_ready_by` and
+`number.smartevse_dual_charger_volvo_ex30_minimum_charge`. Renaming a vehicle later
+changes the friendly name, not the entity ID.
+
+The money sensors take their currency from the price lists, have no state class
+(they are plan values, not running totals) and are unknown until a plan with known
+prices exists.
+
+`Intelligent charging status` values:
+
+| State | Meaning |
+| --- | --- |
+| `disabled` | Intelligent charging is off. |
+| `overridden` | A Force charge plan is active; the plan resumes after it. |
+| `no_ev` | No car is connected, or only one that charge policy keeps out of the plan. |
+| `identifying` | A car was just plugged in and is not identified yet (up to 10 minutes). |
+| `planned` | Waiting for the next planned block. |
+| `charging` | A planned block is running. |
+| `reached` | Every connected car has its minimum, or needs nothing more in this session (for example a session completed below its target). |
+| `at_risk` | At least one car cannot reach its minimum by its ready-by time, or is past it. |
+| `not_accepting` | A planned car is not drawing power. |
+| `no_price_data` | No known prices: charging as late as safely possible before the deadline. |
+
+The full plan is published as the `intelligent` attribute of the `Controller state`
+sensor (status, per-charger plan blocks, per-car target, projected battery level,
+cost and saving, hourly price slots, learning status, recent sessions and the entity
+IDs of all Intelligent entities). The attribute is excluded from the recorder and only
+changes at 15-minute boundaries or when an input changes, so the card does not re-render
+every refresh.
+
+### How the plan is built
+
+The controller re-plans on every refresh. The planner is a pure function: the same
+inputs always give the same plan.
+
+1. **Time grid.** 15-minute units from now to the latest ready-by time. The unit that
+   is already running is used only if at least 5 minutes remain (1 minute for the car
+   that is already charging in it).
+2. **Prices.** Each unit gets the price of its hour. Units are used in three tiers:
+   - hours with a **known price**, cheapest first (negative prices are valid);
+   - hours **without a known price** (not published yet, or missing), only for energy
+     the known hours cannot deliver before the ready-by, and as late as safely possible.
+     The learned price forecast is shown as an estimate but never chooses these hours;
+   - while tomorrow's prices are still **expected** (15:00 local on the day before; Real
+     Electricity Price usually has them by 14:00-15:00), known hours before that time
+     come last: they are used only when waiting for the prices would miss a minimum.
+   The plan is rebuilt every refresh, so it changes as soon as new prices arrive. After
+   15:00 missing prices are late, and the plan no longer waits for them.
+3. **Energy need.** From the battery level to the effective target, which is the
+   minimum charge capped at the car's own charge limit. The need includes a charging
+   taper above 93 % and margins: 3 % plus 3 minutes per expected start, and a
+   conservative variant with the learned worst-case energy per percent, 10 % and
+   10 minutes.
+4. **Latest-start protection.** For each car the latest units before its deadline that
+   cover its conservative need are reserved first. Looking for cheaper hours can
+   therefore never make a car late.
+5. **Which cars can make it.** If not every car can reach its minimum in time, the plan
+   keeps the largest number of cars on time (the owner's policy, see below). The other
+   cars get as much energy as they can before their ready-by without making an
+   on-time car late. Such a car is `at_risk` when its plan ends below its minimum; if
+   the plan still reaches it (only the safety margin is missing) it shows `tight`.
+6. **Cheapest selection.** Units are taken cheapest first; on equal prices a unit next
+   to an already chosen block wins, then the earlier one. A unit is only taken while it
+   adds energy some on-time car can still use before its deadline. For one charger and
+   per-car deadlines this greedy choice is exactly the cheapest plan.
+7. **Safety buffer.** Extra units close to each deadline cover the gap between expected
+   and conservative power, as long as they do not take time another car needs. A car
+   whose buffer could not be completed shows `tight`.
+8. **Blocks.** Consecutive units become blocks. A short block (under 30 minutes) is
+   moved next to the car's other block when that costs at most €0.10 more, to avoid an
+   extra start. Once a unit has started, it stays with its car until the unit ends,
+   unless a car ranked before it (on time, or late but still able to reach its minimum)
+   needs the rest of that unit; the hand-off then happens inside the unit. A start inside
+   a unit gets at least 6 minutes there and happens up to a minute early, so the next
+   cycle still finds enough of the unit left.
+9. **Order.** When both cars need the same hours, the earlier ready-by charges first.
+   `SmartEVSE N first` breaks ties; `SmartEVSE N only` leaves the other outlet out of the
+   plan ("Not planned · charge policy").
+10. **Top-up** (when enabled) adds known-price units at or below the top-up price, before
+    the car's deadline, after the minimum plan is fixed.
+
+**When not all cars can reach their minimum.** The owner's policy is to maximise the
+number of cars that reach their minimum by their ready-by time. When the two cars each
+fit alone but not together, the earlier ready-by stays on time, then the charge-policy
+priority car (never the one with the smaller remaining need, which changes while a car
+charges). A car that does not fit even alone is moved out. The cars that are moved out
+get the most energy they can still get before their ready-by. The on-time cars still
+reach their minimum on time, but they may be moved to dearer hours so that the late car
+gets more energy, which changes their planned cost and saving. Among the late cars, a car
+that can still reach its minimum without the safety margin is served first, then the
+earlier ready-by.
+
+**No price data.** When no known price covers the planning window (after falling back
+to the last good price list the integration saved), every unit ranks equal. The plan
+then covers the conservative need as late as possible before the deadline and stops at
+the minimum, and `controller_error` is `intelligent_price_data_unavailable`. For the first
+10 minutes after Home Assistant starts, missing prices only delay charging unless the time
+left is barely enough.
+
+### Smart-mode power prediction
+
+SmartEVSE Smart mode gives the car what the feeder has left. The integration predicts
+that per hour:
+
+- Household load: each refresh it records the highest phase current of the mains meter
+  minus the EV meter's current on that phase. Per local hour and weekday/weekend it keeps
+  the hourly mean and 90th percentile of the last 14 such hours.
+- Offered current: `min(MaxCurrent, MaxMains − household load)`. The car takes the smaller
+  of that and its own learned current limit. If the offered current is below MinCurrent,
+  SmartEVSE pauses ("No Power Available") and that hour gives 0 kW.
+- Power: current × 3 phases × the learned kW per phase-amp (about 0.235 kW).
+- Expected power uses the median household load; conservative power uses a high
+  percentile with at least 1 A extra. An hour with fewer than 3 learned values uses
+  3 A (expected) and 5 A (conservative), and until 7 days are learned conservative
+  power is capped at 8.5 kW.
+- What the house draws right now counts too: for the current and the next hour the
+  household load of the last hour is a floor, and an hour without learned values uses
+  it instead of the 3 A / 5 A defaults (at most 8 A / 9 A there, so an evening peak does
+  not empty the night). This floor is re-read at the start of each 15-minute planning
+  unit, in 0.5 A steps rounded up, so a spiky house does not change the plan in the
+  middle of a unit.
+- Expected power is calibrated against what the EV meter actually measured in recent
+  5-minute charging windows (factor 0.5–1.10). The comparison uses the household load
+  measured in the same window, so the factor describes the charger only; windows in
+  which the car drew clearly less than it was offered are not used for it.
+- A car that draws clearly less than it is offered (more than 2 A less, in at least two
+  5-minute windows, for example with a cold battery) is planned at the median current
+  it took in its last six such windows. This holds for the rest of that plug session,
+  also while it waits for a cheaper slot or takes all of a lower offer during heat-pump
+  hours. It ends when the car draws more than 1 A above that current, on unplug, or when
+  Home Assistant restarts (then the evidence is gathered again within 10-15 minutes of
+  charging). The other car keeps its own power in the plan.
+
+A Smart-mode pause or a meter communication error is never treated as a full car or a
+car that refuses charge (90-second guard after the pause clears). Hand-offs between
+chargers are sequential in every mode: the outgoing charger is switched `Off` first, and
+the incoming one is switched to `Smart` once the outgoing one is observed off and the EV
+meter is below 1 kW, or 30 seconds after the Off write. This avoids a false "No Power
+Available" start on the incoming charger.
+
+### The learned model
+
+The model lives in a private Home Assistant store,
+`.storage/smartevse_dual_charger.<entry_id>.intelligent`. It is saved at most every
+5 minutes after something new was learned, and on shutdown or reload. Every stored value
+is validated on load; a bad value resets only itself.
+
+| What | How it is learned | Until learned |
+| --- | --- | --- |
+| Household load per hour | Hourly mean and P90, weekday/weekend, last 14 per hour | 3 A expected, 5 A conservative |
+| kW per phase-amp and each car's current limit | Clean 5-minute windows while one car charges | 0.235 kW, MaxCurrent − 0.8 A |
+| Energy per % per car | One sample per clean plug session (≥ 15 points, ≤ 90 %), last 7, used after 3 | Capacity / 100 × 1.05 (capacity option, else Volvo sensor, else 75 kWh) |
+| Session energy when the battery level is unknown | P80 of the last 10 clean sessions in the charging history, at least 30 kWh | 30 kWh |
+| Departure habits | Unplug times 04:00–13:00 after an overnight session, weekday/weekend | No suggestion |
+| Price forecast | Median of the last 14 known prices per local hour, weekday/weekend | The same hour of the most recent known day |
+
+From the departure habits the card can suggest a ready-by time (shown as "Usually
+leaves 07:30" with a "Use 07:15" action) once at least 8 departures are known.
+
+If the store cannot be read (a corrupt, empty or unsupported file), the model runs on
+defaults and never writes over the file. If a save fails (for example a full or read-only
+disk), the learning stays unsaved in memory and is saved again later. In both cases
+`controller_error` shows the warning `intelligent_model_unavailable`.
+
+### Battery level, deadlines and sessions
+
+- **Battery level sources**: a live reading; else the last reading of this plug session;
+  with a reading older than 10 minutes, an estimate from the energy metered since it
+  (also after the charger stopped, until a newer reading arrives); a reading that has
+  not changed since well before the plug-in is "unverified"
+  and gets one short probe instead of being trusted as "reached"; with no reading at all,
+  the plan charges the learned session energy.
+- Once a car has reached its minimum in a plug session, it is planned again only if its
+  level falls 2 points below the target.
+- **Deadline**: the next local occurrence of the ready-by time, built in local time, so
+  daylight-saving changes keep the wall-clock time. A car plugged in less than 60 minutes
+  before its ready-by time is planned for the next day.
+- **At the ready-by time** the deadline moves to the next day. A car still below its
+  minimum that was plugged in at least 60 minutes earlier is in **catch-up**: it charges
+  in the earliest units until it reaches the minimum (`intelligent_catch_up`). A car that
+  is charging towards a missed minimum keeps charging up to the ready-by time (it is not
+  switched off for the last minute of the plan) and continues as catch-up. A ready-by
+  time that passed more than 2 hours before the controller saw it (Home Assistant was
+  down, or a version without Intelligent charging ran) starts no catch-up: the car is
+  planned for the next ready-by time.
+- **Identification during a session**: when a car is identified (or its mapping is
+  corrected) while plugged in, its own ready-by time and minimum apply; a catch-up that
+  is running continues, and a car whose own ready-by time has already passed since the
+  plug-in is in catch-up as well.
+- **Editing a ready-by time** less than 2 hours before the current deadline: an
+  earlier time that is still ahead applies tonight; a later time, or one that has just
+  passed, keeps tonight's deadline and applies from the next day. Editing a ready-by time or
+  a minimum never ends a catch-up: it ends when the (new) minimum is reached, on unplug,
+  or when Intelligent charging is switched off and on.
+- **Charger off the API**: a charger that has not answered for `max(2 × refresh interval,
+  60 s)` is left out of the plan, so the other car gets the time; its plug session,
+  deadline and catch-up are kept and it is planned again as soon as it answers. While
+  nothing charges and such a car may still need charge, the reason is
+  `intelligent_planned_outlet_unavailable`.
+- **Identifying**: for up to 10 minutes after a plug-in, an unidentified car waits
+  (unless it must start now to make its deadline) and no cost or saving is shown for it.
+- **Mapping checks**: a vehicle's "charging" report fixes the mapping only when it
+  changed after the charger's current charging run began and at least 4 minutes after
+  the other charger last charged (the vehicle cloud reports minutes late, so at a
+  hand-off the car just switched off is still reported as charging). While Intelligent
+  charging plans, a battery-level rise on the car mapped to the charger that is off also
+  swaps a wrong mapping, but only when that car's own charger has not charged for
+  30 minutes, the car on the charging charger stays flat, and the rise fits the metered
+  energy.
+- **Completion**: a session that SmartEVSE completes stays complete when the next block
+  starts. If the battery level is still more than 1 point below the target 30 minutes
+  later, the plan retries, at most twice.
+- **Not accepting**: if a planned car in Smart mode does not start charging for 5 minutes, it is
+  left out for 60 minutes and probed again at its next planned block; after 3 probes it is
+  done for this plug session. A car whose battery level already shows its minimum (for
+  example an unverified reading probed with one short charge) and that does not draw is
+  full, not refusing: it counts as reached. If the car reports that its own charging timer
+  is active, the controller shows `smartevse_N_vehicle_timer_blocks_charging` instead.
+
+### Charge reasons
+
+| Reason | Charging | Meaning |
+| --- | --- | --- |
+| `intelligent_charging` | yes | A planned block is running. |
+| `intelligent_top_up` | yes | A top-up block is running for a car that has its minimum. |
+| `intelligent_catch_up` | yes | A late or at-risk car is charging as early as possible. |
+| `intelligent_no_price_data` | yes | Charging without price data, as late as safely possible. |
+| `intelligent_waiting_for_planned_slot` | no | Waiting for the next planned block. |
+| `intelligent_targets_reached` | no | Every connected car has its minimum. |
+| `intelligent_vehicle_not_accepting` | no | Nothing left to plan, but a car below its minimum does not draw power. |
+| `intelligent_charging_complete` | no | Nothing left to plan; a car's session completed below its minimum (or its level is unknown). |
+| `smartevse_N_only_waiting_for_selected_ev` | no | `SmartEVSE N only` is selected and the only connected car is on the other charger. |
+| `intelligent_waiting_for_connected_ev` | no | No car is connected. |
+| `intelligent_identifying_vehicle` | no | A new car is being identified. |
+| `intelligent_planned_outlet_unavailable` | no | The planned charger is unavailable or disconnected, or a car that may still need charge is on a charger that is off the API. |
+
+Reasons are stable while nothing changes, so a reason change does not restart a cycle.
+
+Warning-level `controller_error` values never block charging. Intelligent charging keeps
+charging by deadline when they appear:
+
+- `intelligent_price_data_unavailable`: no known prices; the no-price plan is used.
+- `intelligent_planner_failed`: the planner failed; the no-price plan is used, never
+  "charge now at any price".
+- `intelligent_model_unavailable`: the learned model could not be loaded or saved;
+  defaults are used.
+- `smartevse_1_vehicle_timer_blocks_charging`, `smartevse_2_vehicle_timer_blocks_charging`:
+  the planned car reports a charging status of `scheduled`, so its own timer may block
+  charging.
+
+Each part (model observation, model estimates, planning) runs in its own error guard;
+the charger control loop never fails because of Intelligent charging.
+
+### Saving: "vs charging at plug-in"
+
+The saving compares the plan with plugging in and charging straight away:
+
+- **Baseline**: each car charges continuously from its plug-in time at the expected
+  power, one charger at a time in plug-in order, at the prices known at plug-in. The
+  baseline energy is the energy delivered so far plus the remaining planned energy to
+  the minimum. Top-up energy and cost are left out on both sides.
+- **Per deadline window**: the baseline of the first window starts at the plug-in (at
+  most 25 hours before the deadline). A window opened by a deadline roll (a second night,
+  or catch-up after the ready-by time), or after another mode already charged in the
+  session, starts its baseline when the window opens. The planned and the realised
+  saving use the same start.
+- **Planned saving** = baseline cost − (Intelligent charging cost so far in this window
+  + remaining planned cost). For a car with nothing left to plan it is the window's
+  realised (provisional) saving, the same figure History shows.
+- The saving is unknown when part of it depends on forecast prices, unknown prices or
+  a partial charging record. Savings smaller than €0.10 are published but the card hides
+  them.
+- **Realised saving**: when the deadline passes or the car is unplugged, the window is
+  closed and the saving is recomputed from the charging-history record (measured energy
+  and cost) against the same baseline. A window in which Force charge or another mode
+  also charged is marked `mixed`, and the card shows "Force charge used" instead of a
+  saving.
+
+All amounts are estimates from power and prices, not a billing meter.
+
+### Privacy
+
+- Everything runs locally in Home Assistant. Prices, battery levels and charging data
+  are not sent anywhere.
+- Departure habits are kept only in the private store, as minutes of the day. The
+  attribute and diagnostics only show the rounded suggestion, never the raw times.
+- Diagnostics redact ready-by times, deadlines and suggestions, and round
+  charging-history timestamps to the hour.
+- The `intelligent` attribute is not written to the recorder. It is visible to every
+  Home Assistant user, like the rest of the controller state, and contains the ready-by
+  times and planned blocks.
+
+### Limitations
+
+- Prices are hourly (Real Electricity Price aggregates 15-minute prices); the plan
+  itself uses 15-minute units.
+- The model starts empty at installation. History from before the update is not used
+  for household load, except the charging-history records for the session budget.
+- Plans and savings are estimates. Household load can differ from the learned profile,
+  for example when the heat pump runs harder than usual; the conservative power and
+  the latest-start protection cover this, but the cost can come out higher.
+- A car that was unplugged and plugged in again while Home Assistant was down is not
+  detected as a new session.
+- A saving needs known prices from the start of its baseline (the plug-in, or the
+  start of the deadline window).
+- With 15-minute price lists the realised-saving snapshot keeps the hourly mean; an hour
+  with an unpriced quarter counts as unpriced.
+- There is no notification for `at_risk`; use the `Intelligent charging status` sensor
+  in an automation.
+- No coordination with the heat pump or other large loads.
+- The charging-plan chart on the card is planned for a later card release; the payload
+  already contains the hourly slots.
 
 ## Controller Refresh and Meter Pushes
 
@@ -484,6 +887,8 @@ Presets are recreated mainly as a setup/bootstrap asset set. Runtime control is 
 - `Force charge timer`
 - `Charge with schedule`
 - `Schedule acceptable price`
+- `Intelligent charging`
+- `Intelligent top-up`
 
 ### Numbers
 
@@ -495,10 +900,18 @@ All numeric inputs use Home Assistant number entities with box input.
 - `Controller refresh interval`
 - `Mains current push interval`
 - `EV meter push interval`
+- `Intelligent top-up price`
+- `<Vehicle 1> minimum charge`, `<Vehicle 2> minimum charge`
 
 ### Selects
 
 - `Charge policy`
+
+### Times
+
+- `<Vehicle 1> ready by`, `<Vehicle 2> ready by`, `Unidentified vehicle ready by`
+
+`<Vehicle 1>` and `<Vehicle 2>` are the configured vehicle names.
 
 ### Sensors
 
@@ -524,6 +937,12 @@ All numeric inputs use Home Assistant number entities with box input.
 - `SmartEVSE 2 override current`
 - `SmartEVSE 2 error`
 - `SmartEVSE 2 connected EV`
+- `SmartEVSE 1 session cost`
+- `SmartEVSE 2 session cost`
+- `Intelligent charging status`
+- `Intelligent planned cost`
+- `Intelligent planned saving`
+- `Intelligent next charge`
 
 The `Controller state` sensor also exposes useful extra attributes such as:
 
@@ -536,6 +955,7 @@ The `Controller state` sensor also exposes useful extra attributes such as:
 - current intervals
 - per-SmartEVSE session completion flags
 - last push timestamps
+- `charging_costs` (charging history) and `intelligent` (the Intelligent charging plan); both are excluded from the recorder
 
 ### Service Actions
 
@@ -545,7 +965,7 @@ The `Controller state` sensor also exposes useful extra attributes such as:
 Behavior:
 
 - `refresh`: runs one controller cycle immediately
-- `reset_sessions`: clears remembered per-EV completion state and active SmartEVSE selection, then starts a fresh cycle
+- `reset_sessions`: clears remembered per-EV completion state, the per-car Intelligent charging state (deadline, catch-up, not-accepting) and active SmartEVSE selection, then starts a fresh cycle; the learned model and charging history are kept
 
 These are service actions only. The integration no longer exposes separate button entities for them.
 
@@ -567,6 +987,16 @@ These are service actions only. The integration no longer exposes separate butto
 - `smartevse_2_state_oscillation`
 
 Vehicle mapping and vehicle data warnings are non-blocking. They are exposed so automations can notify about degraded identity/telemetry quality, but charging control continues from SmartEVSE state.
+
+Intelligent charging adds warning-level values. They never block charging; the plan keeps charging by deadline:
+
+- `intelligent_price_data_unavailable`
+- `intelligent_planner_failed`
+- `intelligent_model_unavailable`
+- `smartevse_1_vehicle_timer_blocks_charging`
+- `smartevse_2_vehicle_timer_blocks_charging`
+
+See [Charge reasons](#charge-reasons) for what each one means.
 
 ## EV Identity Mapping
 
@@ -641,11 +1071,15 @@ Both write SmartEVSE modes and will fight each other.
 - [`custom_components/smartevse_dual_charger/__init__.py`](custom_components/smartevse_dual_charger/__init__.py): setup, unload, service registration
 - [`custom_components/smartevse_dual_charger/config_flow.py`](custom_components/smartevse_dual_charger/config_flow.py): initial setup and options flow
 - [`custom_components/smartevse_dual_charger/controller.py`](custom_components/smartevse_dual_charger/controller.py): charging logic, SmartEVSE API I/O, session tracking, WLED calls, notifications
+- [`custom_components/smartevse_dual_charger/charge_planner.py`](custom_components/smartevse_dual_charger/charge_planner.py): Intelligent charging planner (pure Python, no Home Assistant imports)
+- [`custom_components/smartevse_dual_charger/charge_model.py`](custom_components/smartevse_dual_charger/charge_model.py): Intelligent charging learned model (pure Python)
+- [`custom_components/smartevse_dual_charger/intelligent.py`](custom_components/smartevse_dual_charger/intelligent.py): Intelligent charging adapter: source entities, model storage, plan inputs, published plan
 - [`custom_components/smartevse_dual_charger/coordinator.py`](custom_components/smartevse_dual_charger/coordinator.py): refresh scheduling, push loops, immediate price/schedule refresh triggers
-- [`custom_components/smartevse_dual_charger/number.py`](custom_components/smartevse_dual_charger/number.py): runtime number entities
+- [`custom_components/smartevse_dual_charger/number.py`](custom_components/smartevse_dual_charger/number.py): runtime number entities, including the Intelligent minimum charge and top-up price
 - [`custom_components/smartevse_dual_charger/select.py`](custom_components/smartevse_dual_charger/select.py): runtime charge policy select
-- [`custom_components/smartevse_dual_charger/sensor.py`](custom_components/smartevse_dual_charger/sensor.py): controller and SmartEVSE detail sensors
-- [`custom_components/smartevse_dual_charger/switch.py`](custom_components/smartevse_dual_charger/switch.py): force and schedule switches
+- [`custom_components/smartevse_dual_charger/sensor.py`](custom_components/smartevse_dual_charger/sensor.py): controller, SmartEVSE detail, session cost and Intelligent charging sensors
+- [`custom_components/smartevse_dual_charger/switch.py`](custom_components/smartevse_dual_charger/switch.py): force, schedule and Intelligent charging switches
+- [`custom_components/smartevse_dual_charger/time.py`](custom_components/smartevse_dual_charger/time.py): ready-by time entities
 - [`custom_components/smartevse_dual_charger/wled.py`](custom_components/smartevse_dual_charger/wled.py): WLED runtime control, LED map, segment/preset recreation
 - [`custom_components/smartevse_dual_charger/diagnostics.py`](custom_components/smartevse_dual_charger/diagnostics.py): diagnostics with URL/IP redaction
 - [`custom_components/smartevse_dual_charger/services.yaml`](custom_components/smartevse_dual_charger/services.yaml): service descriptions
