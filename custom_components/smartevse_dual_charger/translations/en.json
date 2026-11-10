@@ -136,9 +136,6 @@
       },
       "intelligent_charge": {
         "name": "Intelligent charging"
-      },
-      "intelligent_top_up": {
-        "name": "Intelligent top-up"
       }
     },
     "number": {
@@ -159,9 +156,6 @@
       },
       "ev_meter_push_interval": {
         "name": "EV meter push interval"
-      },
-      "intelligent_top_up_price": {
-        "name": "Intelligent top-up price"
       },
       "vehicle_minimum_charge": {
         "name": "{vehicle} minimum charge"

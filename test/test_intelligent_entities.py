@@ -68,8 +68,8 @@ EXISTING_UNIQUE_KEYS = {
     "time": set(),
 }
 NEW_UNIQUE_KEYS = {
-    "switch": {"intelligent_charge", "intelligent_top_up"},
-    "number": {"intelligent_top_up_price", "vehicle_1_minimum_charge", "vehicle_2_minimum_charge"},
+    "switch": {"intelligent_charge"},
+    "number": {"vehicle_1_minimum_charge", "vehicle_2_minimum_charge"},
     "select": set(),
     "sensor": {"intelligent_status", "intelligent_planned_cost", "intelligent_planned_saving",
                "intelligent_next_charge"},
@@ -201,10 +201,9 @@ class UniqueIdTests(unittest.IsolatedAsyncioTestCase):
 class SwitchAndNumberTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.controller = MagicMock()
-        for name in ("async_set_intelligent_enabled", "async_set_intelligent_top_up",
-                     "async_set_intelligent_top_up_price", "async_set_vehicle_minimum_charge"):
+        for name in ("async_set_intelligent_enabled", "async_set_vehicle_minimum_charge"):
             setattr(self.controller, name, AsyncMock())
-        self.data = {"intelligent_enabled": True, "intelligent_top_up": False, "intelligent_top_up_price": 0.125,
+        self.data = {"intelligent_enabled": True,
                      "vehicle_1_minimum_charge": 70, "vehicle_2_minimum_charge": 90,
                      "other_vehicle_minimum_charge": 80}
         self.entry = make_entry(self.data, controller=self.controller)
@@ -212,24 +211,16 @@ class SwitchAndNumberTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_intelligent_switches_read_and_write_the_controller(self):
         switches = by_key(await setup_platform("switch", self.entry))
-        charge, top_up = switches["intelligent_charge"], switches["intelligent_top_up"]
+        charge = switches["intelligent_charge"]
         self.assertTrue(charge.is_on)
-        self.assertFalse(top_up.is_on)
+        self.assertNotIn("intelligent_top_up", switches)  # automatic since 0.0.10.0
         await charge.async_turn_off()
         self.controller.async_set_intelligent_enabled.assert_awaited_once_with(False)
-        await top_up.async_turn_on()
-        self.controller.async_set_intelligent_top_up.assert_awaited_once_with(True)
-        self.assertEqual([call.args[0] for call in self.refresh.await_args_list], ["switch_turn_off", "switch_turn_on"])
+        self.assertEqual([call.args[0] for call in self.refresh.await_args_list], ["switch_turn_off"])
 
     async def test_intelligent_numbers_read_write_and_shape(self):
         numbers = by_key(await setup_platform("number", self.entry))
-        price = numbers["intelligent_top_up_price"]
-        self.assertEqual(price.native_value, 0.125)
-        self.assertEqual((price.native_min_value, price.native_max_value, price.native_step), (-1.0, 5.0, 0.001))
-        self.assertEqual(price.native_unit_of_measurement, "EUR/kWh")
-        self.assertEqual(price.mode, NumberMode.BOX)
-        await price.async_set_native_value(0.09)
-        self.controller.async_set_intelligent_top_up_price.assert_awaited_once_with(0.09)
+        self.assertNotIn("intelligent_top_up_price", numbers)  # the price limit is learned
 
         for key, settings_key, value in (("vehicle_1_minimum_charge", "vehicle_1", 70.0),
                                          ("vehicle_2_minimum_charge", "vehicle_2", 90.0)):
@@ -243,13 +234,10 @@ class SwitchAndNumberTests(unittest.IsolatedAsyncioTestCase):
                 self.controller.async_set_vehicle_minimum_charge.assert_awaited_with(settings_key, 65)
         # Minimum-charge numbers are runtime settings, never written into the options.
         self.assertEqual(self.entry.options, {})
-        self.assertEqual(self.refresh.await_count, 3)  # top-up price and two vehicle minimums
+        self.assertEqual(self.refresh.await_count, 2)  # two vehicle minimums
 
-    async def test_missing_top_up_price_reads_unknown_instead_of_raising(self):
-        self.data["intelligent_top_up_price"] = None
+    async def test_missing_number_keeps_its_zero_fallback(self):
         numbers = by_key(await setup_platform("number", self.entry))
-        self.assertIsNone(numbers["intelligent_top_up_price"].native_value)
-        # Existing numbers keep their 0 fallback for a missing key.
         self.assertEqual(numbers["acceptable_price"].native_value, 0.0)
 
 
@@ -457,8 +445,6 @@ class TranslationTests(unittest.IsolatedAsyncioTestCase):
                                                  "smartevse_dual_charger_unidentified_vehicle_ready_by"),
             ("number", "vehicle_2_minimum_charge"): ("Volvo EX30 minimum charge",
                                                      "smartevse_dual_charger_volvo_ex30_minimum_charge"),
-            ("number", "intelligent_top_up_price"): ("Intelligent top-up price",
-                                                     "smartevse_dual_charger_intelligent_top_up_price"),
             ("switch", "intelligent_charge"): ("Intelligent charging", "smartevse_dual_charger_intelligent_charging"),
             ("switch", "charge_with_schedule"): ("Charge with schedule", "smartevse_dual_charger_charge_with_schedule"),
             ("sensor", "intelligent_next_charge"): ("Intelligent next charge",
@@ -544,7 +530,7 @@ class VersionTests(unittest.TestCase):
     def test_version_matches_manifest_and_readme(self):
         manifest = json.loads((PACKAGE / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(VERSION, manifest["version"])
-        self.assertEqual(VERSION, "0.0.9.1")
+        self.assertEqual(VERSION, "0.0.10.0")
         # Review round 3: no after_dependency on the price integration — HA refuses to set
         # up an integration whose after_dependency failed, which would stop Schedule/Force
         # too. The registry-based derivation works in any setup order.

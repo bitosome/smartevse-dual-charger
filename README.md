@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.9.1`
+Version: `0.0.10.0`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -191,7 +191,7 @@ Available charging gates:
 - `Force charge by price`
 - `Charge with schedule`
 - `Schedule acceptable price`
-- `Intelligent charging`, with its optional `Intelligent top-up`
+- `Intelligent charging`
 
 `Force charge` is the global activation switch for the force plan. `Force charge timer`
 and `Force charge by price` are optional constraints on that plan. The schedule has
@@ -242,7 +242,6 @@ Trigger behavior table:
 | `Charge with schedule` + `Schedule acceptable price` | Schedule entity is `on` and price is `<= Acceptable price` | Both standing schedule conditions must be satisfied. |
 | Force plan + Schedule plan | The selected Force constraints | Schedule remains on and resumes after Force charge ends. |
 | `Intelligent charging` | In the planned 15-minute units: the cheapest plan that brings each connected car to its minimum by its ready-by time | Schedule is not evaluated. The planned charger gets `Smart`, the other `Off`. |
-| `Intelligent charging` + `Intelligent top-up` | The planned units, plus known-price units at or below `Intelligent top-up price` for cars that already have their minimum | Top-up stops at the car's own charge limit and never runs past the ready-by time. |
 | Force plan + `Intelligent charging` | The selected Force constraints | Intelligent status is `overridden`; the plan resumes after Force charge ends. |
 | `Intelligent charging` + `Charge with schedule` | The Intelligent plan | The schedule stays on but is not evaluated. |
 
@@ -419,7 +418,8 @@ After enabling this feature, remove the old fixed-time **SmartEVSE schedule remi
 Intelligent charging (0.0.9.0) is a standing plan, like `Charge with schedule`. Turn
 on `Intelligent charging` once and it stays on through restarts and unplugs. For every
 connected car it then charges in the cheapest 15-minute units that still bring the car
-to its **minimum charge** by its **ready-by** time:
+to at least its **minimum charge** by its **ready-by** time. The minimum is a floor,
+not a target: above it the car keeps charging while electricity is cheap (see below).
 
 - It knows how many cars are connected (zero, one or two outlets). Only one charger
   charges at a time, because both share one feeder.
@@ -438,10 +438,15 @@ to its **minimum charge** by its **ready-by** time:
 The integration still never writes charging currents. It only chooses which SmartEVSE
 is in `Smart` and which is `Off`; SmartEVSE keeps adapting the current to the feeder.
 
-Optional **top-up**: with `Intelligent top-up` on, a car that has reached its minimum
-also charges, up to the car's own charge limit, in hours whose known price is at or
-below `Intelligent top-up price`. Top-up never uses forecast prices and never moves
-the minimum plan.
+**Above the minimum** (0.0.10.0): once the minimum is planned, the car keeps charging up
+to its own charge limit in hours whose known price is at or below what the cheap hours
+of a day usually cost. That limit is learned from the price lists: the mean of each
+day's six cheapest hours, then the median over the last days (up to 14; it needs 5).
+On a cheap night the car fills up, on an expensive night it stops at the minimum, and
+until five days of prices are known it stops at the minimum. There is nothing to set:
+the earlier `Intelligent top-up` switch and price were removed and are deleted from
+Home Assistant on upgrade. Extra charging never uses hours without a published price,
+never runs past the ready-by time and never delays another car's minimum.
 
 ### What it needs
 
@@ -470,8 +475,6 @@ the rollback. Turn the schedule on first if the cars should still charge overnig
 | Entity | Type | Default | Purpose |
 | --- | --- | --- | --- |
 | `Intelligent charging` | switch | off | Turns the plan on or off. Persists across restarts and unplugs. |
-| `Intelligent top-up` | switch | off | Allows charging above the minimum in cheap hours. |
-| `Intelligent top-up price` | number, currency/kWh | copy of `Acceptable price` | Top-up price limit. |
 | `<Vehicle 1> ready by`, `<Vehicle 2> ready by` | time | 07:00 | When that car must have its minimum. |
 | `Unidentified vehicle ready by` | time | 07:00 | Ready-by for a car that is not identified. |
 | `<Vehicle 1> minimum charge`, `<Vehicle 2> minimum charge` | number, %, 10–100 | 80 % | Minimum charge level by the ready-by time. |
@@ -561,8 +564,9 @@ inputs always give the same plan.
 9. **Order.** When both cars need the same hours, the earlier ready-by charges first.
    `SmartEVSE N first` breaks ties; `SmartEVSE N only` leaves the other outlet out of the
    plan ("Not planned · charge policy").
-10. **Top-up** (when enabled) adds known-price units at or below the top-up price, before
-    the car's deadline, after the minimum plan is fixed.
+10. **Above the minimum.** After the minimum plan is fixed, known-price units at or
+    below the learned cheap price are added, before the car's deadline, up to the
+    car's own charge limit.
 
 **When not all cars can reach their minimum.** The owner's policy is to maximise the
 number of cars that reach their minimum by their ready-by time. When the two cars each
@@ -717,7 +721,7 @@ disk), the learning stays unsaved in memory and is saved again later. In both ca
 | Reason | Charging | Meaning |
 | --- | --- | --- |
 | `intelligent_charging` | yes | A planned block is running. |
-| `intelligent_top_up` | yes | A top-up block is running for a car that has its minimum. |
+| `intelligent_top_up` | yes | A car that has its minimum is charging further in a cheap hour. |
 | `intelligent_catch_up` | yes | A late or at-risk car is charging as early as possible. |
 | `intelligent_no_price_data` | yes | Charging without price data, as late as safely possible. |
 | `intelligent_waiting_for_planned_slot` | no | Waiting for the next planned block. |
@@ -753,7 +757,7 @@ The saving compares the plan with plugging in and charging straight away:
 - **Baseline**: each car charges continuously from its plug-in time at the expected
   power, one charger at a time in plug-in order, at the prices known at plug-in. The
   baseline energy is the energy delivered so far plus the remaining planned energy to
-  the minimum. Top-up energy and cost are left out on both sides.
+  the minimum. Energy and cost above the minimum are left out on both sides.
 - **Per deadline window**: the baseline of the first window starts at the plug-in (at
   most 25 hours before the deadline). A window opened by a deadline roll (a second night,
   or catch-up after the ready-by time), or after another mode already charged in the
@@ -900,7 +904,6 @@ Presets are recreated mainly as a setup/bootstrap asset set. Runtime control is 
 - `Charge with schedule`
 - `Schedule acceptable price`
 - `Intelligent charging`
-- `Intelligent top-up`
 
 ### Numbers
 
@@ -912,7 +915,6 @@ All numeric inputs use Home Assistant number entities with box input.
 - `Controller refresh interval`
 - `Mains current push interval`
 - `EV meter push interval`
-- `Intelligent top-up price`
 - `<Vehicle 1> minimum charge`, `<Vehicle 2> minimum charge`
 
 ### Selects
@@ -1087,7 +1089,7 @@ Both write SmartEVSE modes and will fight each other.
 - [`custom_components/smartevse_dual_charger/charge_model.py`](custom_components/smartevse_dual_charger/charge_model.py): Intelligent charging learned model (pure Python)
 - [`custom_components/smartevse_dual_charger/intelligent.py`](custom_components/smartevse_dual_charger/intelligent.py): Intelligent charging adapter: source entities, model storage, plan inputs, published plan
 - [`custom_components/smartevse_dual_charger/coordinator.py`](custom_components/smartevse_dual_charger/coordinator.py): refresh scheduling, push loops, immediate price/schedule refresh triggers
-- [`custom_components/smartevse_dual_charger/number.py`](custom_components/smartevse_dual_charger/number.py): runtime number entities, including the Intelligent minimum charge and top-up price
+- [`custom_components/smartevse_dual_charger/number.py`](custom_components/smartevse_dual_charger/number.py): runtime number entities, including the Intelligent minimum charge
 - [`custom_components/smartevse_dual_charger/select.py`](custom_components/smartevse_dual_charger/select.py): runtime charge policy select
 - [`custom_components/smartevse_dual_charger/sensor.py`](custom_components/smartevse_dual_charger/sensor.py): controller, SmartEVSE detail, session cost and Intelligent charging sensors
 - [`custom_components/smartevse_dual_charger/switch.py`](custom_components/smartevse_dual_charger/switch.py): force, schedule and Intelligent charging switches

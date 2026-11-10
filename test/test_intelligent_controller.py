@@ -392,10 +392,11 @@ class SettingsTests(TzTestCase):
             await c.async_set_vehicle_ready_by("vehicle_1", "25:61")
         with self.assertRaises(ValueError):
             await c.async_set_vehicle_minimum_charge("garage", 80)
-        with self.assertRaises(ValueError):
-            await c.async_set_intelligent_top_up_price(float("nan"))
+        # The top-up switch and price are gone since 0.0.10.0 (extra charging is automatic).
+        self.assertFalse(hasattr(c, "async_set_intelligent_top_up"))
+        self.assertFalse(hasattr(c, "async_set_intelligent_top_up_price"))
 
-    async def test_switch_and_top_up_setters_save_and_reset(self):
+    async def test_switch_setter_saves_and_resets(self):
         c = self.controller()
         c._mutable.update(smartevse_1_intelligent_committed_until=L(11, 10, 1, 15).isoformat(),
                           active_smartevse="smartevse_1", vehicle_1_last_soc=40.0)
@@ -411,11 +412,7 @@ class SettingsTests(TzTestCase):
         self.assertIsNone(c._mutable["smartevse_1_intelligent_committed_until"])
         self.assertEqual(c._mutable["smartevse_1_intelligent_plugged_at"], L(11, 9, 22).isoformat())
         self.assertIsNone(c._mutable["active_smartevse"])
-        await c.async_set_intelligent_top_up(True)
-        await c.async_set_intelligent_top_up_price(0.12345)
-        self.assertTrue(c._mutable["intelligent_top_up"])
-        self.assertEqual(c._mutable["intelligent_top_up_price"], 0.1235)
-        self.assertEqual(c._store.async_save.await_count, 5)
+        self.assertEqual(c._store.async_save.await_count, 3)
 
     async def test_initialisation_normalises_stored_settings(self):
         c = make_controller()
@@ -750,8 +747,7 @@ class CycleTests(TzTestCase):
     async def test_cycle_publishes_settings_payload_and_flat_sensor_values(self):
         c, harness = await self.plugged_xc40()
         data = await harness.cycle(L(11, 9, 18))
-        for key, value in {"intelligent_enabled": True, "intelligent_top_up": False,
-                           "intelligent_top_up_price": 0.1, "vehicle_1_ready_by": "07:00",
+        for key, value in {"intelligent_enabled": True, "vehicle_1_ready_by": "07:00",
                            "vehicle_2_ready_by": "07:00", "other_vehicle_ready_by": "07:00",
                            "vehicle_1_minimum_charge": 80, "vehicle_2_minimum_charge": 80,
                            "other_vehicle_minimum_charge": 80, "intelligent_status": "planned",
@@ -1084,10 +1080,12 @@ class ReviewRegressionTests(TzTestCase):
         self.assertEqual(c._mutable["smartevse_1_intelligent_deadline"], L(11, 11, 7).isoformat())
         c._async_post.assert_not_awaited()
 
-    async def test_reached_car_is_topped_up_in_cheap_known_hours(self):
-        # Review round 3: XC40 plugged in at its 80 % minimum (car limit 90 %), top-up on at
-        # 0.29 with 01:00-04:00 at 0.20. It used to be passed to the planner as "done".
-        c = make_controller(intelligent_enabled=True, intelligent_top_up=True, intelligent_top_up_price=0.29)
+    async def test_reached_car_keeps_charging_in_cheap_known_hours(self):
+        # XC40 plugged in at its 80 % minimum (car limit 90 %). The minimum is a floor:
+        # above it the car keeps charging in hours at or below the learned cheap price
+        # (0.29 here; 01:00-04:00 cost 0.20). No user switch or price since 0.0.10.0.
+        c = make_controller(intelligent_enabled=True)
+        c._intelligent.extra_price = MagicMock(return_value=0.29)
         put(c.states, XC40_BATTERY, 80.0, at=L(11, 9, 17, 54), unit_of_measurement="%")
         harness = Harness(c)
         await harness.cycle(L(11, 9, 17, 55))
@@ -1100,6 +1098,8 @@ class ReviewRegressionTests(TzTestCase):
         charger = data["intelligent"]["chargers"]["smartevse_1"]
         self.assertEqual(charger["status"], "reached")
         self.assertTrue(charger["top_up"])
+        self.assertEqual(charger["extra_soc"], 90.0)  # up to the car's own limit
+        self.assertEqual(data["intelligent"]["top_up"], {"enabled": True, "price": 0.29, "source": "learned"})
         self.assertTrue(all(block["top_up"] for block in charger["blocks"]))
         self.assertEqual(charger["blocks"][0]["start"], L(11, 10, 1).isoformat())
         c._async_post.reset_mock()

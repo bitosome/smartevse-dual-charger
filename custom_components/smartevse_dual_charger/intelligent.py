@@ -131,8 +131,6 @@ EMERGENCY_OVERHEAD = timedelta(minutes=10)
 # Unique-id keys of the Intelligent entities (§4): f"{entry_id}_{key}".
 ENTITY_KEYS: dict[str, Any] = {
     "intelligent_charge": ("switch", "intelligent_charge"),
-    "intelligent_top_up": ("switch", "intelligent_top_up"),
-    "intelligent_top_up_price": ("number", "intelligent_top_up_price"),
     "vehicle_1": {
         "ready_by": ("time", "vehicle_1_ready_by"),
         "minimum_charge": ("number", "vehicle_1_minimum_charge"),
@@ -398,7 +396,9 @@ def empty_payload(*, enabled: bool, overridden: bool = False,
         "household": {"learned_days": 0, "night_expected_kw": None},
         "slots": [],
         "sessions": [],
-        "top_up": {"enabled": bool(top_up_enabled), "price": top_up_price},
+        # Charging above the minimum in cheap hours. "price" is the learned limit; there
+        # is no user setting since 0.0.10.0.
+        "top_up": {"enabled": bool(top_up_enabled), "price": top_up_price, "source": "learned"},
         "entities": dict(entities) if entities is not None else build_entities(lambda _domain, _key: None),
     }
 
@@ -1212,6 +1212,11 @@ class IntelligentCharging:
             self._display_plan = plan
         return decision
 
+    def extra_price(self) -> float | None:
+        """The learned price limit for charging above the minimum, or None."""
+        reference = self.model.cheap_price_reference(default_time_zone())
+        return None if reference is None else float(reference.value)
+
     def _expected_prices(self, now: datetime, cars: Sequence[cp.CarRequest]) -> datetime | None:
         """When the first missing price should be published, or None when the plan must
         not wait for it.
@@ -1618,7 +1623,18 @@ class IntelligentCharging:
             "queue_after": order[position - 1] if position > 0 else None,
             "top_up": bool(car.top_up) if car is not None else False,
             "top_up_cost": None if hide_money or car is None else car.top_up_cost,
+            # Level the plan reaches with the extra charging in cheap hours (None when
+            # nothing extra is planned or the battery level is unknown).
+            "extra_soc": self._extra_soc(facts, car) if not unavailable else None,
         }
+
+    @staticmethod
+    def _extra_soc(facts: CarFacts, car: cp.CarPlan | None) -> float | None:
+        if car is None or not car.top_up or facts.soc is None or not facts.kwh_per_pct:
+            return None
+        base = max(float(facts.soc), float(car.projected_soc) if car.projected_soc is not None else float(facts.soc))
+        limit = float(facts.car_limit) if facts.car_limit is not None else 100.0
+        return round(min(limit, base + float(car.top_up_kwh or 0.0) / float(facts.kwh_per_pct)), 1)
 
     def _planned_savings(self, now: datetime, tz: tzinfo, plan: cp.Plan | None,
                          windows: Mapping[str, Mapping[str, Any]], ctx: PayloadContext) -> dict[str, dict[str, Any]]:

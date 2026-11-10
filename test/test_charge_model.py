@@ -1398,6 +1398,36 @@ class PriceForecastTests(unittest.TestCase):
     def observe(self, model, now, entries):
         return model.observe_cycle(now, TZ, outlets={}, prices=entries, price_currency="EUR")
 
+    def priced_days(self, days, level=lambda day, hour: 0.20 + 0.01 * hour):
+        """A state with ``days`` full local days of hourly prices ending 2026-11-09."""
+        state = cm.default_state()
+        for back in range(days):
+            day = datetime(2026, 11, 9 - back, tzinfo=TZ)
+            for hour in range(24):
+                start = day + timedelta(hours=hour)
+                bucket = state["prices"]["weekday"].setdefault(str(hour), [])
+                bucket.append([int(start.timestamp() // 60), level(back, hour)])
+        for bucket in state["prices"]["weekday"].values():
+            bucket.sort()
+        return state
+
+    def test_cheap_price_reference_is_the_usual_cost_of_a_days_cheap_hours(self):
+        # 0.0.10.0: the price limit for charging above the minimum is learned, not typed.
+        # Each day: hours cost 0.20, 0.21, ... so the six cheapest average 0.225.
+        model = cm.ChargeModel(self.priced_days(6))
+        self.assertEqual(model.cheap_price_reference(TZ), cm.Estimate(0.225, "learned"))
+        # Fewer than five days: no limit yet, so nothing is charged above the minimum.
+        self.assertIsNone(cm.ChargeModel(self.priced_days(4)).cheap_price_reference(TZ))
+        self.assertIsNone(cm.ChargeModel().cheap_price_reference(TZ))
+        # The median over the days: one very cheap and one very dear day do not move it.
+        odd = self.priced_days(7, level=lambda day, hour: (0.01 if day == 0 else 0.90 if day == 1 else 0.20) + 0.01 * hour)
+        self.assertEqual(cm.ChargeModel(odd).cheap_price_reference(TZ).value, 0.225)
+        # A day with fewer than 18 priced hours does not count.
+        thin = self.priced_days(5)
+        for hour in range(8):
+            thin["prices"]["weekday"][str(hour)].pop()
+        self.assertIsNone(cm.ChargeModel(thin).cheap_price_reference(TZ))
+
     def test_ingest_dedupes_by_start(self):
         model = cm.ChargeModel()
         events = self.observe(model, L(2026, 11, 9, 18, 30), known_entries())

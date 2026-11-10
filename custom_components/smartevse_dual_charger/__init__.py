@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import entity_registry as er
 
 from .const import (
     CONF_CHARGE_POLICY_DEFAULT,
@@ -86,6 +87,28 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     return True
 
 
+# Entities that earlier versions created and this one no longer has: the user's top-up
+# switch and price (0.0.9.x; charging above the minimum is automatic since 0.0.10.0)
+# and the unidentified-vehicle minimum (never released). Without this they would stay
+# in the registry as "unavailable".
+RETIRED_ENTITIES = (
+    ("switch", "intelligent_top_up"),
+    ("number", "intelligent_top_up_price"),
+    ("number", "other_vehicle_minimum_charge"),
+)
+
+
+def _remove_retired_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    try:
+        registry = er.async_get(hass)
+        for platform, key in RETIRED_ENTITIES:
+            entity_id = registry.async_get_entity_id(platform, DOMAIN, f"{entry.entry_id}_{key}")
+            if entity_id:
+                registry.async_remove(entity_id)
+    except Exception:  # noqa: BLE001 - tidying up must never block setup
+        LOGGER.exception("Unable to remove retired SmartEVSE entities")
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: SmartEVSEDualChargerConfigEntry) -> bool:
     """Set up SmartEVSE Dual Charger from a config entry."""
     entry_data = {**entry.data, "entry_id": entry.entry_id}
@@ -108,6 +131,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SmartEVSEDualChargerConf
         coordinator=coordinator,
     )
     await coordinator.async_config_entry_first_refresh()
+    _remove_retired_entities(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     # The first refresh ran before the platforms registered their entities, so its
     # payload has no Intelligent entity ids and the card would hide the feature

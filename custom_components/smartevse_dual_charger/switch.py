@@ -34,12 +34,6 @@ async def async_setup_entry(
                 "intelligent_charge",
                 controller.async_set_intelligent_enabled,
             ),
-            ControllerSwitchEntity(
-                entry,
-                "intelligent_top_up",
-                "intelligent_top_up",
-                controller.async_set_intelligent_top_up,
-            ),
         ]
     )
 

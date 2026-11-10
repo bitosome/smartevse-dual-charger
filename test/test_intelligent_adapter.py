@@ -303,6 +303,32 @@ class RegistryDerivationTests(TzMixin, unittest.IsolatedAsyncioTestCase):
             finally:
                 await hass.async_stop(force=True)
 
+    async def test_retired_entities_are_removed_from_the_registry(self):
+        # 0.0.10.0: the top-up switch and price are gone; upgrading must not leave them
+        # behind as "unavailable" entities.
+        import custom_components.smartevse_dual_charger as integration
+        with TemporaryDirectory() as directory:
+            hass = HomeAssistant(directory)
+            hass.state = CoreState.running
+            device_registry.async_setup(hass)
+            for registry in (floor_registry, area_registry, label_registry, device_registry, entity_registry):
+                await registry.async_load(hass)
+            try:
+                reg = entity_registry.async_get(hass)
+                old_switch = reg.async_get_or_create("switch", "smartevse_dual_charger", "test_entry_intelligent_top_up")
+                old_number = reg.async_get_or_create("number", "smartevse_dual_charger",
+                                                     "test_entry_intelligent_top_up_price")
+                kept = reg.async_get_or_create("switch", "smartevse_dual_charger", "test_entry_intelligent_charge")
+                other = reg.async_get_or_create("switch", "smartevse_dual_charger", "other_entry_intelligent_top_up")
+                integration._remove_retired_entities(hass, SimpleNamespace(entry_id="test_entry"))
+                self.assertIsNone(reg.async_get(old_switch.entity_id))
+                self.assertIsNone(reg.async_get(old_number.entity_id))
+                self.assertIsNotNone(reg.async_get(kept.entity_id))
+                self.assertIsNotNone(reg.async_get(other.entity_id))  # another entry's entity
+                integration._remove_retired_entities(hass, SimpleNamespace(entry_id="test_entry"))  # idempotent
+            finally:
+                await hass.async_stop(force=True)
+
     async def test_loaded_registry_resolves_renamed_volvo_and_own_entities_and_skips_disabled(self):
         with TemporaryDirectory() as directory:
             hass = HomeAssistant(directory)
@@ -376,8 +402,8 @@ class RegistryDerivationTests(TzMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entities["vehicle_2"], {"ready_by": "time.vehicle_2_ready_by",
                                                  "minimum_charge": "number.vehicle_2_minimum_charge"})
         self.assertEqual(entities["next_charge"], "sensor.intelligent_next_charge")
-        self.assertEqual(len(seen), 12)
-        self.assertEqual(len(set(key for _, key in seen)), 12)
+        self.assertEqual(len(seen), 10)
+        self.assertEqual(len(set(key for _, key in seen)), 10)
 
 
 class FactsTests(TzMixin, unittest.IsolatedAsyncioTestCase):
@@ -753,14 +779,14 @@ EXPECTED_CHARGER_KEYS = {
     "vehicle", "vehicle_name", "settings_key", "soc", "soc_source", "minimum", "target", "car_limit",
     "limited_by_car", "ready_by", "deadline", "status", "feasible", "estimated", "projected_soc", "need_kwh",
     "blocks", "next_start", "session_cost", "saving", "includes_forecast", "partial", "overrun",
-    "not_accepting", "car_timer", "queue_after", "top_up", "top_up_cost",
+    "not_accepting", "car_timer", "queue_after", "top_up", "top_up_cost", "extra_soc",
 }
 EXPECTED_VEHICLE_KEYS = {"name", "ready_by", "minimum", "suggested_ready_by", "usually_leaves",
                          "learned_sessions", "model"}
 EXPECTED_SLOT_KEYS = {"start", "end", "price", "kind", "smartevse_1_minutes", "smartevse_2_minutes", "expected_kw"}
 EXPECTED_SESSION_KEYS = {"ledger_id", "outlet", "vehicle_name", "closed", "energy_kwh", "cost", "baseline_cost",
                          "saving", "mixed", "partial"}
-EXPECTED_ENTITY_KEYS = {"intelligent_charge", "intelligent_top_up", "intelligent_top_up_price", "vehicle_1",
+EXPECTED_ENTITY_KEYS = {"intelligent_charge", "vehicle_1",
                         "vehicle_2", "other", "status", "planned_cost", "planned_saving", "next_charge"}
 
 
@@ -808,7 +834,7 @@ class PayloadTests(TzMixin, unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(payload["slots"]), 36)
         for slot in payload["slots"]:
             self.assertEqual(set(slot), EXPECTED_SLOT_KEYS)
-        self.assertEqual(set(payload["top_up"]), {"enabled", "price"})
+        self.assertEqual(set(payload["top_up"]), {"enabled", "price", "source"})
         self.assertEqual(set(payload["entities"]), EXPECTED_ENTITY_KEYS)
         self.assertEqual(set(payload["entities"]["other"]), {"ready_by"})
         self.assertEqual(set(flat), {"intelligent_status", "intelligent_planned_cost", "intelligent_planned_saving",

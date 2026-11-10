@@ -151,17 +151,6 @@ async def async_setup_entry(
                 device_class=NumberDeviceClass.DURATION,
                 mode=NumberMode.BOX,
             ),
-            ControllerNumberEntity(
-                entry,
-                data_key="intelligent_top_up_price",
-                translation_key="intelligent_top_up_price",
-                setter=controller.async_set_intelligent_top_up_price,
-                native_min_value=-1.0,
-                native_max_value=5.0,
-                native_step=0.001,
-                native_unit_of_measurement="EUR/kWh",
-                mode=NumberMode.BOX,
-            ),
             *(
                 _minimum_charge_entity(entry, controller, settings_key, vehicle_names)
                 # No minimum for an unidentified car: without a battery level it is planned

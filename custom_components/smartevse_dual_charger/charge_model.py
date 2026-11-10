@@ -237,6 +237,12 @@ DEPARTURE_HIDE_MINUTES = 15
 PRICE_BUCKET_LIMIT = 14
 PRICE_MIN_BUCKET = 3
 PRICE_ABS_MAX = 100.0
+# Charging above the minimum ("extra") is allowed in hours priced at or below what the
+# cheap hours of a day usually cost: per learned day the mean of its cheapest 6 hours,
+# then the median over the days. Needs 5 days with at least 18 priced hours.
+CHEAP_REFERENCE_HOURS = 6
+CHEAP_REFERENCE_MIN_DAYS = 5
+CHEAP_REFERENCE_MIN_HOURS = 18
 
 # §8.8 realised saving
 REALISED_LIMIT = 30
@@ -1162,6 +1168,25 @@ class ChargeModel:
         return (_aware(last_good["fetched_at"]), last_good["currency"],
                 [{"start": _from_min(s), "end": _from_min(e), "price": p}
                  for s, e, p in last_good["slots"]])
+
+    def cheap_price_reference(self, tz: tzinfo) -> Estimate | None:
+        """What the cheap hours of a day usually cost (see CHEAP_REFERENCE_*), or None
+        while fewer than 5 days of prices are known. Used as the price limit for
+        charging above the minimum; no user setting."""
+        days: dict[date, dict[int, float]] = {}
+        for hours in self._state["prices"].values():
+            for items in hours.values():
+                for start_min, price in items:
+                    local = _from_min(start_min).astimezone(tz)
+                    days.setdefault(local.date(), {})[local.hour] = price
+        cheap = []
+        for day in sorted(days)[-PRICE_BUCKET_LIMIT:]:
+            prices = sorted(days[day].values())
+            if len(prices) >= CHEAP_REFERENCE_MIN_HOURS:
+                cheap.append(sum(prices[:CHEAP_REFERENCE_HOURS]) / CHEAP_REFERENCE_HOURS)
+        if len(cheap) < CHEAP_REFERENCE_MIN_DAYS:
+            return None
+        return Estimate(round(_median(cheap), 4), SOURCE_LEARNED)
 
     def price_forecast(self, at: datetime, tz: tzinfo) -> tuple[float | None, str]:
         """§8.7: bucket median (n >= 3), else the same local hour on the most recent known day."""

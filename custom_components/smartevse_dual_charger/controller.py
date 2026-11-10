@@ -627,19 +627,6 @@ class SmartEVSEDualChargerController:
             self._reset_charge_cycle(preserve_previous_active=True)
         await self._async_save_state()
 
-    async def async_set_intelligent_top_up(self, value: bool) -> None:
-        """Enable or disable Intelligent top-up above the minimum when prices are low."""
-        self._mutable["intelligent_top_up"] = bool(value)
-        await self._async_save_state()
-
-    async def async_set_intelligent_top_up_price(self, value: float) -> None:
-        """Update the top-up price threshold (currency/kWh)."""
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("Top-up price must be a finite number")
-        self._mutable["intelligent_top_up_price"] = round(number, 4)
-        await self._async_save_state()
-
     async def async_set_vehicle_ready_by(self, key: str, value: Any) -> None:
         """Set a ready-by time ("HH:MM" or datetime.time) for vehicle_1, vehicle_2 or other."""
         if key not in INTELLIGENT_SETTINGS_KEYS:
@@ -980,8 +967,6 @@ class SmartEVSEDualChargerController:
             "smartevse_2_session_complete": bool(self._mutable["smartevse_2_session_complete"]),
             # Intelligent charging settings and results (entity data keys, §4/§10).
             "intelligent_enabled": bool(self._mutable.get("intelligent_enabled")),
-            "intelligent_top_up": bool(self._mutable.get("intelligent_top_up")),
-            "intelligent_top_up_price": self._intelligent_top_up_price_value(),
             "vehicle_1_ready_by": normalize_ready_by(self._mutable.get("vehicle_1_ready_by")),
             "vehicle_2_ready_by": normalize_ready_by(self._mutable.get("vehicle_2_ready_by")),
             "other_vehicle_ready_by": normalize_ready_by(self._mutable.get("other_vehicle_ready_by")),
@@ -1546,11 +1531,17 @@ class SmartEVSEDualChargerController:
             result[vehicle_key] = (soc, self._parse_datetime(self._mutable.get(f"{vehicle_key}_last_soc_at")))
         return result
 
-    def _intelligent_top_up_price_value(self) -> float | None:
-        price = self._mutable.get("intelligent_top_up_price")
-        if isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price):
+    def _intelligent_extra_price(self) -> float | None:
+        """Price limit for charging above the minimum: what the cheap hours of a day
+        usually cost, learned from the price lists (0.0.10.0; replaces the user's
+        top-up switch and price). None until enough days are known."""
+        intelligent = getattr(self, "_intelligent", None)
+        if intelligent is None:
             return None
-        return float(price)
+        try:
+            return intelligent.extra_price()
+        except Exception:  # noqa: BLE001 - extra charging is optional
+            return None
 
     def _intelligent_not_accepting_active(self, smartevse_key: str, now: datetime) -> bool:
         if int(self._mutable.get(f"{smartevse_key}_intelligent_probes") or 0) >= INTELLIGENT_MAX_PROBES:
@@ -1638,7 +1629,7 @@ class SmartEVSEDualChargerController:
                     now,
                     self._intelligent_plan_inputs(now=now, statuses=statuses, facts=observed.facts),
                     commitment=self._intelligent_commitment(now),
-                    top_up_price=self._intelligent_top_up_price_value() if self._mutable.get("intelligent_top_up") else None,
+                    top_up_price=self._intelligent_extra_price(),
                     seed=self._intelligent_seed_decision(now, statuses) if intelligent.last_decision is None else None,
                 )
             else:
@@ -1932,8 +1923,8 @@ class SmartEVSEDualChargerController:
         """The ``intelligent`` payload and flat sensor values (never raises)."""
         enabled = bool(self._mutable.get("intelligent_enabled"))
         settings = self._intelligent_settings()
-        top_up_enabled = bool(self._mutable.get("intelligent_top_up"))
-        top_up_price = self._intelligent_top_up_price_value()
+        top_up_price = self._intelligent_extra_price()
+        top_up_enabled = top_up_price is not None
         intelligent = getattr(self, "_intelligent", None)
         overridden = enabled and not governing
         if intelligent is not None:
