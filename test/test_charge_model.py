@@ -666,6 +666,65 @@ class HouseholdLoadTests(unittest.TestCase):
         # Refreshes happen on unit boundaries only.
         self.assertEqual(model._recent_snapshot[0], L(2026, 11, 9, 21, 0, 3))
 
+    def test_day_classes_are_pooled_until_each_has_three_values(self):
+        # Review 6: with separate weekday/weekend buckets the night was "learned" only
+        # on night 6. Two weekday nights and one weekend night now count together.
+        state = stored_with(household={"buckets": {"weekday": {"2": [[2.0, 3.0], [2.2, 3.1]]},
+                                                   "weekend": {"2": [[1.8, 2.9]]}}, "days": []})
+        model = cm.ChargeModel(state)
+        for at in (L(2026, 11, 10, 2), L(2026, 11, 14, 2)):  # Tuesday, Saturday
+            base = model.base_load(at, TZ)
+            self.assertEqual((base.expected_a, base.source), (2.0, "learned"))
+        # Its own class wins once it has three values.
+        state["household"]["buckets"]["weekday"]["2"].append([4.0, 5.0])
+        self.assertEqual(cm.ChargeModel(state).base_load(L(2026, 11, 10, 2), TZ).expected_a, 2.2)
+        # Two values in all are still not enough.
+        thin = stored_with(household={"buckets": {"weekday": {"2": [[2.0, 3.0]]}, "weekend": {"2": [[1.8, 2.9]]}},
+                                      "days": []})
+        self.assertEqual(cm.ChargeModel(thin).base_load(L(2026, 11, 10, 2), TZ), cm.BaseLoad(3.0, 5.0, "default"))
+
+    def test_unusual_evening_raises_later_learned_hours(self):
+        # Review 6: after quiet learned nights, a night where the house draws 4 A more
+        # than usual kept the quiet values for hours more than two ahead.
+        model = cm.ChargeModel(stored_with(household=household_state(2.0, 3.0)))
+        self.assertEqual(model.base_load(L(2026, 11, 10, 2), TZ).expected_a, 2.0)
+        t = L(2026, 11, 9, 20)
+        while t <= L(2026, 11, 9, 21):
+            model.observe_cycle(t, TZ, outlets={}, mains_phase_currents=(6.0, 6.0, 6.0))
+            t += timedelta(seconds=60)
+        later = model.base_load(L(2026, 11, 10, 2), TZ)
+        self.assertEqual((later.expected_a, later.source), (6.0, "learned"))  # 2.0 + (6.0 - 2.0)
+        self.assertGreaterEqual(later.conservative_a, 7.0)
+        # A usual evening changes nothing later; the bounds still cap the raise.
+        usual = cm.ChargeModel(stored_with(household=household_state(2.0, 3.0)))
+        t = L(2026, 11, 9, 20)
+        while t <= L(2026, 11, 9, 21):
+            usual.observe_cycle(t, TZ, outlets={}, mains_phase_currents=(2.4, 2.4, 2.4))
+            t += timedelta(seconds=60)
+        self.assertEqual(usual.base_load(L(2026, 11, 10, 2), TZ), cm.BaseLoad(2.0, 3.0, "learned"))
+        heavy = cm.ChargeModel(stored_with(household=household_state(2.0, 3.0)))
+        t = L(2026, 11, 9, 20)
+        while t <= L(2026, 11, 9, 21):
+            heavy.observe_cycle(t, TZ, outlets={}, mains_phase_currents=(14.0, 14.0, 14.0))
+            t += timedelta(seconds=60)
+        capped = heavy.base_load(L(2026, 11, 10, 2), TZ)
+        self.assertEqual((capped.expected_a, capped.conservative_a), (8.0, 9.0))
+
+    def test_household_floor_expires_without_fresh_readings(self):
+        # Review 6: one busy hour kept lowering the plan for hours after the mains
+        # readings stopped.
+        model = cm.ChargeModel()
+        t = L(2026, 11, 9, 18)
+        while t <= L(2026, 11, 9, 19):
+            model.observe_cycle(t, TZ, outlets={}, mains_phase_currents=(7.5, 7.5, 7.5))
+            t += timedelta(seconds=60)
+        self.assertEqual(model.base_load(L(2026, 11, 10, 3), TZ).expected_a, 7.5)
+        while t <= L(2026, 11, 9, 20):
+            model.observe_cycle(t, TZ, outlets={}, mains_phase_currents=None)
+            t += timedelta(seconds=60)
+        self.assertIsNone(model.recent_base())
+        self.assertEqual(model.base_load(L(2026, 11, 10, 3), TZ), cm.BaseLoad(3.0, 5.0, "default"))
+
     def test_household_summary(self):
         model = cm.ChargeModel(stored_with(household=household_state(2.1, 3.8, days=3)))
         summary = model.household_summary(L(2026, 11, 9, 18), TZ)
@@ -822,6 +881,47 @@ class PowerTests(unittest.TestCase):
         # Windows stamped after ``now`` (a clock step back) are ignored.
         windows((8.0, True), (8.0, True))
         self.assertIsNone(model.session_current_cap("smartevse_1", "vehicle_1", t0 - timedelta(minutes=1)))
+
+    def test_what_a_car_accepted_is_remembered_for_the_next_sessions(self):
+        # Review 6: nothing persistent was learned from a car that draws less than it is
+        # offered, so every night started with the nominal plan. The low quartile of
+        # the last sessions is now the conservative current from plug-in on.
+        sim = Sim(L(2026, 11, 9, 1, 0), step=10)
+        sim.outlets["smartevse_2"]["offered_current"] = 13.5
+        self.night(sim, 41, kw=5.64, phases=(8.0, 8.0, 8.0))
+        sim.stop("smartevse_2")
+        sim.unplug("smartevse_2")
+        sim.advance(60)
+        stored = sim.model.to_dict()
+        self.assertEqual(stored["power"]["session_caps"]["vehicle_2"], [8.0])
+        fresh = cm.ChargeModel(stored)
+        nominal = fresh.car_power("vehicle_2")
+        self.assertEqual(nominal.current_cap_a, 15.2)  # the expected plan stays nominal
+        self.assertAlmostEqual(nominal.cap_low_kw, 3 * fresh.kw_per_phase_amp().value * 8.0 * 0.95, places=2)
+        self.assertEqual(fresh.car_power("vehicle_1").cap_low_kw, round(fresh.car_power("vehicle_1").cap_kw * 0.95, 3))
+        # Tonight the car takes more again: after its first window that counts instead.
+        warm = Sim(L(2026, 11, 10, 1, 0), model=fresh, step=10)
+        warm.outlets["smartevse_2"]["offered_current"] = 13.5
+        self.night(warm, 16, kw=8.95, phases=(12.7, 12.7, 12.7))
+        shown = fresh.car_power("vehicle_2", outlet="smartevse_2", now=warm.now)
+        self.assertAlmostEqual(shown.cap_low_kw, 3 * fresh.kw_per_phase_amp().value * 12.7 * 0.95, places=1)
+        # Normal sessions record the nominal limit, so one cold night ages out.
+        state = cm.default_state()
+        state["power"]["session_caps"]["vehicle_2"] = [8.0, 15.2, 15.2, 15.2, 15.2, 15.2, 15.2]
+        self.assertEqual(cm.ChargeModel(state).car_power("vehicle_2").cap_low_kw,
+                         round(cm.ChargeModel(state).car_power("vehicle_2").cap_kw * 0.95, 3))
+        # Invalid stored values reset only that list.
+        state["power"]["session_caps"]["vehicle_2"] = [8.0, "x"]
+        self.assertEqual(cm.ChargeModel(state).to_dict()["power"]["session_caps"]["vehicle_2"], [])
+
+    def test_a_charger_offering_less_is_not_the_cars_limit(self):
+        # Review 6: the car-limited test compared with the predicted setpoint (13.5 A),
+        # so a car taking all of a 10 A offer was filed as car-limited.
+        sim = Sim(L(2026, 11, 9, 1, 0), step=10)
+        sim.outlets["smartevse_2"]["offered_current"] = 10.0
+        self.night(sim, 41, kw=7.05, phases=(10.0, 10.0, 10.0))
+        self.assertIsNone(sim.model.session_current_cap("smartevse_2", "vehicle_2", sim.now))
+        self.assertEqual(sim.model.car_power("vehicle_2", outlet="smartevse_2", now=sim.now).source, "default")
 
     def test_remap_drops_the_session_cap(self):
         sim = Sim(L(2026, 11, 9, 1, 0), step=10)

@@ -737,27 +737,42 @@ class _Pass:
             _set_needs(car, start_blocks.get(car.outlet, 1))
         self.by_outlet = {car.outlet: car for car in self.cars}
         self.commit_car = self.by_outlet.get(ctx.commit_outlet) if ctx.commit_outlet else None
-        # Units are measured at the fastest car's power. A slower car's needs are
-        # scaled up by (fastest cap / its cap), so it gets the minutes it really needs
-        # and never shrinks another car's planned power. Where the unit's own power is
-        # below the fastest cap the scaling over-reserves the slower car (safe).
-        # Outputs (segment kWh, _simulate, _latest_start) use the car's own power.
+        # Units are measured at the fastest EFFECTIVE power: each car's cap clamped to
+        # the best unit power it can get before its deadline (on a 16 A feeder a unit
+        # gives less than the cars' nominal caps, so nominal caps would over-reserve
+        # the slower car). A slower car's needs are scaled up by (fastest / its own),
+        # so it gets the minutes it really needs and never shrinks another car's
+        # planned power. A car that only has a top-up need counts only when top-up is
+        # configured. Outputs (segment kWh, _simulate, _latest_start) use the car's
+        # own power.
+        top_up_on = _finite(ctx.config.top_up_price) is not None and not ctx.no_price
+
+        def best(car: _Car, attr: str) -> float:
+            own = [getattr(unit, attr) for unit in self.units if unit.end <= car.deadline]
+            values = [value for value in (own or [getattr(unit, attr) for unit in self.units])
+                      if value is not None and math.isfinite(value) and value > 0]
+            return max(values, default=math.inf)
+
         need_cars = [car for car in self.cars
-                     if (car.e_e > _EPS or car.top_need > _EPS) and car.cap > 0]
-        self.k_e = max((car.cap for car in need_cars), default=math.inf)
-        self.k_c = max((car.cap_low for car in need_cars), default=math.inf)
+                     if (car.e_e > _EPS or (top_up_on and car.top_need > _EPS)) and car.cap > 0]
+        eff_e = {car.outlet: min(car.cap, best(car, "kw_e")) for car in need_cars}
+        eff_c = {car.outlet: min(car.cap_low, best(car, "kw_c"), eff_e[car.outlet]) for car in need_cars}
+        self.k_e = max((value for value in eff_e.values() if value > 0), default=math.inf)
+        self.k_c = max((value for value in eff_c.values() if value > 0), default=math.inf)
         for car in self.cars:
             car.scale_e = car.scale_c = 1.0
-            if car in need_cars and math.isfinite(self.k_e):
-                car.scale_e = self.k_e / car.cap if car.cap < self.k_e else 1.0
-                if car.cap_low > 0 and car.cap_low < self.k_c:
-                    car.scale_c = self.k_c / car.cap_low
-                car.e_e *= car.scale_e
-                car.e_v *= car.scale_e
-                car.top_need *= car.scale_e
-                car.e_c *= car.scale_c
-                car.rem_e = car.e_e
-                car.rem_c = car.e_c
+        for car in need_cars:
+            own_e, own_c = eff_e[car.outlet], eff_c[car.outlet]
+            if math.isfinite(self.k_e) and 0 < own_e < self.k_e:
+                car.scale_e = self.k_e / own_e
+            if math.isfinite(self.k_c) and 0 < own_c < self.k_c:
+                car.scale_c = self.k_c / own_c
+            car.e_e *= car.scale_e
+            car.e_v *= car.scale_e
+            car.top_need *= car.scale_e
+            car.e_c *= car.scale_c
+            car.rem_e = car.e_e
+            car.rem_c = car.e_c
         self.residual = [unit.minutes for unit in self.units]
         self.allocs = [[] for _ in self.units]
         self.reserved = set()
@@ -1173,7 +1188,8 @@ class _Pass:
                         )
                         if alloc is None or alloc.energy < energy - _EPS:
                             continue
-                        extra = gain_cost - self.units[edge].rank * energy
+                        # Energies are in the scaled metric; the money is the car's own kWh.
+                        extra = (gain_cost - self.units[edge].rank * energy) / car.scale_e
                         if extra <= START_PENALTY_EUR + 1e-12 and (best is None or extra < best[0] - 1e-12):
                             best = (extra, edge, alloc)
                 if best is None:
@@ -1355,7 +1371,7 @@ class _Pass:
             placement = self._walk(car, edge, 1 if side == "after" else -1, energy, freed, moving_ids)
             if placement is None:
                 continue
-            extra = sum(self.units[i].rank * e for i, e in placement) - old_cost
+            extra = (sum(self.units[i].rank * e for i, e in placement) - old_cost) / car.scale_e
             if extra <= START_PENALTY_EUR + 1e-12 and (best is None or extra < best[0] - 1e-12):
                 best = (extra, placement)
         if best is None:

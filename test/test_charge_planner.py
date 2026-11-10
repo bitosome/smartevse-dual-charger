@@ -457,9 +457,15 @@ class OptimalityTests(unittest.TestCase):
                        for r in requests):
                     continue
                 checked += 1
-                # Units are measured at the fastest car's power; a slower car's need is
-                # scaled by (fastest cap / its cap) (review round 4).
-                cap_k = max(r.cap_kw for r in requests)
+                # Units are measured at the fastest effective power (cap clamped to the
+                # best unit power before the car's deadline); a slower car's need is
+                # scaled by (fastest / its own) (review rounds 4 and 6).
+                def effective(r):
+                    reach = [pw.expected_kw for pw in powers
+                             if max(pw.start, m.floor15(now)) + Q <= m._utc(r.deadline) and pw.end > m.floor15(now)]
+                    return min(r.cap_kw, max(reach or [pw.expected_kw for pw in powers]))
+
+                cap_k = max(effective(r) for r in requests)
                 units, caps, costs = [], [], []
                 start = m.floor15(now)
                 while start + Q <= max(r.deadline for r in requests):
@@ -475,7 +481,7 @@ class OptimalityTests(unittest.TestCase):
                 needs = []
                 for r in requests:
                     planned = sum(metric(seg) for seg in segs(p, r.outlet, top_up=False))
-                    scale = cap_k / r.cap_kw
+                    scale = cap_k / effective(r)
                     self.assertAlmostEqual(planned, p.car(r.outlet).need_expected_kwh * scale, delta=2e-3 * scale)
                     needs.append((m._utc(r.deadline), planned))
                 exact = min_cost_flow(caps, costs, units, needs)
@@ -934,6 +940,42 @@ class MixedCarPowerTests(unittest.TestCase):
         self.assertGreaterEqual(kwh, both.car('smartevse_1').need_expected_kwh - 1e-3)
         self.assertTrue(all(seg.energy_kwh <= seg.minutes * 5.64 / 60 + 1e-9
                             for seg in segs(both, 'smartevse_1')))
+
+
+class EffectivePowerTests(unittest.TestCase):
+    """Review 6: units were scaled by nominal caps. On a 16 A feeder every unit gives
+    less than the fastest cap, so the slower car was over-reserved and shown late."""
+
+    def setUp(self):
+        self.now = L(11, 9, 18)
+        self.powers = [m.PowerSlot(self.now + k * H, self.now + (k + 1) * H, 6.7, 6.0) for k in range(8)]
+        self.prices = hourly(self.now, [0.30] * 8)
+
+    def request(self, base, kwh, deadline, cap, **extra):
+        return car(base, 50, 50 + kwh / 0.5, deadline, kwh_per_pct=0.5, kwh_per_pct_conservative=0.5, cap_kw=cap,
+                   cap_low_kw=cap * 0.95, car_limit=100.0, **extra)
+
+    def minutes(self, p, outlet):
+        return sum(seg.minutes for seg in segs(p, outlet, top_up=False))
+
+    def test_both_cars_are_planned_at_the_power_the_house_leaves(self):
+        dl = self.now + 7 * H
+        fast, slow = self.request(XC40, 20, dl, 10.7), self.request(EX30, 20, dl, 8.0)
+        both = m.build_plan(self.now, self.prices, self.powers, [fast, slow])
+        for outlet, alone in (("smartevse_1", fast), ("smartevse_2", slow)):
+            single = m.build_plan(self.now, self.prices, self.powers, [alone])
+            self.assertFalse(both.car(outlet).late, outlet)
+            self.assertAlmostEqual(self.minutes(both, outlet), self.minutes(single, outlet), delta=6.0)
+
+    def test_an_idle_car_at_its_minimum_does_not_change_the_other_cars_plan(self):
+        dl = self.now + 7 * H
+        busy = self.request(EX30, 19, dl, 7.4)
+        idle = car(XC40, 85, 80, dl, cap_kw=10.7, cap_low_kw=10.2, car_limit=100.0, reached=True)
+        alone = m.build_plan(self.now, self.prices, self.powers, [busy])
+        with_idle = m.build_plan(self.now, self.prices, self.powers, [idle, busy])
+        self.assertEqual(with_idle.car("smartevse_2").late, alone.car("smartevse_2").late)
+        self.assertAlmostEqual(self.minutes(with_idle, "smartevse_2"), self.minutes(alone, "smartevse_2"), delta=1.0)
+        self.assertEqual(with_idle.car("smartevse_2").status, alone.car("smartevse_2").status)
 
 
 class TopUpTests(unittest.TestCase):

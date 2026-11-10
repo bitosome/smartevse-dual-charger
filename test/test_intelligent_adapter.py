@@ -571,6 +571,49 @@ class PlanTests(TzMixin, unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual([(b.start, b.end) for b in replanned],
                             [(b.start, b.end) for b in plan.car("smartevse_1").blocks])
 
+    def test_only_cars_that_need_charge_make_the_plan_wait_for_prices(self):
+        # Review 6: a car sitting at its minimum with a ready-by tomorrow made the other
+        # car, whose own hours all have prices, avoid its cheapest hours before 15:00.
+        price_states(self.states, tomorrow=False)
+        now = L(11, 9, 9)
+
+        def request(outlet, soc, target, deadline, **extra):
+            fields = dict(outlet=outlet, vehicle="vehicle_1", settings_key="vehicle_1", name="x", soc=soc,
+                          soc_source="vehicle", target_soc=target, car_limit=100.0, deadline=deadline,
+                          kwh_per_pct=0.75, kwh_per_pct_conservative=0.8, cap_kw=10.7, cap_low_kw=10.2,
+                          budget_kwh=None, done=False, overrun=False, drawing=False, priority=0)
+            fields.update(extra)
+            return intel.cp.CarRequest(**fields)
+
+        self.plan_xc40(now=now)  # reads the price lists
+        needs_tonight = request("smartevse_1", 40.0, 80.0, L(11, 9, 18))
+        needs_tomorrow = request("smartevse_2", 40.0, 80.0, L(11, 10, 7))
+        idle = request("smartevse_2", 85.0, 80.0, L(11, 10, 7), reached=True)
+        expected = self.adapter._expected_prices
+        self.assertEqual(expected(now, [needs_tomorrow]), L(11, 9, 15))
+        self.assertIsNone(expected(now, [needs_tonight]))            # its window is fully priced
+        self.assertIsNone(expected(now, [needs_tonight, idle]))      # the idle car does not count
+        self.assertIsNone(expected(now, [needs_tonight, needs_tomorrow]))  # nobody waits
+        self.assertIsNone(expected(now, [idle]))
+        self.assertIsNone(expected(now, [request("smartevse_2", 40.0, 80.0, L(11, 10, 7), excluded=True)]))
+        self.assertIsNone(expected(L(11, 9, 15, 1), [needs_tomorrow]))  # late: no waiting
+
+    def test_the_midnight_hour_belongs_to_the_previous_days_list(self):
+        # Day-ahead lists run 01:00 -> 01:00. A missing 00:00-01:00 hour is not in the
+        # list published this afternoon, so the plan must not wait for it.
+        price_states(self.states, tomorrow=True)
+        self.plan_xc40(now=L(11, 9, 10))
+        slots = self.adapter._price_slots
+        hour = L(11, 10, 0)
+        self.adapter._price_slots = [intel.cp.PriceSlot(s.start, s.end, None, "unknown") if s.start == hour else s
+                                     for s in slots]
+        car = intel.cp.CarRequest(outlet="smartevse_1", vehicle="vehicle_1", settings_key="vehicle_1", name="x",
+                                  soc=40.0, soc_source="vehicle", target_soc=80.0, car_limit=100.0,
+                                  deadline=L(11, 10, 7), kwh_per_pct=0.75, kwh_per_pct_conservative=0.8,
+                                  cap_kw=10.7, cap_low_kw=10.2, budget_kwh=None, done=False, overrun=False,
+                                  drawing=False, priority=0)
+        self.assertIsNone(self.adapter._expected_prices(L(11, 9, 10), [car]))
+
     def test_late_prices_are_not_waited_for(self):
         # After 15:00 the missing prices are late: no waiting, unpriced hours last.
         price_states(self.states, tomorrow=False)

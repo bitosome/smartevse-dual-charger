@@ -1185,7 +1185,7 @@ class IntelligentCharging:
         commit = None
         if commitment is not None and commitment[1] > now:
             commit = cp.Commitment(commitment[0], commitment[1])
-        self._prices_expected_at = self._expected_prices(now, horizon)
+        self._prices_expected_at = self._expected_prices(now, cars)
         config = cp.PlannerConfig(top_up_price=top_up_price, prices_expected_at=self._prices_expected_at)
         plan = None
         failed = False
@@ -1212,18 +1212,34 @@ class IntelligentCharging:
             self._display_plan = plan
         return decision
 
-    def _expected_prices(self, now: datetime, horizon: datetime) -> datetime | None:
-        """When the first missing price before ``horizon`` should be published: 15:00
-        local on the day before that hour. None when every hour is priced or that time
-        has passed (the prices are late: plan around them, do not wait)."""
+    def _expected_prices(self, now: datetime, cars: Sequence[cp.CarRequest]) -> datetime | None:
+        """When the first missing price should be published, or None when the plan must
+        not wait for it.
+
+        Only cars that still need their minimum count (a car that is done, reached or
+        left out by policy never makes another car wait). If any of them has a fully
+        priced window (its ready-by is not after the first missing hour), nothing
+        waits: its cheapest hours may well be before the publication. Day-ahead lists
+        run 01:00 -> 01:00 local and arrive by 15:00 the day before they start; when
+        that time has passed the prices are late and the plan no longer waits.
+        """
         tz = default_time_zone()
+        deadlines = [cp._utc(car.deadline) for car in cars
+                     if not (car.excluded or car.done or car.reached)
+                     and (car.soc is None or car.soc < car.target_soc)]
+        if not deadlines:
+            return None
+        horizon = max(deadlines)
         missing = [s.start for s in self._price_slots if s.kind != cp.PRICE_KNOWN and s.start < horizon]
         covered = max((s.end for s in self._price_slots), default=None)
         if covered is None or covered < horizon:
             missing.append(covered or now)
         if not missing:
             return None
-        day = min(missing).astimezone(tz).date() - timedelta(days=1)
+        first = min(missing)
+        if min(deadlines) <= first:
+            return None
+        day = (first - timedelta(hours=1)).astimezone(tz).date() - timedelta(days=1)
         expected = datetime.combine(day, PRICE_PUBLICATION_LOCAL, tzinfo=tz).astimezone(UTC)
         return expected if expected > now else None
 

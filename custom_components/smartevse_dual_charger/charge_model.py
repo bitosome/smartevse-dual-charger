@@ -137,6 +137,7 @@ HOUSEHOLD_RECENT_MAX_CONSERVATIVE_A = 9.0
 # (UTC grid, as the planner) and in 0.5 A steps rounded up, so a spiky house does not
 # change the power slots (and the payload) in the middle of a unit.
 HOUSEHOLD_RECENT_REFRESH = timedelta(minutes=15)
+HOUSEHOLD_RECENT_MAX_AGE = timedelta(minutes=45)  # older than this, the floor is not used
 HOUSEHOLD_RECENT_STEP_A = 0.5
 DEFAULT_BASE_EXPECTED_A = 3.0
 DEFAULT_BASE_CONSERVATIVE_A = 5.0
@@ -180,6 +181,12 @@ CALIBRATION_CAR_LIMITED_A = 2.0  # car drew this much below its offer: not a cal
 SESSION_CAP_WINDOWS = 6
 SESSION_CAP_MIN_LIMITED = 2
 SESSION_CAP_LIFT_A = 1.0
+# What each car accepted in its last plug sessions (amps; a normal session records
+# the car's nominal limit). The low quartile is the car's conservative current from plug-in on, so the
+# safety reserve already covers a cold battery before the first block shows it.
+SESSION_HISTORY_LIMIT = 7
+SESSION_HISTORY_QUANTILE = 0.25
+SESSION_HISTORY_MIN_WINDOWS = 2
 POWER_WINDOW_SECONDS = 300
 POWER_WINDOW_MIN_SAMPLES = 3
 POWER_MIN_KW = 1.5
@@ -583,7 +590,8 @@ def default_state() -> dict[str, Any]:
         "schema": SCHEMA_VERSION,
         "household": {"buckets": {dc: {} for dc in DAY_CLASSES}, "days": []},
         "power": {"kw_per_phase_amp": [], "calibration": [],
-                  "car_cap": {vehicle: [] for vehicle in VEHICLES}},
+                  "car_cap": {vehicle: [] for vehicle in VEHICLES},
+                  "session_caps": {vehicle: [] for vehicle in VEHICLES}},
         "energy": {vehicle: [] for vehicle in VEHICLES},
         "budget": {vehicle: [] for vehicle in VEHICLES},
         "departures": {vehicle: {dc: [] for dc in DAY_CLASSES} for vehicle in VEHICLES},
@@ -776,6 +784,17 @@ def load_state(data: Any) -> tuple[dict[str, Any], list[str]]:
             take(f"power.car_cap.{vehicle}", value,
                  _list_of(value, CAR_CAP_LIMIT, lambda x: _strict(x, *CAR_CAP_BOUNDS)),
                  lambda v, vehicle=vehicle: state["power"]["car_cap"].__setitem__(vehicle, v))
+
+    history = power.get("session_caps")
+    if "session_caps" in power and not isinstance(history, dict):
+        issues.append("power.session_caps")
+        history = {}
+    for vehicle in VEHICLES:
+        if isinstance(history, dict) and vehicle in history:
+            value = history[vehicle]
+            take(f"power.session_caps.{vehicle}", value,
+                 _list_of(value, SESSION_HISTORY_LIMIT, lambda x: _strict(x, *CAR_CAP_BOUNDS)),
+                 lambda v, vehicle=vehicle: state["power"]["session_caps"].__setitem__(vehicle, v))
 
     energy = section("energy")
     for vehicle in VEHICLES:
@@ -1294,7 +1313,7 @@ class ChargeModel:
         return {"plugged_at": plugged_at, "observed": observed, "vehicle": None,
                 "remapped": False, "last_available_at": None, "energy": None,
                 "anchor": None, "soc_prev": None, "kwh": None, "cap_samples": [],
-                "power_windows": []}
+                "power_windows": [], "windows": 0, "peak": None}
 
     def _observe_sessions(self, now: datetime, tz: tzinfo, outlets: dict[str, dict[str, Any]],
                           soc_map: dict[str, SocReading], capacities: dict[str, float | None],
@@ -1404,6 +1423,7 @@ class ChargeModel:
                     break
         session["cap_samples"] = []
         session["power_windows"] = []
+        session["windows"], session["peak"] = 0, None
         if removed:
             self._dirty = True
         if self._run is not None and self._run["outlet"] == outlet:
@@ -1434,6 +1454,7 @@ class ChargeModel:
                 items.append(round(ratio, 4))
                 del items[:-KWH_LIMIT]
                 self._commit("kwh_sample")
+        self._record_session_cap(outlet, session)
         vehicle = session["vehicle"]
         plugged = session["plugged_at"]
         seen = session["last_available_at"]
@@ -1447,6 +1468,24 @@ class ChargeModel:
             self._pending_departures.append({
                 "outlet": outlet, "vehicle": vehicle, "day_class": self.day_class(local.date()),
                 "minute": minute, "unplug_at": now, "reconnects": {}, "discarded": False})
+
+    def _record_session_cap(self, outlet: str, session: dict[str, Any]) -> None:
+        """At unplug: what this car accepted in the session: its limited current, or its
+        nominal limit when it took what it was offered (a low offer is the house's
+        doing, not the car's)."""
+        vehicle = session.get("vehicle")
+        if vehicle not in VEHICLES or session.get("remapped"):
+            return
+        if session.get("windows", 0) < SESSION_HISTORY_MIN_WINDOWS:
+            return
+        limited = self.session_current_cap(outlet, vehicle)
+        value = limited if limited is not None else self.car_current_cap(vehicle).value
+        if value is None or not CAR_CAP_BOUNDS[0] <= value <= CAR_CAP_BOUNDS[1]:
+            return
+        items = self._state["power"]["session_caps"][vehicle]
+        items.append(round(value, 3))
+        del items[:-SESSION_HISTORY_LIMIT]
+        self._commit("session_cap")
 
     def _confirm_departures(self, now: datetime, outlets: dict[str, dict[str, Any]]) -> None:
         for pending in list(self._pending_departures):
@@ -1594,12 +1633,16 @@ class ChargeModel:
                 or now - snapshot[0] >= HOUSEHOLD_RECENT_REFRESH):
             self._recent_snapshot = (now, self._recent_stats())
 
-    def recent_base(self) -> tuple[datetime, float, float] | None:
+    def recent_base(self, now: datetime | None = None) -> tuple[datetime, float, float] | None:
         """(sample time, mean, P90) of the household base over the last hour, when it
         covers at least half an hour; else None. Re-read once per 15 min, in 0.5 A
         steps rounded up."""
         snapshot = self._recent_snapshot
         if snapshot is None or snapshot[1] is None or not self._recent_base:
+            return None
+        # Without fresh readings (mains or EV sensors gone) the floor expires.
+        now = now or self._last_observed_at
+        if now is not None and now - self._recent_base[-1][0] > HOUSEHOLD_RECENT_MAX_AGE:
             return None
         # Values from the snapshot; the time of the newest sample, so the "current and
         # next hour" window follows the clock and not the snapshot.
@@ -1646,6 +1689,27 @@ class ChargeModel:
         return sum(1 for _, hours in self._state["household"]["days"]
                    if hours >= HOUSEHOLD_DAY_MIN_HOURS)
 
+    def _hour_items(self, local: datetime) -> tuple[list, bool]:
+        """(values, usable) for a local clock hour. While the hour's own day class has
+        fewer than 3 values, both day classes are pooled if together they have 3: the
+        night load is known from the first nights instead of only after three weekday
+        and three weekend nights."""
+        own = self.day_class(local.date())
+        buckets = self._state["household"]["buckets"]
+        items = buckets[own].get(str(local.hour), [])
+        if len(items) >= HOUSEHOLD_MIN_BUCKET:
+            return items, True
+        other = buckets["weekend" if own == "weekday" else "weekday"].get(str(local.hour), [])
+        pooled = list(items) + list(other)
+        return (pooled, True) if len(pooled) >= HOUSEHOLD_MIN_BUCKET else (items, False)
+
+    @staticmethod
+    def _hour_stats(items: list) -> tuple[float, float]:
+        expected = _median(mean for mean, _ in items)
+        conservative = max(_quantile((p90 for _, p90 in items), BASE_CONSERVATIVE_QUANTILE),
+                           expected + BASE_CONSERVATIVE_MARGIN_A)
+        return expected, conservative
+
     def base_load(self, at: datetime, tz: tzinfo) -> BaseLoad:
         """Max-phase household base for the local hour: median of means / max(P80 of P90s, +1 A).
 
@@ -1655,12 +1719,9 @@ class ChargeModel:
         instead of the 3 A / 5 A defaults alone.
         """
         local = at.astimezone(tz)
-        items = self._state["household"]["buckets"][self.day_class(local.date())].get(str(local.hour), [])
-        learned = len(items) >= HOUSEHOLD_MIN_BUCKET
+        items, learned = self._hour_items(local)
         if learned:
-            expected = _median(mean for mean, _ in items)
-            conservative = max(_quantile((p90 for _, p90 in items), BASE_CONSERVATIVE_QUANTILE),
-                               expected + BASE_CONSERVATIVE_MARGIN_A)
+            expected, conservative = self._hour_stats(items)
         else:
             expected, conservative = DEFAULT_BASE_EXPECTED_A, DEFAULT_BASE_CONSERVATIVE_A
         recent = self.recent_base()
@@ -1674,6 +1735,26 @@ class ChargeModel:
                 expected = max(expected, min(mean, HOUSEHOLD_RECENT_MAX_EXPECTED_A))
                 conservative = max(conservative, min(p90, HOUSEHOLD_RECENT_MAX_CONSERVATIVE_A),
                                    expected + BASE_CONSERVATIVE_MARGIN_A)
+            else:
+                # An unusual night: a later learned hour is raised by what the house draws
+                # now above the learned values of the hour(s) the last hour of samples
+                # covers (weighted by the overlap), within the same 8 A / 9 A bounds.
+                last_local = last.astimezone(tz)
+                share = (last_local.minute * 60 + last_local.second) / 3600.0
+                now_items, now_ok = self._hour_items(last_local)
+                prev_items, prev_ok = self._hour_items((last - timedelta(hours=1)).astimezone(tz))
+                if now_ok and prev_ok:
+                    now_e, now_c = self._hour_stats(now_items)
+                    prev_e, prev_c = self._hour_stats(prev_items)
+                    usual_e = share * now_e + (1.0 - share) * prev_e
+                    usual_c = max(now_c, prev_c)
+                    excess = mean - usual_e
+                    if excess >= BASE_CONSERVATIVE_MARGIN_A:
+                        excess_c = max(excess, p90 - usual_c)
+                        expected = max(expected, min(expected + excess, HOUSEHOLD_RECENT_MAX_EXPECTED_A))
+                        conservative = max(conservative,
+                                           min(conservative + excess_c, HOUSEHOLD_RECENT_MAX_CONSERVATIVE_A),
+                                           expected + BASE_CONSERVATIVE_MARGIN_A)
         return BaseLoad(round(expected, 3), round(conservative, 3),
                         SOURCE_LEARNED if learned else SOURCE_DEFAULT)
 
@@ -1732,7 +1813,17 @@ class ChargeModel:
         if accepted is not None and accepted < value:
             value, source = round(max(accepted, CAR_CAP_BOUNDS[0]), 3), SOURCE_SESSION
         cap_kw = PHASES * kpa * value
-        return CarPower(round(cap_kw, 3), round(cap_kw * CAP_LOW_FACTOR, 3), value, source)
+        # Conservative: the low quartile of what the car accepted in its last sessions.
+        # Once the car has shown in this session that it takes more, that counts instead.
+        history = self._state["power"]["session_caps"][vehicle] if vehicle in VEHICLES else []
+        low = value
+        if history:
+            low = _quantile(history, SESSION_HISTORY_QUANTILE)
+            session = self._sessions.get(outlet) if outlet else None
+            if session is not None and session.get("vehicle") == vehicle and session.get("peak"):
+                low = max(low, session["peak"])
+            low = min(value, low)
+        return CarPower(round(cap_kw, 3), round(PHASES * kpa * low * CAP_LOW_FACTOR, 3), value, source)
 
     def hour_power(self, at: datetime, tz: tzinfo, *, max_current: Any = None,
                    max_mains: Any = None, min_current: Any = None, vehicle: str | None = None,
@@ -1868,12 +1959,21 @@ class ChargeModel:
             current_max = max(per_phase)
             # The car drew clearly less than it was offered (cold battery, taper, its
             # own limit): that says nothing about Smart mode's power.
-            car_limited = setpoint is not None and current_max < setpoint - CALIBRATION_CAR_LIMITED_A
+            # Judged against what the charger really offered when that is known (a charger
+            # offering less than predicted is not the car's limit).
+            reference = setpoint
+            if reference is not None and all(o is not None for o in offers):
+                reference = min(reference, sum(offers) / len(offers))
+            car_limited = reference is not None and current_max < reference - CALIBRATION_CAR_LIMITED_A
             # Phase currents must agree with the metered power (a zero or missing phase
             # reading is no evidence of what the car accepts).
             consistent = (total > 0 and CAR_CAP_BOUNDS[0] <= current_max <= CAR_CAP_BOUNDS[1]
                           and KW_PER_PHASE_AMP_SAMPLE_BOUNDS[0] <= power / total
                           <= KW_PER_PHASE_AMP_SAMPLE_BOUNDS[1])
+            if consistent and outlet in self._sessions:
+                session = self._sessions[outlet]
+                session["windows"] = session.get("windows", 0) + 1
+                session["peak"] = max(session.get("peak") or 0.0, round(current_max, 3))
             if consistent and setpoint is not None and outlet in self._sessions:
                 windows = self._sessions[outlet].setdefault("power_windows", [])
                 if car_limited:

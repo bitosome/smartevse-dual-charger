@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.9.0`
+Version: `0.0.9.1`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -528,7 +528,9 @@ inputs always give the same plan.
      Electricity Price usually has them by 14:00-15:00), known hours before that time
      come last: they are used only when waiting for the prices would miss a minimum.
    The plan is rebuilt every refresh, so it changes as soon as new prices arrive. After
-   15:00 missing prices are late, and the plan no longer waits for them.
+   15:00 missing prices are late, and the plan no longer waits for them. Only cars that
+   still need their minimum can make the plan wait, and nothing waits when one of them
+   has prices for its whole window (0.0.9.1).
 3. **Energy need.** From the battery level to the effective target, which is the
    minimum charge capped at the car's own charge limit. The need includes a charging
    taper above 93 % and margins: 3 % plus 3 minutes per expected start, and a
@@ -593,15 +595,20 @@ that per hour:
   SmartEVSE pauses ("No Power Available") and that hour gives 0 kW.
 - Power: current × 3 phases × the learned kW per phase-amp (about 0.235 kW).
 - Expected power uses the median household load; conservative power uses a high
-  percentile with at least 1 A extra. An hour with fewer than 3 learned values uses
-  3 A (expected) and 5 A (conservative), and until 7 days are learned conservative
-  power is capped at 8.5 kW.
+  percentile with at least 1 A extra. An hour needs 3 learned values. Weekdays and
+  weekends are learned separately, but while one of them has fewer than 3 values for an
+  hour, both are used together (0.0.9.1), so the night load is known after about three
+  nights. An hour with fewer than 3 values in all uses 3 A (expected) and 5 A
+  (conservative), and until 7 days are learned conservative power is capped at 8.5 kW.
 - What the house draws right now counts too: for the current and the next hour the
   household load of the last hour is a floor, and an hour without learned values uses
   it instead of the 3 A / 5 A defaults (at most 8 A / 9 A there, so an evening peak does
   not empty the night). This floor is re-read at the start of each 15-minute planning
   unit, in 0.5 A steps rounded up, so a spiky house does not change the plan in the
-  middle of a unit.
+  middle of a unit. It expires after 45 minutes without mains readings.
+- An unusual night (0.0.9.1): when the house draws at least 1 A more than it usually
+  does at this time, later learned hours are raised by that difference (within the same
+  8 A / 9 A bounds), so a cold or busy night is planned earlier.
 - Expected power is calibrated against what the EV meter actually measured in recent
   5-minute charging windows (factor 0.5–1.10). The comparison uses the household load
   measured in the same window, so the factor describes the charger only; windows in
@@ -612,7 +619,12 @@ that per hour:
   also while it waits for a cheaper slot or takes all of a lower offer during heat-pump
   hours. It ends when the car draws more than 1 A above that current, on unplug, or when
   Home Assistant restarts (then the evidence is gathered again within 10-15 minutes of
-  charging). The other car keeps its own power in the plan.
+  charging). The other car keeps its own power in the plan. "Less than offered" is
+  judged against the current the charger actually offered.
+- What each car accepted is remembered for its last 7 plug sessions (0.0.9.1). The low
+  quartile of those is the car's conservative current from plug-in on, so after a
+  cold-battery night the safety reserve already covers the next one. Normal sessions
+  record the nominal limit, so a single cold night ages out.
 
 A Smart-mode pause or a meter communication error is never treated as a full car or a
 car that refuses charge (90-second guard after the pause clears). Hand-offs between
