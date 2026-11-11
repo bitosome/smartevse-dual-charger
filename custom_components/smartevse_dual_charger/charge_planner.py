@@ -27,7 +27,7 @@ Identical inputs always give an identical plan.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
@@ -52,6 +52,7 @@ RANK_TIER_UNPRICED = 1000.0
 RANK_TIER_BEFORE_PRICES = 2000.0
 RANK_LATE_STEP = 0.001  # per hour before the plan horizon: later unpriced hours first
 TAIL_MERGE_MAX_MINUTES = 30
+EXTRA_MIN_PCT = 0.5  # charging above the minimum needs at least this much room below the car limit
 
 # Supporting constants.
 MIN_COMMITTED_MINUTES = 1  # the committed car may use unit 0 down to 1 minute
@@ -180,7 +181,13 @@ class Commitment:
 
 @dataclass(frozen=True)
 class PlannerConfig:
-    top_up_price: float | None = None
+    # Charging above the minimum (0.0.11.0): the minimum is a floor, so a car keeps
+    # charging to its own limit in the cheapest known-price units left before its
+    # ready-by time. There is no price limit.
+    above_minimum: bool = False
+    # While the prices of a car's window are still due (tomorrow's list), its charging
+    # above the minimum waits for them: this is when they are expected.
+    extra_prices_expected_at: datetime | None = None
     no_price_mode: bool = False
     # When the missing prices are expected to be published (tomorrow's day-ahead
     # prices); None when nothing is pending or the time has passed.
@@ -229,6 +236,8 @@ class CarPlan:
     need_expected_kwh: float = 0.0
     need_conservative_kwh: float = 0.0
     top_up: bool = False
+    # Level after the planned charging above the minimum (None when none is planned).
+    extra_soc: float | None = None
     tight: bool = False
     latest_start: datetime | None = None
     # Left out of the on-time set (R11): its margined need does not fit. It may
@@ -257,6 +266,7 @@ class CarPlan:
             "need_expected_kwh": self.need_expected_kwh,
             "need_conservative_kwh": self.need_conservative_kwh,
             "top_up": self.top_up,
+            "extra_soc": self.extra_soc,
             "tight": self.tight,
             "latest_start": _iso(self.latest_start),
             "late": self.late,
@@ -344,6 +354,25 @@ class BaselineSession:
     cap_kw: float
     soc: float | None = None
     kwh_per_pct: float | None = None
+    # The physical charger, when ``outlet`` is only a key (the realised ledger keys
+    # sessions by window): the charge policy names the charger that starts.
+    charger: str | None = None
+
+
+@dataclass(frozen=True)
+class ScheduleRules:
+    """The "Charge with schedule" settings, for the baseline the saving is compared with.
+
+    ``windows`` are the UTC intervals in which the weekly schedule is on, covering the
+    simulated period. ``price_limit`` is set while the schedule's "only below the
+    acceptable price" option is on. ``duty_minutes`` is the hand-over interval while
+    two cars still need charge, ``first`` the charger the charge policy starts with.
+    """
+
+    windows: Sequence[tuple[datetime, datetime]]
+    price_limit: float | None = None
+    duty_minutes: float = 0.0
+    first: str | None = None
 
 
 # --- Small helpers ----------------------------------------------------------
@@ -618,7 +647,8 @@ def _set_needs(car: _Car, start_blocks: int) -> None:
         and car.limit is not None
     ):
         base = max(car.soc, car.target)
-        if car.limit > base + _EPS:
+        # Within half a percent of its own limit the car is full: it would not draw.
+        if car.limit > base + EXTRA_MIN_PCT:
             car.top_need = EXPECTED_TAPER.virtual(car.k_e, base, car.limit)
     car.rem_e = car.e_e
     car.rem_c = car.e_c
@@ -689,6 +719,10 @@ class _Context:
         if expected is not None and expected <= self.now:
             expected = None
         self.prices_expected_at = expected
+        pending = getattr(self.config, "extra_prices_expected_at", None)
+        pending = _utc(pending) if isinstance(pending, datetime) else None
+        self.extra_waits = pending is not None and pending > self.now
+        self.extra_on = bool(getattr(self.config, "above_minimum", False))
         end = self.units[-1].end if self.units else self.now
         for unit in self.units:
             if self.no_price:
@@ -745,7 +779,7 @@ class _Pass:
         # planned power. A car that only has a top-up need counts only when top-up is
         # configured. Outputs (segment kWh, _simulate, _latest_start) use the car's
         # own power.
-        top_up_on = _finite(ctx.config.top_up_price) is not None and not ctx.no_price
+        top_up_on = ctx.extra_on and not ctx.no_price
 
         def best(car: _Car, attr: str) -> float:
             own = [getattr(unit, attr) for unit in self.units if unit.end <= car.deadline]
@@ -782,6 +816,9 @@ class _Pass:
         self.protect_short = 0.0  # conservative kWh the live cars' protection could not cover
         self.late_order: list[_Car] = []  # late live cars, the one served first first
         self.late_need: dict[str, float] = {}  # most energy each late car can still get
+        # While the charger runs, equally priced units next to now are preferred: the
+        # running block continues, and when a car finishes its minimum the next car's
+        # minimum follows at once (earlier is safer when its real power is lower).
         self.anchor_prev = any(car.drawing or car.committed for car in self.cars if not car.excluded)
 
     # Capacity helpers (expected / conservative metric of the minimum phase).
@@ -1099,6 +1136,13 @@ class _Pass:
         anchors = {i for i in range(self.n) if self.allocs[i]}
         if self.anchor_prev:
             anchors.add(-1)
+            # The last seconds of the running unit cannot be planned (too short to
+            # start in, and the commitment has run out): the charging in progress
+            # still continues into the next unit. Without this, equally priced units
+            # after it lose their "continue the running block" preference for those
+            # seconds and the plan moves the block to a later hour for one cycle.
+            if self.n and not self.units[0].usable_all and not self.allocs[0]:
+                anchors.add(0)
         return anchors
 
     def _fill(self, chosen: dict, cars: list[_Car], kinds: dict, needs: dict) -> None:
@@ -1430,10 +1474,20 @@ class _Pass:
 
     # Step 10
     def top_up(self) -> None:
-        threshold = _finite(self.ctx.config.top_up_price)
-        if threshold is None or self.ctx.no_price:
+        """Charging above the minimum: every car goes on to its own limit in the
+        cheapest known-price capacity the minimum plan left before its ready-by time.
+        It never uses an hour without a known price, and while the prices of a car's
+        window are still due it waits for them (the night may be cheaper than what is
+        known now)."""
+        if not self.ctx.extra_on or self.ctx.no_price:
             return
-        cars = sorted((c for c in self.cars if c.top_need > _EPS and c.cap > 0), key=_Car.edf)
+
+        def waits(car):
+            return self.ctx.extra_waits and any(
+                unit.kind != PRICE_KNOWN and unit.end <= car.deadline for unit in self.units
+            )
+
+        cars = sorted((c for c in self.cars if c.top_need > _EPS and c.cap > 0 and not waits(c)), key=_Car.edf)
         if not cars:
             return
         k_t = self.k_e if math.isfinite(self.k_e) else max(car.cap for car in cars)
@@ -1444,7 +1498,7 @@ class _Pass:
 
         def qualifies(i):
             unit = self.units[i]
-            return unit.kind == PRICE_KNOWN and unit.price <= threshold + 1e-12 and kw_t(i) > 0
+            return unit.kind == PRICE_KNOWN and kw_t(i) > 0
 
         def give(i, car, energy):
             kw = kw_t(i)
@@ -1457,35 +1511,87 @@ class _Pass:
             self.allocs[i].append(_Alloc(car.outlet, minutes, KIND_TOP_UP, given))
             return given
 
+        # Minimums first, in time (found with the regression nights, 2026-11-11): a car
+        # charges above its minimum only after the last unit planned for another car's
+        # minimum, and not before the ready-by of a car whose minimum is not fully
+        # planned. The power a car will really take is not known until it has charged
+        # in this session; extra charging ahead of its minimum would use up the time it
+        # needs when that power turns out lower. Later on it is safe: every replan
+        # gives a minimum that runs behind those units before any extra charging.
+        def last_minimum_unit(other):
+            return max((i for i in range(self.n)
+                        if any(a.outlet == other.outlet and a.kind != KIND_TOP_UP for a in self.allocs[i])), default=-1)
+
+        blocked = {}
+        for car in cars:
+            after = -1
+            for other in self.cars:
+                if other is car or other.excluded:
+                    continue
+                after = max(after, last_minimum_unit(other))
+                short = other.rem_e > _REL_TOL * max(1.0, other.e_e) + 1e-6
+                if short or other.outlet in self.late:
+                    after = max(after, max((i for i, unit in enumerate(self.units) if unit.end <= other.deadline),
+                                           default=-1))
+            blocked[car.outlet] = after
+
         commit = self.commit_car
         if (
             commit is not None
             and commit in cars
             and self.n
+            and blocked[commit.outlet] < 0
             and not self.units[0].usable_all
             and self.usable(0, commit)
             and qualifies(0)
         ):
             give(0, commit, need[commit.outlet])
-        cars = [car for car in cars if need[car.outlet] > _EPS]
-        if not cars:
-            return
-        latest = max(car.deadline for car in cars)
-        candidates = [
-            i for i, unit in enumerate(self.units)
-            if unit.usable_all and self.residual[i] > _MIN_EPS and unit.end <= latest and qualifies(i)
-        ]
-        caps = {i: kw_t(i) * self.residual[i] / 60.0 for i in candidates}
-        flow = _Nested(cars, [need[car.outlet] for car in cars])
-        chosen = _greedy(self.units, candidates, caps, flow, self._anchors(), False)
-        for i in sorted(chosen):
-            left = chosen[i]
-            for car in cars:
-                if left <= _EPS:
-                    break
-                if need[car.outlet] <= _EPS or self.units[i].end > car.deadline:
-                    continue
-                left -= give(i, car, min(left, need[car.outlet]))
+        # One car after the other: the car that is charging first (it continues), then
+        # the car whose own minimum ends last (its extra charging follows on from it),
+        # then the earlier ready-by. Each takes the cheapest capacity left that it may use.
+        # The next car starts where the one before it ended, so the cars do not take
+        # turns inside the extra charging.
+        running = self._running()
+        taken = -1
+        for car in sorted(cars, key=lambda c: (c.outlet not in running, -last_minimum_unit(c), c.edf())):
+            if need[car.outlet] <= _EPS:
+                continue
+            first = max(blocked[car.outlet] + 1, taken)
+            candidates = [
+                i for i, unit in enumerate(self.units)
+                if i >= first and unit.usable_all and self.residual[i] > _MIN_EPS
+                and unit.end <= car.deadline and qualifies(i)
+            ]
+            caps = {i: kw_t(i) * self.residual[i] / 60.0 for i in candidates}
+            flow = _Nested([car], [need[car.outlet]])
+            chosen = _greedy(self.units, candidates, caps, flow, self._anchors(), False)
+            for i in sorted(chosen):
+                if give(i, car, min(chosen[i], need[car.outlet])) > 0:
+                    taken = max(taken, i)
+        self._drop_short_extra_blocks()
+
+    def _drop_short_extra_blocks(self) -> None:
+        """A start for a few minutes of charging above the minimum is not worth it (the
+        last fraction of a percent, planned in an hour of its own): a run of units
+        that holds only such charging for one car, shorter than a start may be, is
+        left out unless that car is charging now."""
+        running = self._running()
+        for car in self.cars:
+            units = [i for i in range(self.n) if any(a.outlet == car.outlet for a in self.allocs[i])]
+            run: list[int] = []
+            for i in units + [None]:
+                if run and (i is None or i != run[-1] + 1):
+                    mine = [a for j in run for a in self.allocs[j] if a.outlet == car.outlet]
+                    only_extra = all(a.kind == KIND_TOP_UP for a in mine)
+                    continues = run[0] == 0 and car.outlet in running
+                    if only_extra and not continues and sum(a.minutes for a in mine) < MIN_START_MINUTES:
+                        for j in run:
+                            for alloc in [a for a in self.allocs[j] if a.outlet == car.outlet]:
+                                self.allocs[j].remove(alloc)
+                                self.residual[j] += alloc.minutes
+                    run = []
+                if i is not None:
+                    run.append(i)
 
     def run(self) -> None:
         self.commit()
@@ -1596,6 +1702,62 @@ def _place_segments(p: "_Pass") -> list[Segment]:
     return segments
 
 
+def _floor_level(car: _Car) -> float:
+    """The level the guaranteed charge ends at: the minimum, capped by the car's own
+    limit. A car that already reached its minimum (and reads a little lower since)
+    has nothing guaranteed left."""
+    floor = min(car.target, car.limit if car.limit is not None else 100.0)
+    if car.reached and car.soc is not None:
+        floor = min(floor, car.soc)
+    return floor
+
+
+def _label_by_level(p: "_Pass", segments: list[Segment], units_by_start: dict) -> list[Segment]:
+    """Mark each car's planned charging by battery level: guaranteed until the minimum
+    is in, extra after that (a segment that crosses the minimum is split there).
+
+    The planner gives the cheapest capacity to the minimum and the next cheapest to
+    the charging above it, so an extra hour can come before a minimum hour. The car
+    charges in both; in time order the first of them fills the minimum.
+    """
+    result = []
+    for car in p.cars:
+        mine = [seg for seg in segments if seg.outlet == car.outlet]
+        if car.soc is None or not any(seg.top_up for seg in mine):
+            result.extend(mine)
+            continue
+        limit_top = car.limit if car.limit is not None else 100.0
+        floor = _floor_level(car)
+        soc = car.soc
+
+        def labelled(seg, extra, start=None, end=None, share=1.0):
+            kind = KIND_TOP_UP if extra else (KIND_MINIMUM if seg.kind == KIND_TOP_UP else seg.kind)
+            return replace(seg, top_up=extra, kind=kind, start=start or seg.start, end=end or seg.end,
+                           minutes=seg.minutes * share, energy_kwh=seg.energy_kwh * share)
+
+        for seg in mine:
+            unit = units_by_start.get(floor15(seg.start))
+            power = min(unit.kw_e if unit is not None else math.inf, car.cap)
+            if power <= 0 or seg.minutes <= 0 or not math.isfinite(power):
+                result.append(seg)
+                continue
+            virtual = power * seg.minutes / 60.0
+            need = EXPECTED_TAPER.virtual(car.k_e, soc, floor) if soc < floor else 0.0
+            minimum_minutes = seg.minutes * min(1.0, need / virtual)
+            if minimum_minutes < 1.0:
+                result.append(labelled(seg, True))
+            elif seg.minutes - minimum_minutes < 1.0:
+                result.append(labelled(seg, False))
+            else:
+                cut = seg.start + timedelta(seconds=round(minimum_minutes * 60))
+                share = minimum_minutes / seg.minutes
+                result.append(labelled(seg, False, end=cut, share=share))
+                result.append(labelled(seg, True, start=cut, share=1.0 - share))
+            soc = EXPECTED_TAPER.advance(car.k_e, soc, virtual, limit_top)
+    result.sort(key=lambda seg: (seg.start, seg.end, seg.outlet))
+    return result
+
+
 def _blocks(segments: list[Segment]) -> tuple[Block, ...]:
     blocks = []
     for seg in segments:
@@ -1639,7 +1801,15 @@ def _latest_start(car: _Car, units: list, now: datetime) -> datetime | None:
 
 
 def _simulate(car: _Car, segments: list[Segment], units_by_start: dict) -> dict:
-    """Step 13: chronological delivery at the car's expected power."""
+    """Step 13: chronological delivery at the car's expected power.
+
+    With charging above the minimum planned, the battery level decides what the
+    energy is: up to the minimum it is the guaranteed charge, above it the extra
+    charge. The plan is rebuilt every cycle, so an hour given to the minimum simply
+    carries on as extra charging once the minimum is in, and an extra hour that
+    comes first also fills the minimum. ``floor_soc`` is the level the guaranteed
+    charge reaches, ``soc`` the level after everything planned.
+    """
     soc = car.soc
     left = car.e_actual
     result = {
@@ -1647,6 +1817,8 @@ def _simulate(car: _Car, segments: list[Segment], units_by_start: dict) -> dict:
         "forecast": False, "partial": False,
     }
     limit_top = car.limit if car.limit is not None else 100.0
+    floor = _floor_level(car)
+    extra = any(seg.top_up for seg in segments)
     for seg in segments:
         unit = units_by_start.get(floor15(seg.start))
         kw_unit = unit.kw_e if unit is not None else math.inf
@@ -1657,24 +1829,26 @@ def _simulate(car: _Car, segments: list[Segment], units_by_start: dict) -> dict:
         if soc is None:
             if seg.top_up:
                 continue
-            energy = min(virtual, left)
-            left -= energy
+            parts = {"": min(virtual, left)}
+            left -= parts[""]
         else:
-            limit = limit_top if seg.top_up else min(car.target, limit_top)
-            new_soc = EXPECTED_TAPER.advance(car.k_e, soc, virtual, limit)
+            new_soc = EXPECTED_TAPER.advance(car.k_e, soc, virtual, limit_top if extra else floor)
             energy = max(0.0, (new_soc - soc) * car.k_e)
+            below = min(energy, max(0.0, (min(new_soc, floor) - min(soc, floor)) * car.k_e))
+            parts = {"": below, "top_up": energy - below}
             soc = max(soc, new_soc)
-        if energy <= _EPS:
-            continue
-        key = "top_up" if seg.top_up else ""
-        result["top_up_energy" if seg.top_up else "energy"] += energy
-        if seg.price is None or seg.price_kind == PRICE_UNKNOWN:
-            result["partial"] = True
-        else:
-            result[(key + "_cost") if key else "cost"] += seg.price * energy
-            if seg.price_kind == PRICE_FORECAST:
-                result["forecast"] = True
+        for key, energy in parts.items():
+            if energy <= _EPS:
+                continue
+            result["top_up_energy" if key else "energy"] += energy
+            if seg.price is None or seg.price_kind == PRICE_UNKNOWN:
+                result["partial"] = True
+            else:
+                result["top_up_cost" if key else "cost"] += seg.price * energy
+                if seg.price_kind == PRICE_FORECAST:
+                    result["forecast"] = True
     result["soc"] = soc
+    result["floor_soc"] = None if soc is None else min(soc, max(floor, car.soc))
     return result
 
 
@@ -1688,7 +1862,8 @@ def _covers_minimum(car: _Car, sim: dict) -> bool:
 
 def _build_output(ctx: _Context, p: _Pass) -> tuple[Plan, dict]:
     now = ctx.now
-    segments = _place_segments(p)
+    units_by_start = {floor15(u.start): u for u in ctx.units}
+    segments = _label_by_level(p, _place_segments(p), units_by_start)
     by_car = {car.outlet: [s for s in segments if s.outlet == car.outlet] for car in p.cars}
     owner_seg = None
     if segments and (segments[0].start <= now or (
@@ -1696,7 +1871,6 @@ def _build_output(ctx: _Context, p: _Pass) -> tuple[Plan, dict]:
         # A block starting within START_LEAD in this unit starts now (see START_LEAD).
         owner_seg = segments[0]
     owner = owner_seg.outlet if owner_seg is not None else None
-    units_by_start = {floor15(u.start): u for u in ctx.units}
     starts = {}
     car_plans = []
     for car in p.cars:
@@ -1723,9 +1897,11 @@ def _build_output(ctx: _Context, p: _Pass) -> tuple[Plan, dict]:
             status = STATUS_TIGHT if car.outlet in p.tight or car.outlet in p.late else STATUS_PLANNED
             feasible = True
         has_top_up = any(s.top_up for s in mine)
-        projected = None
+        projected = extra_soc = None
         if car.soc is not None:
-            projected = round(_clamp(sim["soc"], 0.0, 100.0), 1)
+            projected = round(_clamp(sim["floor_soc"], 0.0, 100.0), 1)
+            final = round(_clamp(sim["soc"], 0.0, 100.0), 1)
+            extra_soc = final if has_top_up and final > projected else None
         car_plans.append(
             CarPlan(
                 outlet=car.outlet,
@@ -1745,6 +1921,7 @@ def _build_output(ctx: _Context, p: _Pass) -> tuple[Plan, dict]:
                 need_expected_kwh=round(car.e_e / car.scale_e, 3),
                 need_conservative_kwh=round(car.e_c / car.scale_c, 3),
                 top_up=has_top_up,
+                extra_soc=extra_soc,
                 tight=car.outlet in p.tight,
                 latest_start=_latest_start(car, ctx.units, now),
                 late=car.outlet in p.late,
@@ -1908,3 +2085,116 @@ def _baseline_one(session, start, prices, powers, edges, allow_forecast):
             soc = min(100.0, soc + delivered / k)
         t = seg_end
     return (cost if priced else None), t
+
+
+def schedule_baseline_costs(
+    sessions: Sequence[BaselineSession],
+    price_slots: Sequence[PriceSlot],
+    power_slots: Sequence[PowerSlot],
+    rules: ScheduleRules,
+    *,
+    allow_forecast: bool = False,
+) -> dict:
+    """Cost of the same energy charged by "Charge with schedule" (owner, 2026-11-11).
+
+    A car charges only while the weekly schedule is on, and with the schedule's price
+    option only while the known price is at or below the acceptable price. One
+    charger at a time: with two cars that still need charge the charger named by the
+    charge policy starts and they change over every ``duty_minutes``; a car that has
+    its energy leaves the rotation. Each car charges at the expected power until its
+    energy is delivered, in later schedule windows too. Returns outlet -> cost, or
+    None when any of its energy falls in a period without a usable price, when the
+    price option meets a price that is not published, or when the windows given end
+    before the energy is delivered.
+    """
+    prices = _prepare_prices(price_slots)
+    powers = _prepare_powers(power_slots)
+    windows: list[list[datetime]] = []
+    for start, end in sorted((_utc(a), _utc(b)) for a, b in (rules.windows or ()) if b > a):
+        if windows and start <= windows[-1][1]:
+            windows[-1][1] = max(windows[-1][1], end)
+        else:
+            windows.append([start, end])
+    limit = _finite(rules.price_limit)
+    duty = max(0.0, _finite(rules.duty_minutes) or 0.0)
+    duty = timedelta(minutes=duty) if duty > 0 else None
+    price_edges = sorted({p.start for p in prices} | {p.end for p in prices})
+    results: dict = {}
+    cars = []
+
+    def settle(car, cost):
+        outlet = car["session"].outlet
+        if outlet in results:
+            prior = results[outlet]
+            cost = None if prior is None or cost is None else prior + cost
+        results[outlet] = cost
+
+    for session in sorted(sessions or (), key=lambda s: (_utc(s.plugged_at), s.outlet)):
+        energy = max(0.0, _finite(session.energy_kwh) or 0.0)
+        cap = max(0.0, _finite(session.cap_kw) or 0.0)
+        soc, k, taper = _finite(session.soc), _finite(session.kwh_per_pct), EXPECTED_TAPER
+        if soc is None or k is None or k <= 0:
+            soc, k, taper = 0.0, 1.0, NO_TAPER
+        car = {"session": session, "left": energy, "cap": cap, "soc": _clamp(soc, 0.0, 100.0), "k": k, "taper": taper,
+               "plugged": _utc(session.plugged_at), "cost": 0.0, "priced": True,
+               "charger": session.charger or session.outlet}
+        if energy <= _EPS:
+            settle(car, 0.0)
+        elif cap <= 0:
+            settle(car, None)
+        else:
+            cars.append(car)
+    step = timedelta(minutes=1)
+    active = None
+    since = None
+    moment = min((car["plugged"] for car in cars), default=None)
+    while cars and moment is not None:
+        window = next((w for w in windows if w[1] > moment), None)
+        if window is None:
+            break
+        if moment < window[0]:
+            moment, active = window[0], None
+            continue
+        ready = [car for car in cars if car["plugged"] <= moment]
+        if not ready:
+            moment, active = min(car["plugged"] for car in cars), None
+            continue
+        price, kind = _price_at(prices, moment)
+        if limit is not None:
+            if price is None or kind != PRICE_KNOWN:
+                break  # whether the schedule would charge here is not known yet
+            if price > limit + 1e-12:
+                later = next((edge for edge in price_edges if edge > moment), None)
+                moment, active = (later if later is not None else moment + step), None
+                continue
+        if active not in ready:
+            active = next((car for car in ready if car["charger"] == rules.first), ready[0])
+            since = moment
+        elif duty is not None and len(ready) > 1 and moment - since >= duty:
+            active = next(car for car in ready if car is not active)
+            since = moment
+        car = active
+        end = min(moment + step, window[1])
+        hours = (end - moment).total_seconds() / 3600.0
+        kw, _ = _power_at(powers, moment)
+        full = min(kw, car["cap"]) * hours
+        if car["taper"] is NO_TAPER:
+            delivered = min(car["left"], full)
+        else:
+            delivered = min(car["left"], max(0.0, (car["taper"].advance(car["k"], car["soc"], full, 100.0) - car["soc"]) * car["k"]))
+            car["soc"] = min(100.0, car["soc"] + delivered / car["k"])
+        if delivered > _EPS:
+            if price is None or kind == PRICE_UNKNOWN or (kind == PRICE_FORECAST and not allow_forecast):
+                car["priced"] = False
+            else:
+                car["cost"] += price * delivered
+        car["left"] -= delivered
+        # A battery that takes nothing more at 100 % ends like a delivered one.
+        if car["left"] <= 1e-9 or (car["taper"] is not NO_TAPER and car["soc"] >= 100.0 - 1e-9):
+            settle(car, car["cost"] if car["priced"] else None)
+            cars.remove(car)
+            active = None
+        moment = end
+    for car in cars:
+        settle(car, None)
+    return {outlet: _money(cost) for outlet, cost in results.items()}

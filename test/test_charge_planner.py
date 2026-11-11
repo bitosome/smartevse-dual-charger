@@ -979,79 +979,112 @@ class EffectivePowerTests(unittest.TestCase):
 
 
 class TopUpTests(unittest.TestCase):
-    def test_top_up_uses_known_units_at_or_below_the_price(self):
+    def test_cars_keep_charging_to_their_limit_in_the_cheapest_known_units(self):
+        # 0.0.11.0 (owner): the minimum is a floor. After it each car goes on to its own
+        # limit in the cheapest known-price units left before its ready-by; no price limit.
         dl = L(11, 10, 7)
         requests = [car(XC40, 53, 80, dl), car(EX30, 40, 80, dl)]
         base = plan(L(11, 9, 18, 30), requests)
-        p = plan(L(11, 9, 18, 30), requests, config=m.PlannerConfig(top_up_price=0.29))
+        p = plan(L(11, 9, 18, 30), requests, config=m.PlannerConfig(above_minimum=True))
         top = [s for s in p.segments if s.top_up]
         self.assertTrue(top)
         for seg in top:
             self.assertEqual(seg.price_kind, 'known')
-            self.assertLessEqual(seg.price, 0.29)
             self.assertLessEqual(seg.end, dl)
         for request in requests:
             c = p.car(request.outlet)
             self.assertTrue(c.top_up)
             self.assertIsNotNone(c.top_up_cost)
-            self.assertGreater(c.projected_soc, 80.0)
-            self.assertLessEqual(c.projected_soc, request.car_limit)
-            self.assertEqual(c.cost, base.car(request.outlet).cost)  # top-up cost is reported separately
+            self.assertEqual(c.projected_soc, 80.0)  # what is guaranteed
+            self.assertEqual(c.extra_soc, request.car_limit)  # the night is long enough for both
+            self.assertEqual(c.energy_kwh, base.car(request.outlet).energy_kwh)
+            self.assertAlmostEqual(c.cost, base.car(request.outlet).cost, delta=0.35)
         self.assertAlmostEqual(p.total_top_up_cost, sum(c.top_up_cost for c in p.cars), places=2)
+        # The dear evening hours stay unused, and nothing runs past the ready-by.
+        self.assertTrue(all(L(11, 9, 21) <= seg.start and seg.end <= dl for seg in p.segments))
+        # Minimums first, then one car's extra charging after the other's: the cars do
+        # not take turns (two hand-overs here: XC40 -> EX30 -> XC40).
+        owners = [seg.outlet for seg in p.segments]
+        self.assertLessEqual(sum(1 for a, b in zip(owners, owners[1:]) if a != b), 2)
+        xc40_minimum = max(seg.end for seg in segs(p, 'smartevse_1', top_up=False))
+        ex30_minimum = max(seg.end for seg in segs(p, 'smartevse_2', top_up=False))
+        self.assertTrue(all(seg.start >= xc40_minimum - Q for seg in segs(p, 'smartevse_2', top_up=True)))
+        # (The XC40's first minutes above 80 % are the end of its own minimum block.)
+        self.assertGreaterEqual(max(seg.start for seg in segs(p, 'smartevse_1', top_up=True)), ex30_minimum - Q)
+        # Without the option nothing is charged above the minimum.
+        self.assertFalse([s for s in base.segments if s.top_up])
+        self.assertTrue(all(c.extra_soc is None for c in base.cars))
+
+    def test_guaranteed_and_extra_charging_are_split_by_battery_level(self):
+        # An extra hour that comes before a minimum hour fills the minimum first: in time
+        # order the charging is "guaranteed" until the minimum is in and "extra" after.
+        dl = L(11, 10, 7)
+        p = plan(L(11, 9, 18, 30), [car(XC40, 53, 80, dl), car(EX30, 40, 80, dl)],
+                 config=m.PlannerConfig(above_minimum=True))
+        for outlet in ('smartevse_1', 'smartevse_2'):
+            flags = [seg.top_up for seg in segs(p, outlet)]
+            self.assertEqual(flags, sorted(flags))  # guaranteed first, then extra
+            c = p.car(outlet)
+            self.assertAlmostEqual(min_energy(p, outlet), c.need_kwh, delta=0.2)
+            self.assertGreaterEqual(sum(seg.energy_kwh for seg in segs(p, outlet)), c.need_expected_kwh)
 
     def test_top_up_need_starts_at_the_current_soc_above_target(self):
-        p = plan(L(11, 9, 18, 30), [car(XC40, 85, 80, L(11, 10, 7))], config=m.PlannerConfig(top_up_price=0.29))
+        p = plan(L(11, 9, 18, 30), [car(XC40, 85, 80, L(11, 10, 7))], config=m.PlannerConfig(above_minimum=True))
         c = p.car('smartevse_1')
         self.assertEqual((c.status, c.need_kwh), ('reached', 0.0))
         self.assertAlmostEqual(c.top_up_kwh, 5 * 0.754, places=2)
-        self.assertEqual(c.projected_soc, 90.0)
+        self.assertEqual((c.projected_soc, c.extra_soc), (85.0, 90.0))
         self.assertEqual(loc(c.next_start), '23:00')  # 23:00 is the cheapest hour
-        at = plan(L(11, 9, 23, 0), [car(XC40, 85, 80, L(11, 10, 7))], config=m.PlannerConfig(top_up_price=0.29))
+        at = plan(L(11, 9, 23, 0), [car(XC40, 85, 80, L(11, 10, 7))], config=m.PlannerConfig(above_minimum=True))
         self.assertEqual((at.current_outlet, at.reason), ('smartevse_1', m.REASON_TOP_UP))
 
     def test_reached_car_has_no_minimum_need_but_is_topped_up(self):
         # Review round 3: the reached hysteresis must not make a car "done" — a car at 79 %
         # that already reached 80 % gets no minimum need but its top-up to the car limit.
         p = plan(L(11, 9, 18, 30), [car(XC40, 79, 80, L(11, 10, 7), reached=True)],
-                 config=m.PlannerConfig(top_up_price=0.29))
+                 config=m.PlannerConfig(above_minimum=True))
         c = p.car('smartevse_1')
         self.assertEqual((c.status, c.need_kwh, c.energy_kwh), ('reached', 0.0, 0.0))
         self.assertTrue(c.top_up)
         self.assertTrue(segs(p, 'smartevse_1', top_up=True))
         self.assertFalse(segs(p, 'smartevse_1', top_up=False))
         at = plan(L(11, 9, 23, 0), [car(XC40, 79, 80, L(11, 10, 7), reached=True)],
-                  config=m.PlannerConfig(top_up_price=0.29))
+                  config=m.PlannerConfig(above_minimum=True))
         self.assertEqual((at.current_outlet, at.reason), ('smartevse_1', m.REASON_TOP_UP))
         # Without top-up it is simply reached; done still gets nothing at all.
         off = plan(L(11, 9, 23, 0), [car(XC40, 79, 80, L(11, 10, 7), reached=True)])
         self.assertEqual((off.current_outlet, off.reason, off.car('smartevse_1').status),
                          (None, m.REASON_TARGETS_REACHED, 'reached'))
         done = plan(L(11, 9, 23, 0), [car(XC40, 79, 80, L(11, 10, 7), reached=True, done=True)],
-                    config=m.PlannerConfig(top_up_price=0.29))
+                    config=m.PlannerConfig(above_minimum=True))
         self.assertFalse(done.segments)
 
     def test_top_up_may_use_buffer_units(self):
         t0 = L(11, 9, 20)
         prices = hourly(t0, [0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.12, 0.1, 0.05])
-        p = plan(t0, [car(XC40, 50, 77, L(11, 10, 7))], prices=prices, config=m.PlannerConfig(top_up_price=0.06))
+        p = plan(t0, [car(XC40, 50, 77, L(11, 10, 7))], prices=prices, config=m.PlannerConfig(above_minimum=True))
         top = [s for s in p.segments if s.top_up]
         self.assertTrue(top)
-        self.assertTrue(all(s.start >= L(11, 10, 6) for s in top))
+        # The last hour is the cheapest; the minimum plan keeps it as its safety buffer
+        # and the extra charging uses it.
+        self.assertTrue(any(s.start >= L(11, 10, 6) for s in top))
+        self.assertEqual(p.car('smartevse_1').extra_soc, 90.0)
 
     def test_committed_unit_exception_is_only_for_the_committed_car(self):
         # Review algorithm #9a: EX30 reached 80 % at 03:57 in its committed unit.
         dl = L(11, 10, 7)
         p = plan(L(11, 10, 3, 57), [car(XC40, 85, 80, dl), car(EX30, 80, 80, dl, drawing=True, car_limit=80)],
-                 config=m.PlannerConfig(top_up_price=0.29),
+                 config=m.PlannerConfig(above_minimum=True),
                  commitment=m.Commitment('smartevse_2', L(11, 10, 4)))
         self.assertTrue(all(s.start >= L(11, 10, 4) for s in segs(p, 'smartevse_1')))
         self.assertTrue(segs(p, 'smartevse_1', top_up=True))
 
     def test_no_top_up_without_soc_limit_or_when_done(self):
-        config = m.PlannerConfig(top_up_price=0.29)
+        config = m.PlannerConfig(above_minimum=True)
         dl = L(11, 10, 7)
+        # (89.6 % with a 90 % limit: within half a percent the car is full and would not draw.)
         for request in [car(XC40, None, 80, dl, budget_kwh=5), car(XC40, 85, 80, dl, car_limit=None),
-                        car(XC40, 85, 80, dl, done=True)]:
+                        car(XC40, 85, 80, dl, done=True), car(XC40, 89.6, 80, dl)]:
             p = plan(L(11, 9, 18, 30), [request], config=config)
             self.assertFalse([s for s in p.segments if s.top_up])
             self.assertIsNone(p.car('smartevse_1').top_up_cost)
@@ -1059,8 +1092,96 @@ class TopUpTests(unittest.TestCase):
     def test_top_up_ignores_forecast_prices(self):
         t0 = L(11, 9, 22)
         prices = hourly(t0, [0.4, 0.4]) + hourly(t0 + 2 * H, [0.01, 0.01], kind='forecast')
-        p = plan(t0, [car(XC40, 85, 80, t0 + 4 * H)], prices=prices, config=m.PlannerConfig(top_up_price=0.2))
-        self.assertEqual(p.segments, ())
+        p = plan(t0, [car(XC40, 85, 80, t0 + 4 * H)], prices=prices, config=m.PlannerConfig(above_minimum=True))
+        self.assertTrue(p.segments)
+        self.assertTrue(all(s.top_up and s.price_kind == 'known' and s.end <= t0 + 2 * H for s in p.segments))
+
+    def test_minimums_come_first_in_time(self):
+        # Found with the regression nights (2026-11-11): a car that charged above its
+        # minimum before the other car's minimum had started used up the time that car
+        # needed when its real power turned out 30 % lower. Extra charging is planned
+        # only after the last unit of another car's minimum.
+        t0 = L(11, 9, 12)
+        prices = hourly(t0, [0.2, 0.2, 0.1, 0.6, 0.4, 0.4, 0.3, 0.2, 0.4, 0.4, 0.5, 0.4, 0.5, 0.3, 0.1, 0.1, 0.4, 0.1, 0.4, 0.4])
+        powers = power_slots(t0, 24, expected=7.0, conservative=5.6)
+        config = m.PlannerConfig(above_minimum=True)
+
+        def at(now, xc40=33, xc40_drawing=False, ex30_drawing=False, commitment=None, **xc40_extra):
+            requests = [car(XC40, xc40, 90, L(11, 10, 8), car_limit=100, drawing=xc40_drawing, **xc40_extra),
+                        car(EX30, 80, 80, L(11, 10, 7, 30), reached=True, drawing=ex30_drawing)]
+            return plan(now, requests, prices=prices, powers=powers, config=config, commitment=commitment)
+
+        p = at(L(11, 9, 16, 30))
+        last_minimum = max(seg.end for seg in segs(p, 'smartevse_1', top_up=False))
+        ex30 = segs(p, 'smartevse_2')
+        self.assertTrue(ex30)  # the EX30 still gets its extra charge, later
+        self.assertTrue(all(seg.top_up and seg.start >= last_minimum - Q for seg in ex30))
+        self.assertEqual(p.car('smartevse_1').projected_soc, 90.0)
+        # Alone, the EX30 would use the cheapest hours from now on.
+        alone = plan(L(11, 9, 16, 30), [car(EX30, 80, 80, L(11, 10, 7, 30), reached=True)], prices=prices, powers=powers,
+                     config=config)
+        self.assertLess(min(seg.start for seg in alone.segments), min(seg.start for seg in ex30))
+        # A car whose minimum cannot be fully planned leaves no extra charging before its ready-by.
+        short = plan(L(11, 10, 3), [car(XC40, 33, 90, L(11, 10, 8), car_limit=100),
+                                    car(EX30, 80, 80, L(11, 10, 7, 30), reached=True)],
+                     prices=prices, powers=powers, config=config)
+        self.assertIn(short.car('smartevse_1').status, ('at_risk', 'tight'))
+        self.assertFalse(segs(short, 'smartevse_2'))
+        # With the XC40's minimum in, both go on above it and nobody waits for the other.
+        done = at(L(11, 9, 16, 30), xc40=90, reached=True)
+        self.assertTrue(segs(done, 'smartevse_1', top_up=True))
+        self.assertTrue(segs(done, 'smartevse_2', top_up=True))
+
+    def test_running_block_continues_through_a_unit_boundary(self):
+        # In the last seconds of a unit (too short to plan, the commitment has run out)
+        # the charging in progress still continues into the next equally priced unit.
+        t0 = L(11, 9, 12)
+        prices = hourly(t0, [0.2, 0.2, 0.1, 0.6, 0.4, 0.4, 0.3, 0.2, 0.4, 0.4, 0.5, 0.4, 0.5, 0.3, 0.1, 0.1, 0.4, 0.1, 0.4, 0.4])
+        powers = power_slots(t0, 24, expected=7.0, conservative=5.6)
+        requests = [car(XC40, 35, 90, L(11, 10, 8), car_limit=100, drawing=True),
+                    car(EX30, 80, 80, L(11, 10, 7, 30), reached=True)]
+        config = m.PlannerConfig(above_minimum=True)
+        commitment = m.Commitment('smartevse_1', L(11, 9, 16, 45))
+        before = plan(L(11, 9, 16, 44), requests, prices=prices, powers=powers, config=config, commitment=commitment)
+        self.assertEqual(before.current_outlet, 'smartevse_1')
+        boundary = plan(L(11, 9, 16, 44, 30), requests, prices=prices, powers=powers, config=config, commitment=commitment)
+        self.assertEqual([(seg.outlet, seg.start, seg.top_up) for seg in boundary.segments[:1]],
+                         [('smartevse_1', L(11, 9, 16, 45), False)])
+
+    def test_no_start_for_a_few_minutes_of_extra_charging(self):
+        # 0.4 % below the car limit would be a block of its own of about two minutes in
+        # the cheapest hour: not worth a start. While the car is charging it may finish.
+        dl = L(11, 10, 7)
+        idle = plan(L(11, 9, 18, 30), [car(XC40, 89.2, 80, dl)], config=m.PlannerConfig(above_minimum=True))
+        self.assertEqual((idle.segments, idle.reason), ((), m.REASON_TARGETS_REACHED))
+        self.assertIsNone(idle.car('smartevse_1').extra_soc)
+        running = plan(L(11, 9, 23, 2), [car(XC40, 89.2, 80, dl, drawing=True)], config=m.PlannerConfig(above_minimum=True),
+                       commitment=m.Commitment('smartevse_1', L(11, 9, 23, 15)))
+        self.assertEqual(running.current_outlet, 'smartevse_1')
+        # A longer remainder is planned as before.
+        more = plan(L(11, 9, 18, 30), [car(XC40, 85, 80, dl)], config=m.PlannerConfig(above_minimum=True))
+        self.assertTrue(segs(more, 'smartevse_1', top_up=True))
+
+    def test_extra_charging_waits_for_prices_that_are_still_due(self):
+        # 13:00, tomorrow's list is due at 15:00 and the ready-by is tomorrow morning:
+        # the night may be cheaper than what is known now, so nothing extra is planned yet.
+        t0 = L(11, 9, 13)
+        prices = hourly(t0, [0.20] * 12)  # known to 01:00
+        dl = L(11, 10, 7)
+        waiting = m.PlannerConfig(above_minimum=True, extra_prices_expected_at=L(11, 9, 15))
+        p = plan(t0, [car(XC40, 85, 80, dl)], prices=prices, config=waiting)
+        self.assertEqual((p.segments, p.reason), ((), m.REASON_TARGETS_REACHED))
+        # A car whose own window is fully priced does not wait for the other car's prices.
+        both = plan(t0, [car(XC40, 85, 80, dl), car(EX30, 85, 80, L(11, 9, 20))], prices=prices, config=waiting)
+        self.assertFalse(segs(both, 'smartevse_1'))
+        self.assertTrue(segs(both, 'smartevse_2', top_up=True))
+        # The prices are late (the time has passed): the known hours are used.
+        late = plan(L(11, 9, 16), [car(XC40, 85, 80, dl)], prices=prices, config=waiting)
+        self.assertTrue(segs(late, 'smartevse_1', top_up=True))
+        self.assertTrue(all(s.price_kind == 'known' for s in late.segments))
+        # The minimum never waits because of this setting.
+        need = plan(t0, [car(XC40, 50, 80, L(11, 9, 17))], prices=prices, config=waiting)
+        self.assertEqual(need.car('smartevse_1').projected_soc, 80.0)
 
 
 class PriceKindTests(unittest.TestCase):
@@ -1184,7 +1305,7 @@ class NoPriceModeTests(unittest.TestCase):
 
     def test_no_top_up_in_no_price_mode(self):
         p = plan(L(11, 9, 18, 30), [car(XC40, 85, 80, L(11, 10, 7))],
-                 config=m.PlannerConfig(top_up_price=1.0, no_price_mode=True))
+                 config=m.PlannerConfig(above_minimum=True, no_price_mode=True))
         self.assertEqual(p.segments, ())
 
 
@@ -1251,7 +1372,7 @@ class DeterminismAndOutputTests(unittest.TestCase):
     def test_identical_inputs_identical_output(self):
         dl = L(11, 10, 7)
         requests = [car(XC40, 53, 80, dl), car(EX30, 40, 80, dl)]
-        config = m.PlannerConfig(top_up_price=0.29)
+        config = m.PlannerConfig(above_minimum=True)
         first = plan(L(11, 9, 18, 31, 7), requests, config=config).as_dict()
         second = plan(L(11, 9, 18, 31, 7), requests, config=config).as_dict()
         self.assertEqual(first, second)
@@ -1262,7 +1383,7 @@ class DeterminismAndOutputTests(unittest.TestCase):
         self.assertEqual(first, third)
 
     def test_as_dict_is_json_friendly_and_rounded(self):
-        p = plan(L(11, 9, 18, 31, 7), [car(XC40, 53, 80, L(11, 10, 7))], config=m.PlannerConfig(top_up_price=0.29))
+        p = plan(L(11, 9, 18, 31, 7), [car(XC40, 53, 80, L(11, 10, 7))], config=m.PlannerConfig(above_minimum=True))
         data = json.loads(json.dumps(p.as_dict()))
         self.assertEqual(data['reason'], m.REASON_WAITING)
         charger = data['cars']['smartevse_1']
@@ -1343,7 +1464,7 @@ class RobustnessTests(unittest.TestCase):
             commitment = None
             if requests and rng.random() < 0.4:
                 commitment = m.Commitment(rng.choice(requests).outlet, m.floor15(now) + Q * rng.choice([0, 1, 2]))
-            config = m.PlannerConfig(top_up_price=rng.choice([None, 0.1, 0.3, 1.0]), no_price_mode=rng.random() < 0.1)
+            config = m.PlannerConfig(above_minimum=rng.random() < 0.7, no_price_mode=rng.random() < 0.1)
             p = m.build_plan(now, prices, powers, requests, config, commitment)
             self.assertEqual(p.as_dict(), m.build_plan(now, prices, powers, requests, config, commitment).as_dict())
             json.dumps(p.as_dict())
@@ -1359,8 +1480,7 @@ class RobustnessTests(unittest.TestCase):
                 self.assertEqual(m.floor15(seg.start), m.floor15(seg.end - timedelta(microseconds=1)))
                 used[m.floor15(seg.start)] = used.get(m.floor15(seg.start), 0.0) + seg.minutes
                 if seg.top_up:
-                    self.assertEqual(seg.price_kind, 'known')
-                    self.assertLessEqual(seg.price, config.top_up_price + 1e-9)
+                    self.assertTrue(config.above_minimum)
             for unit, minutes in used.items():
                 self.assertLessEqual(minutes, (unit + Q - max(unit, now_utc)).total_seconds() / 60 + 1e-6)
             if p.segments and p.segments[0].start <= now_utc:
@@ -1374,7 +1494,11 @@ class RobustnessTests(unittest.TestCase):
             for c in p.cars:
                 self.assertIn(c.status, self.STATUSES)
                 if c.status in ('planned', 'charging', 'tight'):
-                    self.assertGreaterEqual(min_energy(p, c.outlet), c.need_expected_kwh - 2e-3)
+                    # With extra charging planned the level decides what is "minimum".
+                    energy = sum(seg.energy_kwh for seg in segs(p, c.outlet))
+                    self.assertGreaterEqual(energy, c.need_expected_kwh - 2e-3)
+                    if not c.top_up:
+                        self.assertGreaterEqual(min_energy(p, c.outlet), c.need_expected_kwh - 2e-3)
                 for value in (c.cost, c.top_up_cost):
                     self.assertTrue(value is None or round(value, 2) == value)
 
@@ -1391,6 +1515,108 @@ class RobustnessTests(unittest.TestCase):
         hours = c.need_expected_kwh / 10.3
         self.assertAlmostEqual((dl - c.latest_start).total_seconds() / 3600, hours, delta=0.01)
         self.assertIsNone(plan(L(11, 9, 18, 30), [car(XC40, 85, 80, dl)]).car('smartevse_1').latest_start)
+
+
+class ScheduleBaselineTests(unittest.TestCase):
+    """The saving is compared with "Charge with schedule" (owner, 2026-11-11): the same
+    energy charged in the schedule's windows, by its rules."""
+
+    def setUp(self):
+        self.t0 = L(11, 9, 18)
+        # 18:00-24:00 dear, then the night: 00 0.30, 01 0.20, 02 0.10, 03 0.25, 04 0.15, 05-06 0.40.
+        self.prices = hourly(self.t0, [0.50] * 6 + [0.30, 0.20, 0.10, 0.25, 0.15, 0.40, 0.40])
+        self.powers = power_slots(self.t0, 13, expected=10.0)
+        self.night = [(L(11, 10, 0), L(11, 10, 7))]
+
+    def costs(self, sessions, **rules):
+        rules.setdefault("windows", self.night)
+        return m.schedule_baseline_costs(sessions, self.prices, self.powers, m.ScheduleRules(**rules))
+
+    def test_one_car_charges_from_the_start_of_the_schedule_window(self):
+        # Plugged in at 18:00, the schedule opens at midnight: 15 kWh at 10 kW = 00:00-01:30.
+        result = self.costs([m.BaselineSession('smartevse_1', self.t0, 15.0, 10.0)])
+        self.assertEqual(result, {'smartevse_1': round(10 * 0.30 + 5 * 0.20, 2)})
+        # Charging at plug-in would have used the 0.50 evening hours.
+        plug_in = m.baseline_costs([m.BaselineSession('smartevse_1', self.t0, 15.0, 10.0)], self.prices, self.powers)
+        self.assertEqual(plug_in, {'smartevse_1': 7.5})
+        # A car plugged in inside the window starts at once.
+        late = self.costs([m.BaselineSession('smartevse_1', L(11, 10, 2, 30), 10.0, 10.0)])
+        self.assertEqual(late, {'smartevse_1': round(5 * 0.10 + 5 * 0.25, 2)})
+
+    def test_two_cars_change_over_by_the_duty_cycle_and_the_policy_names_the_first(self):
+        cars = [m.BaselineSession('smartevse_1', self.t0, 10.0, 10.0), m.BaselineSession('smartevse_2', self.t0, 10.0, 10.0)]
+        # 60-minute duty cycle, SmartEVSE 1 first: 1 has 00-01 (0.30), 2 has 01-02 (0.20).
+        self.assertEqual(self.costs(cars, duty_minutes=60, first='smartevse_1'), {'smartevse_1': 3.0, 'smartevse_2': 2.0})
+        self.assertEqual(self.costs(cars, duty_minutes=60, first='smartevse_2'), {'smartevse_1': 2.0, 'smartevse_2': 3.0})
+        # 30 minutes: 1 has 00:00-00:30 and 01:00-01:30, 2 the half hours between.
+        self.assertEqual(self.costs(cars, duty_minutes=30, first='smartevse_1'), {'smartevse_1': 2.5, 'smartevse_2': 2.5})
+        # Without a duty cycle the first car finishes before the other starts; a car that
+        # has its energy leaves the rotation, so the other gets all the time after it.
+        uneven = [m.BaselineSession('smartevse_1', self.t0, 5.0, 10.0), m.BaselineSession('smartevse_2', self.t0, 20.0, 10.0)]
+        self.assertEqual(self.costs(uneven, first='smartevse_1'),
+                         {'smartevse_1': 1.5, 'smartevse_2': round(5 * 0.30 + 10 * 0.20 + 5 * 0.10, 2)})
+
+    def test_the_price_option_charges_only_at_or_below_the_acceptable_price(self):
+        car_ = [m.BaselineSession('smartevse_1', self.t0, 20.0, 10.0)]
+        # Limit 0.20: 01:00-03:00 (0.20, 0.10); 03:00 (0.25) is skipped.
+        self.assertEqual(self.costs(car_, price_limit=0.20), {'smartevse_1': round(10 * 0.20 + 10 * 0.10, 2)})
+        # 30 kWh needs a third cheap hour: 04:00 (0.15).
+        more = [m.BaselineSession('smartevse_1', self.t0, 30.0, 10.0)]
+        self.assertEqual(self.costs(more, price_limit=0.20), {'smartevse_1': round(10 * 0.20 + 10 * 0.10 + 10 * 0.15, 2)})
+        # Not enough cheap hours in the windows given: the schedule would not finish.
+        self.assertEqual(self.costs([m.BaselineSession('smartevse_1', self.t0, 45.0, 10.0)], price_limit=0.20),
+                         {'smartevse_1': None})
+        # A price that is not published: whether the schedule charges there is not known.
+        forecast = hourly(self.t0, [0.50] * 6) + hourly(L(11, 10, 0), [0.10] * 7, kind='forecast')
+        gated = m.schedule_baseline_costs(car_, forecast, self.powers, m.ScheduleRules(self.night, price_limit=0.20))
+        self.assertEqual(gated, {'smartevse_1': None})
+
+    def test_energy_that_does_not_fit_tonight_continues_in_the_next_window(self):
+        # 7 hours give 70 kWh; 80 kWh need the next night, whose prices are not known.
+        big = [m.BaselineSession('smartevse_1', self.t0, 80.0, 10.0)]
+        two_nights = self.night + [(L(11, 11, 0), L(11, 11, 7))]
+        self.assertEqual(self.costs(big, windows=two_nights), {'smartevse_1': None})
+        prices = self.prices + hourly(L(11, 10, 7), [0.60] * 17) + hourly(L(11, 11, 0), [0.05] * 7)
+        result = m.schedule_baseline_costs(big, prices, power_slots(self.t0, 40, expected=10.0), m.ScheduleRules(two_nights))
+        night_one = 10 * (0.30 + 0.20 + 0.10 + 0.25 + 0.15 + 0.40 + 0.40)
+        self.assertEqual(result, {'smartevse_1': round(night_one + 10 * 0.05, 2)})
+        # No schedule window at all: nothing can be compared.
+        self.assertEqual(self.costs(big, windows=[]), {'smartevse_1': None})
+
+    def test_power_limit_taper_zero_energy_and_several_windows_of_one_outlet(self):
+        slow = [m.PowerSlot(self.t0, self.t0 + 13 * H, 5.0, 4.0)]
+        result = m.schedule_baseline_costs([m.BaselineSession('smartevse_1', self.t0, 7.5, 10.0)], self.prices, slow,
+                                           m.ScheduleRules(self.night))
+        self.assertEqual(result, {'smartevse_1': round(5 * 0.30 + 2.5 * 0.20, 2)})
+        self.assertEqual(self.costs([m.BaselineSession('smartevse_1', self.t0, 0.0, 10.0)]), {'smartevse_1': 0.0})
+        self.assertEqual(self.costs([m.BaselineSession('smartevse_1', self.t0, 5.0, 0.0)]), {'smartevse_1': None})
+        flat = self.costs([m.BaselineSession('smartevse_1', self.t0, 12.0, 10.0)])['smartevse_1']
+        taper = self.costs([m.BaselineSession('smartevse_1', self.t0, 12.0, 10.0, soc=84.0, kwh_per_pct=0.75)])['smartevse_1']
+        self.assertLess(taper, flat)  # the taper stretches the charge into the cheaper 02:00 hour
+        # The realised ledger keys sessions by window; the charger decides who starts.
+        keyed = [m.BaselineSession('window-a', self.t0, 10.0, 10.0, charger='smartevse_2'),
+                 m.BaselineSession('window-b', self.t0, 10.0, 10.0, charger='smartevse_1')]
+        self.assertEqual(self.costs(keyed, duty_minutes=60, first='smartevse_1'), {'window-a': 2.0, 'window-b': 3.0})
+
+    def test_random_sessions_keep_the_schedule_rules(self):
+        rng = random.Random(11)
+        for _ in range(60):
+            energies = [rng.choice([0.0, 3.0, 12.0, 25.0, 40.0]) for _ in range(2)]
+            sessions = [m.BaselineSession(f'smartevse_{i + 1}', self.t0 + timedelta(minutes=rng.choice([0, 95, 400, 520])),
+                                          energy, rng.choice([7.0, 10.0, 11.0])) for i, energy in enumerate(energies)]
+            rules = m.ScheduleRules(self.night, price_limit=rng.choice([None, None, 0.25]),
+                                    duty_minutes=rng.choice([0, 15, 45]), first=rng.choice(['smartevse_1', 'smartevse_2']))
+            result = m.schedule_baseline_costs(sessions, self.prices, self.powers, rules)
+            self.assertEqual(result, m.schedule_baseline_costs(sessions, self.prices, self.powers, rules))
+            for session in sessions:
+                cost = result[session.outlet]
+                if cost is None:
+                    continue
+                # Never cheaper than the cheapest night price, never dearer than the dearest.
+                self.assertGreaterEqual(cost, round(session.energy_kwh * 0.10, 2) - 0.01)
+                self.assertLessEqual(cost, round(session.energy_kwh * 0.40, 2) + 0.01)
+                if rules.price_limit is not None:
+                    self.assertLessEqual(cost, round(session.energy_kwh * 0.25, 2) + 0.01)
 
 
 class BaselineTests(unittest.TestCase):

@@ -648,9 +648,19 @@ class NotAcceptingTests(TzTestCase):
             self.step(c, start)
             self.step(c, start + timedelta(seconds=300))
             self.assertTrue(c._mutable["smartevse_1_intelligent_reached"])
-            self.assertEqual(c._mutable["smartevse_1_intelligent_probes"], 0)
             self.assertIsNone(c._mutable["smartevse_1_intelligent_committed_until"])
             self.assertFalse(c._intelligent_not_accepting_active("smartevse_1", start + timedelta(minutes=6)))
+            # 0.0.11.0: it takes nothing above its minimum either. One more block is
+            # tried (the car may only have been slow to wake); after the second the
+            # session is complete, so no block keeps its charger in Smart for nothing.
+            self.assertEqual(c._mutable["smartevse_1_intelligent_probes"], 1)
+            self.assertFalse(c._mutable["smartevse_1_intelligent_complete"])
+            self.step(c, start + timedelta(seconds=310))
+            self.step(c, start + timedelta(seconds=610))
+            self.assertTrue(c._mutable["smartevse_1_intelligent_complete"])
+            self.assertEqual(c._mutable["smartevse_1_intelligent_complete_at"],
+                             (start + timedelta(seconds=610)).isoformat())
+            self.assertFalse(c._intelligent_not_accepting_active("smartevse_1", start + timedelta(minutes=12)))
         c = self.controller(smartevse_1_intelligent_probes=2)
         self.step(c, start)
         self.step(c, start + timedelta(seconds=300))
@@ -761,7 +771,12 @@ class CycleTests(TzTestCase):
         next_charge = data["intelligent_next_charge"]
         self.assertIsInstance(next_charge, datetime)
         self.assertIsNotNone(next_charge.tzinfo)
-        self.assertEqual(next_charge, L(11, 10, 1))  # the cheap 01:00-04:00 window
+        # The cheap 01:00-04:00 window takes the minimum (53 -> 80 %) and most of the
+        # charging above it (to the car's 90 %); the rest runs right before it.
+        self.assertEqual(next_charge, L(11, 10, 0, 33))
+        charger = data["intelligent"]["chargers"]["smartevse_1"]
+        self.assertEqual((charger["projected_soc"], charger["extra_soc"]), (80.0, 90.0))
+        self.assertEqual([block["top_up"] for block in charger["blocks"]], [False, True])
         charger = data["intelligent"]["chargers"]["smartevse_1"]
         self.assertEqual((charger["vehicle"], charger["soc"], charger["deadline"]),
                          ("vehicle_1", 53.0, L(11, 10, 7).isoformat()))
@@ -1082,10 +1097,9 @@ class ReviewRegressionTests(TzTestCase):
 
     async def test_reached_car_keeps_charging_in_cheap_known_hours(self):
         # XC40 plugged in at its 80 % minimum (car limit 90 %). The minimum is a floor:
-        # above it the car keeps charging in hours at or below the learned cheap price
-        # (0.29 here; 01:00-04:00 cost 0.20). No user switch or price since 0.0.10.0.
+        # above it the car keeps charging to its own limit in the cheapest hours before
+        # its ready-by (01:00-04:00 cost 0.20). No switch, no price limit (0.0.11.0).
         c = make_controller(intelligent_enabled=True)
-        c._intelligent.extra_price = MagicMock(return_value=0.29)
         put(c.states, XC40_BATTERY, 80.0, at=L(11, 9, 17, 54), unit_of_measurement="%")
         harness = Harness(c)
         await harness.cycle(L(11, 9, 17, 55))
@@ -1099,7 +1113,8 @@ class ReviewRegressionTests(TzTestCase):
         self.assertEqual(charger["status"], "reached")
         self.assertTrue(charger["top_up"])
         self.assertEqual(charger["extra_soc"], 90.0)  # up to the car's own limit
-        self.assertEqual(data["intelligent"]["top_up"], {"enabled": True, "price": 0.29, "source": "learned"})
+        self.assertEqual(data["intelligent"]["top_up"],
+                         {"enabled": True, "price": None, "source": "car_limit", "waits_until": None})
         self.assertTrue(all(block["top_up"] for block in charger["blocks"]))
         self.assertEqual(charger["blocks"][0]["start"], L(11, 10, 1).isoformat())
         c._async_post.reset_mock()
@@ -1111,6 +1126,47 @@ class ReviewRegressionTests(TzTestCase):
         harness.statuses["smartevse_1"] = status("smartevse_1", state="Charging", mode="Smart")
         await harness.cycle(L(11, 10, 1, 0, 30))
         self.assertEqual(c._mutable["smartevse_1_intelligent_committed_until"], L(11, 10, 1, 15).isoformat())
+
+    def test_schedule_settings_for_the_saving_comparison(self):
+        # The saving is compared with "Charge with schedule" as it is set up: the price
+        # option with its acceptable price, the duty cycle and the charge policy.
+        c = make_controller(intelligent_enabled=True, duty_cycle_minutes=45, acceptable_price=0.16, schedule_price=False)
+        self.assertEqual(c._schedule_baseline_settings(), {"price_limit": None, "duty_minutes": 45, "first": "smartevse_1"})
+        c._mutable.update(schedule_price=True, charge_policy="smartevse_2_first")
+        self.assertEqual(c._schedule_baseline_settings(), {"price_limit": 0.16, "duty_minutes": 45, "first": "smartevse_2"})
+        c._mutable.update(charge_policy="smartevse_2_only")
+        self.assertEqual(c._schedule_baseline_settings()["first"], "smartevse_2")
+        c._mutable.update(charge_policy="nonsense")
+        self.assertEqual(c._schedule_baseline_settings()["first"], "smartevse_1")
+
+    async def test_car_that_takes_nothing_above_its_minimum_is_left_alone(self):
+        # The car is at 85 % (minimum 80) and the integration reads a 90 % charge limit,
+        # but the car does not draw: its real limit is lower, or the reading is stale.
+        # After the no-draw probe the session is complete: no block is planned for it
+        # again, and it is never reported as "not accepting".
+        c = make_controller(intelligent_enabled=True)
+        put(c.states, XC40_BATTERY, 85.0, at=L(11, 9, 17, 54), unit_of_measurement="%")
+        harness = Harness(c)
+        await harness.cycle(L(11, 9, 17, 55))
+        harness.statuses["smartevse_1"] = status("smartevse_1")
+        put(c.states, XC40_CONNECTION, "disconnected", at=L(11, 9, 17, 50))
+        await harness.cycle(L(11, 9, 17, 56))
+        put(c.states, XC40_CONNECTION, "connected", at=L(11, 9, 17, 57))
+        await harness.cycle(L(11, 9, 18))
+        start = L(11, 10, 1, 0, 20)
+        data = await harness.cycle(start)
+        self.assertEqual((data["charge_allowed"], data["charge_reason"]), (True, "intelligent_top_up"))
+        harness.statuses["smartevse_1"] = status("smartevse_1", mode="Smart")  # Smart, connected, not drawing
+        for second in range(10, 900, 10):
+            data = await harness.cycle(start + timedelta(seconds=second))
+        self.assertTrue(c._mutable["smartevse_1_intelligent_complete"])
+        charger = data["intelligent"]["chargers"]["smartevse_1"]
+        self.assertEqual((data["charge_allowed"], charger["status"], charger["blocks"], charger["top_up"]),
+                         (False, "reached", [], False))
+        self.assertEqual((charger["not_accepting"], charger["extra_done"], charger["planned_kwh"]), (False, True, 0.0))
+        # It stays that way for the rest of the night.
+        data = await harness.cycle(L(11, 10, 3))
+        self.assertEqual((data["charge_allowed"], data["intelligent"]["chargers"]["smartevse_1"]["blocks"]), (False, []))
 
     async def test_schedule_mode_never_applies_a_cross_check_swap(self):
         # Review round 3: the §8.11 swap only acts while Intelligent plans; Schedule keeps

@@ -103,6 +103,41 @@ def active_window_start(schedule: dict[str, Any], now: datetime) -> str | None:
     return None
 
 
+def schedule_intervals(schedule: dict[str, Any], start: datetime, end: datetime, tz: Any) -> list[tuple[datetime, datetime]]:
+    """The intervals (UTC) in which the weekly schedule is on between ``start`` and
+    ``end``: local wall-clock blocks, touching blocks merged, also across midnight.
+    Raises ValueError for a definition that is not a native weekly schedule."""
+    if not isinstance(schedule, dict):
+        raise ValueError("Invalid native schedule definition")
+    first_day = dt_util.as_utc(start).astimezone(tz).date() - timedelta(days=1)
+    last_day = dt_util.as_utc(end).astimezone(tz).date() + timedelta(days=1)
+    found: list[tuple[datetime, datetime]] = []
+    day = first_day
+    while day <= last_day:
+        for block in schedule.get(_WEEKDAYS[day.weekday()], []) or []:
+            opens, closes = block["from"], block["to"]
+            opens = opens if isinstance(opens, time) else time.fromisoformat(opens)
+            if isinstance(closes, str) and closes.startswith("24:"):
+                closes = time.max
+            closes = closes if isinstance(closes, time) else time.fromisoformat(closes)
+            if opens.tzinfo is not None or closes.tzinfo is not None or opens >= closes:
+                raise ValueError("Invalid native schedule range")
+            begin = datetime.combine(day, opens, tzinfo=tz)
+            # HA writes the end of the day as time.max or 24:00, read back as 00:00.
+            finish = (datetime.combine(day + timedelta(days=1), time(), tzinfo=tz) if closes == time.max
+                      else datetime.combine(day, closes, tzinfo=tz))
+            found.append((dt_util.as_utc(begin), dt_util.as_utc(finish)))
+        day += timedelta(days=1)
+    merged: list[tuple[datetime, datetime]] = []
+    for begin, finish in sorted(found):
+        if merged and begin <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(finish, merged[-1][1]))
+        else:
+            merged.append((begin, finish))
+    low, high = dt_util.as_utc(start), dt_util.as_utc(end)
+    return [(max(begin, low), min(finish, high)) for begin, finish in merged if finish > low and begin < high]
+
+
 def _covers_day(blocks: list[tuple[time, time]]) -> bool:
     end = time()
     for first, last in sorted(blocks):

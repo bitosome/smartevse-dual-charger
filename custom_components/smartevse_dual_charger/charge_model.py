@@ -240,9 +240,6 @@ PRICE_ABS_MAX = 100.0
 # Charging above the minimum ("extra") is allowed in hours priced at or below what the
 # cheap hours of a day usually cost: per learned day the mean of its cheapest 6 hours,
 # then the median over the days. Needs 5 days with at least 18 priced hours.
-CHEAP_REFERENCE_HOURS = 6
-CHEAP_REFERENCE_MIN_DAYS = 5
-CHEAP_REFERENCE_MIN_HOURS = 18
 
 # §8.8 realised saving
 REALISED_LIMIT = 30
@@ -685,13 +682,17 @@ _REALISED_KEYS = frozenset({
     "unobserved_seconds", "mixed", "reached", "snapshot", "baseline_cost", "final",
 })
 # Added in review round 3; records written before it have no baseline start.
-_REALISED_OPTIONAL_KEYS = frozenset({"baseline_start"})
+# "baseline_kind" (0.0.11.0) names what a final baseline cost was compared with; a
+# record without it was compared with charging at plug-in.
+_REALISED_OPTIONAL_KEYS = frozenset({"baseline_start", "baseline_kind"})
+BASELINE_KINDS = ("plug_in", "schedule")
 
 
 def _valid_realised(record: Any) -> bool:
     return (isinstance(record, dict) and _REALISED_KEYS <= set(record)
             and set(record) <= _REALISED_KEYS | _REALISED_OPTIONAL_KEYS
             and _valid_time_text(record.get("baseline_start"))
+            and record.get("baseline_kind", BASELINE_KINDS[0]) in BASELINE_KINDS
             and isinstance(record["id"], str) and 0 < len(record["id"]) <= 64
             and record["outlet"] in OUTLETS
             and (record["vehicle"] is None or record["vehicle"] in VEHICLES)
@@ -966,6 +967,10 @@ class ChargeModel:
         self.vehicle_names: dict[str, str] = {
             k: v for k, v in (vehicle_names or {}).items() if k in VEHICLES and isinstance(v, str)}
         self.baseline = baseline
+        # What the baseline callback compares with now ("plug_in" or "schedule"). A
+        # closed window whose final baseline was computed for another kind is
+        # computed again, so History compares every charge with the same thing.
+        self.baseline_kind: str = BASELINE_KINDS[0]
         self.last_events: frozenset[str] = frozenset()
         self.last_error: str | None = None
         self._dirty = False
@@ -1168,25 +1173,6 @@ class ChargeModel:
         return (_aware(last_good["fetched_at"]), last_good["currency"],
                 [{"start": _from_min(s), "end": _from_min(e), "price": p}
                  for s, e, p in last_good["slots"]])
-
-    def cheap_price_reference(self, tz: tzinfo) -> Estimate | None:
-        """What the cheap hours of a day usually cost (see CHEAP_REFERENCE_*), or None
-        while fewer than 5 days of prices are known. Used as the price limit for
-        charging above the minimum; no user setting."""
-        days: dict[date, dict[int, float]] = {}
-        for hours in self._state["prices"].values():
-            for items in hours.values():
-                for start_min, price in items:
-                    local = _from_min(start_min).astimezone(tz)
-                    days.setdefault(local.date(), {})[local.hour] = price
-        cheap = []
-        for day in sorted(days)[-PRICE_BUCKET_LIMIT:]:
-            prices = sorted(days[day].values())
-            if len(prices) >= CHEAP_REFERENCE_MIN_HOURS:
-                cheap.append(sum(prices[:CHEAP_REFERENCE_HOURS]) / CHEAP_REFERENCE_HOURS)
-        if len(cheap) < CHEAP_REFERENCE_MIN_DAYS:
-            return None
-        return Estimate(round(_median(cheap), 4), SOURCE_LEARNED)
 
     def price_forecast(self, at: datetime, tz: tzinfo) -> tuple[float | None, str]:
         """§8.7: bucket median (n >= 3), else the same local hour on the most recent known day."""
@@ -2216,13 +2202,20 @@ class ChargeModel:
         Closed windows get a final baseline once every overlapping window that
         was plugged in earlier is closed (sequential one-charger baseline);
         open windows show a provisional value once the car reached its
-        minimum. saving = baseline(priced Intelligent kWh, top-up excluded) -
-        Intelligent ledger cost; None when mixed, partial, unpriceable or when
-        less than 0.1 kWh was charged under Intelligent.
+        minimum. saving = baseline(priced kWh charged by the plan, the charging
+        above the minimum included since 0.0.11.0) - their ledger cost; None when
+        mixed, partial, unpriceable or when less than 0.1 kWh was charged by the plan.
         Finalising marks the model dirty.
         """
         callback = baseline or self.baseline
         records = self._state["realised"]
+        kind = self.baseline_kind if self.baseline_kind in BASELINE_KINDS else BASELINE_KINDS[0]
+        if callback is not None:
+            for record in records:
+                if record["final"] and record.get("baseline_kind", BASELINE_KINDS[0]) != kind:
+                    record["final"] = False
+                    record["baseline_cost"] = None
+                    self._dirty = True
 
         def start_of(record):
             return _aware(record["start"])
@@ -2261,7 +2254,10 @@ class ChargeModel:
                 if not record["final"] and results is not None and not earlier_open:
                     cost = results.get(record["id"])
                     record["baseline_cost"] = round(cost, 2) if cost is not None else None
-                    record["final"] = True
+                    record["baseline_kind"] = kind
+                    # A schedule baseline that cannot be priced yet (its window is not in
+                    # the snapshot, or the schedule is not read) is tried again.
+                    record["final"] = cost is not None or kind == BASELINE_KINDS[0]
                     self._dirty = True
                 elif not record["final"] and results is not None:
                     provisional[record["id"]] = results.get(record["id"])
@@ -2275,10 +2271,11 @@ class ChargeModel:
                 baseline_cost = round(value, 2) if value is not None else None
             partial = self._window_partial(record)
             saving = None
+            planned = self._planned_parts(record)
             if (baseline_cost is not None and not record["mixed"] and not partial
                     and (closed or record["reached"])
-                    and record["intelligent"]["priced_kwh"] >= REALISED_MIN_KWH):
-                saving = round(baseline_cost - record["intelligent"]["cost"], 2)
+                    and planned["priced_kwh"] >= REALISED_MIN_KWH):
+                saving = round(baseline_cost - planned["cost"], 2)
             parts = (record["intelligent"], record["top_up"], record["other"])
             energy = sum(part["energy_kwh"] for part in parts)
             cost = sum(part["cost"] for part in parts)
@@ -2294,12 +2291,21 @@ class ChargeModel:
                 # For the adapter's planned saving (not published as such).
                 "id": record["id"], "deadline": record["deadline"],
                 "baseline_start": record.get("baseline_start"),
-                "intelligent_kwh": round(record["intelligent"]["energy_kwh"], 4),
-                "intelligent_priced_kwh": round(record["intelligent"]["priced_kwh"], 4),
-                "intelligent_cost": round(record["intelligent"]["cost"], 4),
+                "baseline_kind": record.get("baseline_kind", BASELINE_KINDS[0]) if record["final"] else kind,
+                # Charged by the plan: the minimum and the charging above it.
+                "intelligent_kwh": round(planned["energy_kwh"], 4),
+                "intelligent_priced_kwh": round(planned["priced_kwh"], 4),
+                "intelligent_cost": round(planned["cost"], 4),
                 "top_up_cost": round(record["top_up"]["cost"], 4),
             })
         return output
+
+    @staticmethod
+    def _planned_parts(record: Mapping[str, Any]) -> dict[str, float]:
+        """Energy and cost charged by the Intelligent plan in a window: the minimum
+        plus the charging above it (both are compared with charging at plug-in)."""
+        return {field: record["intelligent"][field] + record["top_up"][field]
+                for field in ("energy_kwh", "priced_kwh", "cost")}
 
     def realised_digest(self) -> list[list[Any]]:
         """What the published realised windows look like, without computing any
@@ -2331,7 +2337,7 @@ class ChargeModel:
                              "vehicle": record["vehicle"],
                              "plugged_at": anchor,
                              "start": start,
-                             "energy_kwh": round(record["intelligent"]["priced_kwh"], 4)})
+                             "energy_kwh": round(self._planned_parts(record)["priced_kwh"], 4)})
             snapshot = record["snapshot"]
             for index, kw in enumerate(snapshot["kw"]):
                 minute = snapshot["t0"] + 60 * index

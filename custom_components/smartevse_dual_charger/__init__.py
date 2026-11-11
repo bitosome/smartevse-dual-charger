@@ -88,7 +88,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
 
 # Entities that earlier versions created and this one no longer has: the user's top-up
-# switch and price (0.0.9.x; charging above the minimum is automatic since 0.0.10.0)
+# switch and price (0.0.9.x; charging above the minimum is automatic since 0.0.10.0,
+# and has no price limit since 0.0.11.0)
 # and the unidentified-vehicle minimum (never released). Without this they would stay
 # in the registry as "unavailable".
 RETIRED_ENTITIES = (

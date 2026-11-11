@@ -1411,23 +1411,6 @@ class PriceForecastTests(unittest.TestCase):
             bucket.sort()
         return state
 
-    def test_cheap_price_reference_is_the_usual_cost_of_a_days_cheap_hours(self):
-        # 0.0.10.0: the price limit for charging above the minimum is learned, not typed.
-        # Each day: hours cost 0.20, 0.21, ... so the six cheapest average 0.225.
-        model = cm.ChargeModel(self.priced_days(6))
-        self.assertEqual(model.cheap_price_reference(TZ), cm.Estimate(0.225, "learned"))
-        # Fewer than five days: no limit yet, so nothing is charged above the minimum.
-        self.assertIsNone(cm.ChargeModel(self.priced_days(4)).cheap_price_reference(TZ))
-        self.assertIsNone(cm.ChargeModel().cheap_price_reference(TZ))
-        # The median over the days: one very cheap and one very dear day do not move it.
-        odd = self.priced_days(7, level=lambda day, hour: (0.01 if day == 0 else 0.90 if day == 1 else 0.20) + 0.01 * hour)
-        self.assertEqual(cm.ChargeModel(odd).cheap_price_reference(TZ).value, 0.225)
-        # A day with fewer than 18 priced hours does not count.
-        thin = self.priced_days(5)
-        for hour in range(8):
-            thin["prices"]["weekday"][str(hour)].pop()
-        self.assertIsNone(cm.ChargeModel(thin).cheap_price_reference(TZ))
-
     def test_ingest_dedupes_by_start(self):
         model = cm.ChargeModel()
         events = self.observe(model, L(2026, 11, 9, 18, 30), known_entries())
@@ -1582,7 +1565,8 @@ class RealisedBaselineStartTests(unittest.TestCase):
                     "plugged_at": start, "start": start, "baseline_start": start,
                     "snapshot": {"t0": int(datetime.fromisoformat(start).timestamp() // 60) // 60 * 60,
                                  "prices": prices, "kinds": kinds, "kw": [10.0] * len(prices)},
-                    "intelligent": {"energy_kwh": energy, "cost": 0.0, "priced_kwh": energy}}
+                    "intelligent": {"energy_kwh": energy, "cost": 0.0, "priced_kwh": energy},
+                    "top_up": {"energy_kwh": 0.0, "cost": 0.0, "priced_kwh": 0.0}}
         start = L(2026, 11, 9, 22)
         a = record("a", start.isoformat(), "kff", [0.3, 0.2, 0.2], 5.0)
         b = record("b", (start + timedelta(hours=1)).isoformat(), "kk", [0.25, 0.25], 15.0)
@@ -1780,7 +1764,9 @@ class RealisedSavingTests(unittest.TestCase):
         self.assertIsNone(record["closed_at"])
         self.assertEqual(record["deadline"], L(2026, 11, 10, 6, 30).isoformat())
 
-    def test_top_up_energy_is_excluded_from_the_saving(self):
+    def test_charging_above_the_minimum_is_part_of_the_saving(self):
+        # 0.0.11.0: every car goes on above its minimum, so that energy is compared with
+        # charging at plug-in like the rest (it was left out while it was an option).
         calls = []
 
         def top_up(s):
@@ -1791,9 +1777,66 @@ class RealisedSavingTests(unittest.TestCase):
         [session] = sim.model.realised_sessions(TZ)
         self.assertAlmostEqual(session["top_up_kwh"], 5.1, delta=0.1)
         self.assertAlmostEqual(session["energy_kwh"], 10.2, delta=0.1)
-        self.assertAlmostEqual(calls[0][0]["energy_kwh"], 5.1, delta=0.1)
+        self.assertAlmostEqual(calls[0][0]["energy_kwh"], 10.2, delta=0.1)
         record = sim.model.to_dict()["realised"][0]
-        self.assertEqual(session["saving"], round(session["baseline_cost"] - record["intelligent"]["cost"], 2))
+        self.assertGreater(record["top_up"]["cost"], 0)
+        self.assertEqual(session["saving"], round(
+            session["baseline_cost"] - record["intelligent"]["cost"] - record["top_up"]["cost"], 2))
+        self.assertAlmostEqual(session["intelligent_kwh"], 10.2, delta=0.1)
+
+    def test_a_changed_comparison_recomputes_finished_windows(self):
+        # 0.0.11.0: the saving is compared with "Charge with schedule" when a schedule is
+        # configured. Windows finished under the plug-in comparison are computed again, so
+        # History compares every charge with the same thing.
+        calls = []
+        sim = Sim(L(2026, 11, 9, 17, 59, 30), prices=known_entries(), baseline=fake_baseline(calls))
+        sim.price = 0.2418
+        self.night(sim)
+        [session] = sim.model.realised_sessions(TZ)
+        [record] = sim.model.to_dict()["realised"]
+        self.assertEqual((record["final"], record["baseline_kind"], session["baseline_kind"]), (True, "plug_in", "plug_in"))
+        plug_in_cost = session["baseline_cost"]
+        self.assertEqual(len(calls), 1)
+        sim.model.realised_sessions(TZ)
+        self.assertEqual(len(calls), 1)  # final: not computed again
+
+        def schedule(sessions, price_slots, power_slots):
+            calls.append("schedule")
+            return {session["key"]: 1.0 for session in sessions}
+        sim.model.baseline = schedule
+        sim.model.baseline_kind = "schedule"
+        [session] = sim.model.realised_sessions(TZ)
+        [record] = sim.model.to_dict()["realised"]
+        self.assertEqual((record["final"], record["baseline_kind"], session["baseline_cost"], session["baseline_kind"]),
+                         (True, "schedule", 1.0, "schedule"))
+        self.assertNotEqual(plug_in_cost, 1.0)
+        self.assertEqual(session["saving"], round(1.0 - record["intelligent"]["cost"], 2))
+        sim.model.realised_sessions(TZ)
+        self.assertEqual(calls.count("schedule"), 1)
+        # A stored record with the field loads, and one with an unknown kind is dropped.
+        state = sim.model.to_dict()
+        self.assertEqual(cm.ChargeModel(deepcopy(state)).to_dict()["realised"][0]["baseline_kind"], "schedule")
+        broken = deepcopy(state)
+        broken["realised"][0]["baseline_kind"] = "something"
+        self.assertEqual(cm.ChargeModel(broken).to_dict()["realised"], [])
+
+    def test_a_schedule_baseline_that_cannot_be_priced_yet_is_tried_again(self):
+        answers = [None, 2.5]
+        calls = []
+
+        def schedule(sessions, price_slots, power_slots):
+            calls.append(1)
+            return {session["key"]: answers[min(len(calls), len(answers)) - 1] for session in sessions}
+        sim = Sim(L(2026, 11, 9, 17, 59, 30), prices=known_entries(), baseline=schedule)
+        sim.model.baseline_kind = "schedule"
+        sim.price = 0.2418
+        self.night(sim)
+        [session] = sim.model.realised_sessions(TZ)
+        self.assertEqual((session["baseline_cost"], session["saving"]), (None, None))
+        self.assertFalse(sim.model.to_dict()["realised"][0]["final"])
+        [session] = sim.model.realised_sessions(TZ)
+        self.assertEqual(session["baseline_cost"], 2.5)
+        self.assertTrue(sim.model.to_dict()["realised"][0]["final"])
 
     def test_two_cars_get_a_sequential_baseline_finalised_in_plug_order(self):
         calls = []

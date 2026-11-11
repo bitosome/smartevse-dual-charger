@@ -286,6 +286,8 @@ NON_DRAWING_MODES = {"Off", "Pause"}
 INTELLIGENT_NOT_ACCEPTING_MIN_SECONDS = 300  # >= max(30 x update interval, 300 s)
 INTELLIGENT_NOT_ACCEPTING_HOLD = timedelta(minutes=60)
 INTELLIGENT_MAX_PROBES = 3
+# No-draw blocks of a car that is at or above its minimum before its session is complete.
+INTELLIGENT_EXTRA_TRIES = 2
 INTELLIGENT_RETRY_AFTER = timedelta(minutes=30)
 INTELLIGENT_MAX_RETRIES = 2
 INTELLIGENT_RETRY_MARGIN = 1.0  # % below target
@@ -1531,17 +1533,24 @@ class SmartEVSEDualChargerController:
             result[vehicle_key] = (soc, self._parse_datetime(self._mutable.get(f"{vehicle_key}_last_soc_at")))
         return result
 
-    def _intelligent_extra_price(self) -> float | None:
-        """Price limit for charging above the minimum: what the cheap hours of a day
-        usually cost, learned from the price lists (0.0.10.0; replaces the user's
-        top-up switch and price). None until enough days are known."""
-        intelligent = getattr(self, "_intelligent", None)
-        if intelligent is None:
-            return None
+    def _schedule_baseline_settings(self) -> dict[str, Any]:
+        """How "Charge with schedule" would charge, for the saving comparison."""
         try:
-            return intelligent.extra_price()
-        except Exception:  # noqa: BLE001 - extra charging is optional
-            return None
+            policy = ChargePolicy(self._mutable["charge_policy"])
+        except (KeyError, ValueError):
+            policy = ChargePolicy(DEFAULT_CHARGE_POLICY)
+        only = {ChargePolicy.SMARTEVSE_1_ONLY: "smartevse_1", ChargePolicy.SMARTEVSE_2_ONLY: "smartevse_2"}.get(policy)
+        price_limit = None
+        if self._mutable.get("schedule_price"):
+            try:
+                price_limit = float(self._mutable["acceptable_price"])
+            except (KeyError, TypeError, ValueError):
+                price_limit = None
+        return {
+            "price_limit": price_limit,
+            "duty_minutes": max(1, int(self._mutable.get("duty_cycle_minutes") or 1)),
+            "first": only or self._preferred_smartevse(policy),
+        }
 
     def _intelligent_not_accepting_active(self, smartevse_key: str, now: datetime) -> bool:
         if int(self._mutable.get(f"{smartevse_key}_intelligent_probes") or 0) >= INTELLIGENT_MAX_PROBES:
@@ -1604,6 +1613,10 @@ class SmartEVSEDualChargerController:
             if enabled:
                 self._update_intelligent_not_accepting(now=now, statuses=statuses)
             model_state, model_reason = self._intelligent_model_state(pre_state, pre_reason)
+            # The saving is compared with "Charge with schedule": its weekly windows
+            # and the schedule settings (price option, duty cycle, charge policy).
+            await intelligent.async_refresh_schedule(now)
+            intelligent.set_schedule_settings(**self._schedule_baseline_settings())
             observed = intelligent.observe(
                 now,
                 outlets=self._intelligent_outlet_inputs(statuses),
@@ -1629,7 +1642,7 @@ class SmartEVSEDualChargerController:
                     now,
                     self._intelligent_plan_inputs(now=now, statuses=statuses, facts=observed.facts),
                     commitment=self._intelligent_commitment(now),
-                    top_up_price=self._intelligent_extra_price(),
+                    above_minimum=True,
                     seed=self._intelligent_seed_decision(now, statuses) if intelligent.last_decision is None else None,
                 )
             else:
@@ -1690,7 +1703,17 @@ class SmartEVSEDualChargerController:
             # A car showing its minimum (e.g. an unverified reading probed with one
             # short charge) that does not draw is full, not refusing: it has reached
             # its minimum for this session (planned again only below target - 2).
+            # It also takes nothing above the minimum (it stops below the charge limit
+            # the integration knows, or that limit is out of date): the session is
+            # complete, or the plan would keep its charger in Smart for nothing and
+            # keep those hours from the other car.
             self._mutable[f"{smartevse_key}_intelligent_reached"] = True
+            # The second time: a car that was only slow to wake gets one more block.
+            tries = int(self._mutable.get(f"{smartevse_key}_intelligent_probes") or 0) + 1
+            self._mutable[f"{smartevse_key}_intelligent_probes"] = min(tries, INTELLIGENT_EXTRA_TRIES)
+            if tries >= INTELLIGENT_EXTRA_TRIES and not self._mutable.get(f"{smartevse_key}_intelligent_complete"):
+                self._mutable[f"{smartevse_key}_intelligent_complete"] = True
+                self._mutable[f"{smartevse_key}_intelligent_complete_at"] = now.isoformat()
             return
         probes = int(self._mutable.get(f"{smartevse_key}_intelligent_probes") or 0) + 1
         if facts is None or facts.soc is None:
@@ -1923,8 +1946,8 @@ class SmartEVSEDualChargerController:
         """The ``intelligent`` payload and flat sensor values (never raises)."""
         enabled = bool(self._mutable.get("intelligent_enabled"))
         settings = self._intelligent_settings()
-        top_up_price = self._intelligent_extra_price()
-        top_up_enabled = top_up_price is not None
+        # The minimum is a floor: charging always goes on to the car's own limit.
+        top_up_enabled = True
         intelligent = getattr(self, "_intelligent", None)
         overridden = enabled and not governing
         if intelligent is not None:
@@ -1953,7 +1976,6 @@ class SmartEVSEDualChargerController:
                     active_since=self._parse_datetime(self._mutable.get("active_smartevse_since")) if active else None,
                     settings=settings,
                     top_up_enabled=top_up_enabled,
-                    top_up_price=top_up_price,
                     outlets=outlets,
                 )
                 return intelligent.build_payload(now, context)
@@ -1975,7 +1997,6 @@ class SmartEVSEDualChargerController:
             settings=settings,
             vehicle_names={key: self._configured_vehicle_name(key) for key in ("vehicle_1", "vehicle_2")},
             top_up_enabled=top_up_enabled,
-            top_up_price=top_up_price,
             entities=entities,
         )
         if intelligent is not None and enabled:

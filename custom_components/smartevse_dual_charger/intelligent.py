@@ -24,6 +24,7 @@ failure never means "charge now at any price".
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta, tzinfo
@@ -46,6 +47,7 @@ from .const import (
     CONF_MAINS_L2_ENTITY,
     CONF_MAINS_L3_ENTITY,
     CONF_PRICE_SENSOR_ENTITY,
+    CONF_SCHEDULE_ENTITY,
     CONF_VEHICLE_1_BATTERY_CAPACITY_KWH,
     CONF_VEHICLE_1_BATTERY_ENTITY,
     CONF_VEHICLE_2_BATTERY_CAPACITY_KWH,
@@ -86,6 +88,7 @@ from .const import (
     VEHICLE_INTEGRATION_DOMAIN,
 )
 from .naming import configured_vehicle_names
+from .schedule_reminders import schedule_intervals
 from .storage import ModelStore
 
 OUTLETS = ("smartevse_1", "smartevse_2")
@@ -125,6 +128,14 @@ FALLBACK_EXPECTED_KW = 9.0
 PRICE_PUBLICATION_LOCAL = time(15, 0)
 FALLBACK_CONSERVATIVE_KW = 7.5
 FALLBACK_CAP_KW = 10.7
+# What the saving is compared with: the same energy charged by "Charge with schedule"
+# (when a schedule helper is configured), else charging at plug-in.
+BASELINE_SCHEDULE = "schedule"
+BASELINE_PLUG_IN = "plug_in"
+SCHEDULE_REFRESH = timedelta(minutes=10)
+SCHEDULE_RETRY = timedelta(minutes=1)
+SCHEDULE_READ_TIMEOUT = 10
+SCHEDULE_BASELINE_HORIZON = timedelta(hours=72)
 EMERGENCY_MARGIN = 1.10
 EMERGENCY_OVERHEAD = timedelta(minutes=10)
 
@@ -350,7 +361,7 @@ def emergency_outlet(now: datetime, cars: Sequence[cp.CarRequest]) -> str | None
 def empty_payload(*, enabled: bool, overridden: bool = False,
                   settings: Mapping[str, Mapping[str, Any]] | None = None,
                   vehicle_names: Mapping[str, str] | None = None, top_up_enabled: bool = False,
-                  top_up_price: float | None = None, entities: Mapping[str, Any] | None = None,
+                  entities: Mapping[str, Any] | None = None,
                   currency: str | None = None) -> dict[str, Any]:
     """The §10 payload shape with nothing planned (also used when the adapter is missing)."""
     settings = settings or {}
@@ -396,9 +407,11 @@ def empty_payload(*, enabled: bool, overridden: bool = False,
         "household": {"learned_days": 0, "night_expected_kw": None},
         "slots": [],
         "sessions": [],
-        # Charging above the minimum in cheap hours. "price" is the learned limit; there
-        # is no user setting since 0.0.10.0.
-        "top_up": {"enabled": bool(top_up_enabled), "price": top_up_price, "source": "learned"},
+        # Charging above the minimum: since 0.0.11.0 every car goes on to its own limit
+        # in the cheapest known-price hours before its ready-by time. There is no price
+        # limit ("price" stays for older cards); "waits_until" is set while that charging
+        # waits for prices that are still due.
+        "top_up": {"enabled": bool(top_up_enabled), "price": None, "source": "car_limit", "waits_until": None},
         "entities": dict(entities) if entities is not None else build_entities(lambda _domain, _key: None),
     }
 
@@ -494,7 +507,7 @@ class PlanInput:
     # (its plug session, deadline and overrun are kept by the controller).
     unavailable: bool = False
     # Reached its minimum in this session (§8.4 hysteresis): no minimum need, but
-    # still topped up to its car limit in cheap known hours when top-up is on.
+    # it goes on to its car limit in the cheapest known-price hours before its ready-by.
     reached: bool = False
     # Held off because it did not draw (§6.4); part of ``done``.
     not_accepting: bool = False
@@ -534,7 +547,6 @@ class PayloadContext:
     active_since: datetime | None
     settings: Mapping[str, Mapping[str, Any]]  # {"vehicle_1": {"ready_by", "minimum"}, ...}
     top_up_enabled: bool
-    top_up_price: float | None
     outlets: Mapping[str, OutletPayloadInput]
 
 
@@ -572,6 +584,15 @@ class IntelligentCharging:
         self._currency: str | None = None
         self._known_until: datetime | None = None
         self._prices_expected_at: datetime | None = None
+        # The saving is compared with "Charge with schedule": the weekly definition of
+        # the schedule helper and the schedule settings of the controller.
+        self._schedule_definition: dict[str, Any] | None = None
+        self._schedule_read_at: datetime | None = None
+        self._schedule_read_ok = False
+        self._schedule_marker: Any = None
+        self._schedule_settings: dict[str, Any] = {}
+        self._extra_waits_until: datetime | None = None
+        self._extra_first_missing: datetime | None = None
         self._limits: dict[str, float | None] = {}
         self._capacities: dict[str, float | None] = {}
         self._plan: cp.Plan | None = None
@@ -833,10 +854,82 @@ class IntelligentCharging:
         else:
             LOGGER.debug(message, exc_info=True)
 
-    # -- baseline callback (model realised windows, §7.8) ---------------------------
+    # -- baseline: what the saving is compared with (§7.8) -----------------------------
+
+    @property
+    def baseline_kind(self) -> str:
+        """"schedule" when a schedule helper is configured: the saving is compared with
+        the same energy charged by "Charge with schedule". Otherwise "plug_in"."""
+        return BASELINE_SCHEDULE if self._entry_data.get(CONF_SCHEDULE_ENTITY) else BASELINE_PLUG_IN
+
+    def set_schedule_settings(self, *, price_limit: float | None, duty_minutes: float, first: str | None) -> None:
+        """The controller's schedule settings for the baseline: the acceptable price
+        while the schedule's price option is on, the duty cycle and the charger the
+        charge policy starts with."""
+        self._schedule_settings = {"price_limit": price_limit, "duty_minutes": duty_minutes, "first": first}
+
+    async def async_refresh_schedule(self, now: datetime) -> None:
+        """Read the weekly definition of the schedule helper (never raises). Read again
+        when the helper changes and every ten minutes, so an edited schedule is used."""
+        entity_id = self._entry_data.get(CONF_SCHEDULE_ENTITY)
+        services = getattr(self.hass, "services", None)
+        if not entity_id or services is None:
+            return
+        state = self.hass.states.get(entity_id)
+        marker = (entity_id, getattr(state, "state", None), getattr(state, "last_updated", None))
+        if (self._schedule_read_ok and marker == self._schedule_marker
+                and self._schedule_read_at is not None and now - self._schedule_read_at < SCHEDULE_REFRESH):
+            return
+        if self._schedule_read_at is not None and marker == self._schedule_marker \
+                and now - self._schedule_read_at < SCHEDULE_RETRY:
+            return  # a failed read is retried a minute later, not every cycle
+        self._schedule_read_at, self._schedule_marker, self._schedule_read_ok = now, marker, False
+        try:
+            async with asyncio.timeout(SCHEDULE_READ_TIMEOUT):
+                response = await services.async_call(
+                    "schedule", "get_schedule", {"entity_id": entity_id}, blocking=True, return_response=True)
+            definition = (response or {}).get(entity_id)
+            if not isinstance(definition, dict):
+                raise ValueError("the schedule definition is unavailable")
+            schedule_intervals(definition, now, now + timedelta(days=7), default_time_zone())  # validates it
+            self._schedule_read_ok = True
+            if definition != self._schedule_definition:
+                self._schedule_definition = definition
+                self._display_key = None  # the planned saving depends on it
+        except Exception:  # noqa: BLE001 - only the saving depends on it
+            self._log_exception("schedule", "Unable to read the charge schedule for the saving comparison", now)
+
+    def _schedule_rules(self, start: datetime, end: datetime) -> cp.ScheduleRules | None:
+        if self._schedule_definition is None:
+            return None
+        settings = self._schedule_settings
+        return cp.ScheduleRules(
+            windows=schedule_intervals(self._schedule_definition, start, end, default_time_zone()),
+            price_limit=settings.get("price_limit"),
+            duty_minutes=float(settings.get("duty_minutes") or 0.0),
+            first=settings.get("first"),
+        )
+
+    def _baseline_costs(self, sessions: Sequence[cp.BaselineSession], prices: Sequence[cp.PriceSlot],
+                        powers: Sequence[cp.PowerSlot]) -> dict[str, float | None]:
+        """Baseline cost per session key: "Charge with schedule" when a schedule helper is
+        configured (None for every session until its definition has been read), else
+        charging at plug-in."""
+        if self.baseline_kind != BASELINE_SCHEDULE:
+            return cp.baseline_costs(sessions, prices, powers)
+        if not sessions:
+            return {}
+        start = min(dt_util.as_utc(session.plugged_at) for session in sessions)
+        ends = [dt_util.as_utc(slot.end) for slot in prices]
+        end = max([start + SCHEDULE_BASELINE_HORIZON, *ends])
+        rules = self._schedule_rules(start, end)
+        if rules is None:
+            return {session.outlet: None for session in sessions}
+        return cp.schedule_baseline_costs(sessions, prices, powers, rules)
 
     def _baseline(self, sessions: Sequence[Mapping[str, Any]], price_slots: Sequence[Mapping[str, Any]],
                   power_slots: Sequence[Mapping[str, Any]]) -> dict[str, float | None]:
+        """Callback of the model's realised windows."""
         prices = [cp.PriceSlot(s["start"], s["end"], s.get("price"), s.get("kind") or cp.PRICE_UNKNOWN)
                   for s in price_slots]
         powers = [cp.PowerSlot(s["start"], s["end"], float(s.get("expected_kw") or 0.0),
@@ -844,9 +937,10 @@ class IntelligentCharging:
                   for s in power_slots]
         cap = max((p.expected_kw for p in powers), default=FALLBACK_CAP_KW) or FALLBACK_CAP_KW
         baseline = [cp.BaselineSession(outlet=s["key"], plugged_at=s["plugged_at"],
-                                       energy_kwh=float(s.get("energy_kwh") or 0.0), cap_kw=cap)
+                                       energy_kwh=float(s.get("energy_kwh") or 0.0), cap_kw=cap,
+                                       charger=s.get("outlet"))
                     for s in sessions]
-        return cp.baseline_costs(baseline, prices, powers)
+        return self._baseline_costs(baseline, prices, powers)
 
     # -- 1. observation (every mode) -------------------------------------------------
 
@@ -1163,7 +1257,7 @@ class IntelligentCharging:
         return requests
 
     def plan(self, now: datetime, inputs: Mapping[str, PlanInput], *, commitment: tuple[str, datetime] | None = None,
-             top_up_price: float | None = None, seed: IntelligentDecision | None = None) -> IntelligentDecision:
+             above_minimum: bool = True, seed: IntelligentDecision | None = None) -> IntelligentDecision:
         """Run the planner for the connected outlets and return the gate decision.
 
         ``seed`` stands in for the previous decision when this process has none yet
@@ -1186,7 +1280,9 @@ class IntelligentCharging:
         if commitment is not None and commitment[1] > now:
             commit = cp.Commitment(commitment[0], commitment[1])
         self._prices_expected_at = self._expected_prices(now, cars)
-        config = cp.PlannerConfig(top_up_price=top_up_price, prices_expected_at=self._prices_expected_at)
+        self._extra_waits_until = self._extra_prices_expected(now, cars) if above_minimum else None
+        config = cp.PlannerConfig(above_minimum=above_minimum, prices_expected_at=self._prices_expected_at,
+                                  extra_prices_expected_at=self._extra_waits_until)
         plan = None
         failed = False
         try:
@@ -1212,10 +1308,38 @@ class IntelligentCharging:
             self._display_plan = plan
         return decision
 
-    def extra_price(self) -> float | None:
-        """The learned price limit for charging above the minimum, or None."""
-        reference = self.model.cheap_price_reference(default_time_zone())
-        return None if reference is None else float(reference.value)
+    def _extra_prices_expected(self, now: datetime, cars: Sequence[cp.CarRequest]) -> datetime | None:
+        """When the first missing price of the plan window should be published, or None.
+
+        Charging above the minimum is optional, so it waits for prices that are still
+        due instead of using the hours known now (the planner applies this per car:
+        only a car whose own window has a missing price waits). Unlike
+        ``_expected_prices`` this does not depend on what the cars still need.
+        """
+        self._extra_first_missing = None
+        deadlines = [cp._utc(car.deadline) for car in cars if not (car.excluded or car.done)]
+        if not deadlines:
+            return None
+        self._extra_first_missing = self._first_missing_price(now, max(deadlines))
+        return self._publication(now, self._extra_first_missing)
+
+    def _first_missing_price(self, now: datetime, horizon: datetime) -> datetime | None:
+        missing = [s.start for s in self._price_slots if s.kind != cp.PRICE_KNOWN and s.start < horizon]
+        covered = max((s.end for s in self._price_slots), default=None)
+        if covered is None or covered < horizon:
+            missing.append(covered or now)
+        return min(missing) if missing else None
+
+    @staticmethod
+    def _publication(now: datetime, first: datetime | None) -> datetime | None:
+        """Day-ahead lists run 01:00 -> 01:00 local and arrive by 15:00 the day before
+        they start; None when that time has passed (the prices are late)."""
+        if first is None:
+            return None
+        tz = default_time_zone()
+        day = (first - timedelta(hours=1)).astimezone(tz).date() - timedelta(days=1)
+        expected = datetime.combine(day, PRICE_PUBLICATION_LOCAL, tzinfo=tz).astimezone(UTC)
+        return expected if expected > now else None
 
     def _expected_prices(self, now: datetime, cars: Sequence[cp.CarRequest]) -> datetime | None:
         """When the first missing price should be published, or None when the plan must
@@ -1228,25 +1352,15 @@ class IntelligentCharging:
         run 01:00 -> 01:00 local and arrive by 15:00 the day before they start; when
         that time has passed the prices are late and the plan no longer waits.
         """
-        tz = default_time_zone()
         deadlines = [cp._utc(car.deadline) for car in cars
                      if not (car.excluded or car.done or car.reached)
                      and (car.soc is None or car.soc < car.target_soc)]
         if not deadlines:
             return None
-        horizon = max(deadlines)
-        missing = [s.start for s in self._price_slots if s.kind != cp.PRICE_KNOWN and s.start < horizon]
-        covered = max((s.end for s in self._price_slots), default=None)
-        if covered is None or covered < horizon:
-            missing.append(covered or now)
-        if not missing:
+        first = self._first_missing_price(now, max(deadlines))
+        if first is None or min(deadlines) <= first:
             return None
-        first = min(missing)
-        if min(deadlines) <= first:
-            return None
-        day = (first - timedelta(hours=1)).astimezone(tz).date() - timedelta(days=1)
-        expected = datetime.combine(day, PRICE_PUBLICATION_LOCAL, tzinfo=tz).astimezone(UTC)
-        return expected if expected > now else None
+        return self._publication(now, first)
 
     def _decide(self, now: datetime, plan: cp.Plan | None, cars: Sequence[cp.CarRequest],
                 inputs: Mapping[str, PlanInput], failed: bool) -> IntelligentDecision:
@@ -1347,6 +1461,8 @@ class IntelligentCharging:
         self._plan_inputs = {}
         self._decision = None
         self._planner_error = None
+        self._extra_waits_until = None
+        self._extra_first_missing = None
 
     # -- 4. payload ------------------------------------------------------------------------
 
@@ -1434,7 +1550,8 @@ class IntelligentCharging:
             "unit": cp.floor15(now).isoformat(),
             "ctx": [ctx.enabled, ctx.overridden, ctx.governing, ctx.charge_allowed, ctx.controller_state,
                     ctx.charge_reason, ctx.active_outlet, iso_minute(ctx.active_since),
-                    ctx.top_up_enabled, ctx.top_up_price],
+                    ctx.top_up_enabled, iso_minute(self._extra_waits_until),
+                    self.baseline_kind, self._schedule_settings, self._schedule_definition],
             "settings": {key: dict(value) for key, value in ctx.settings.items()},
             "outlets": outlets,
             "decision": [plan.current_outlet, plan.reason, plan.no_price_mode, list(plan.order)]
@@ -1461,17 +1578,20 @@ class IntelligentCharging:
         connected = [outlet for outlet in OUTLETS if outlet in self._facts]
         payload = empty_payload(enabled=ctx.enabled, overridden=ctx.overridden, settings=ctx.settings,
                                 vehicle_names=self._vehicle_names(), top_up_enabled=ctx.top_up_enabled,
-                                top_up_price=ctx.top_up_price, entities=static["entities"],
+                                entities=static["entities"],
                                 currency=self._currency)
         payload.update({
             "connected_count": len(connected),
             "known_until": iso_minute(self._known_until) if plan is not None else None,
             "prices_expected_at": iso_minute(self._prices_expected_at) if plan is not None else None,
+            "baseline_kind": self.baseline_kind,
             "model_error": self.model_error,
             "planner_error": self._planner_error if ctx.enabled else None,
             "vehicles": static["vehicles"],
             "household": static["household"],
         })
+        if plan is not None:
+            payload["top_up"]["waits_until"] = iso_minute(self._extra_waits_until)
         realised = self._realised(tz, now)
         payload["sessions"] = [
             {
@@ -1485,6 +1605,8 @@ class IntelligentCharging:
                 "saving": money(record.get("saving")),
                 "mixed": bool(record.get("mixed")),
                 "partial": bool(record.get("partial")),
+                # What this window's saving is compared with ("schedule" or "plug_in").
+                "baseline_kind": record.get("baseline_kind") or BASELINE_PLUG_IN,
             }
             for record in realised
             # A window without energy, open or closed (the one a deadline roll opens
@@ -1531,7 +1653,8 @@ class IntelligentCharging:
                 energy += (car.energy_kwh or 0.0) + (car.top_up_kwh or 0.0)
                 if entry["session_cost"] is not None:
                     totals_cost.append(entry["session_cost"])
-                has_energy = (car.energy_kwh or 0.0) > 0 or (savings.get(outlet) or {}).get("delivered", 0) > 0
+                has_energy = ((car.energy_kwh or 0.0) + (car.top_up_kwh or 0.0) > 0
+                              or (savings.get(outlet) or {}).get("delivered", 0) > 0)
                 if has_energy:
                     if entry["saving"] is None:
                         saving_ok = False
@@ -1554,6 +1677,7 @@ class IntelligentCharging:
 
     def _realised(self, tz: tzinfo, now: datetime) -> list[dict[str, Any]]:
         try:
+            self.model.baseline_kind = self.baseline_kind
             # Twice the published count: empty open windows are skipped in the payload.
             return list(self.model.realised_sessions(tz, limit=2 * MAX_PAYLOAD_SESSIONS))
         except Exception:  # noqa: BLE001
@@ -1626,15 +1750,33 @@ class IntelligentCharging:
             # Level the plan reaches with the extra charging in cheap hours (None when
             # nothing extra is planned or the battery level is unknown).
             "extra_soc": self._extra_soc(facts, car) if not unavailable else None,
+            # Set while the charging above the minimum waits for prices that are due.
+            "extra_waits_until": None if unavailable or hide_money else self._extra_wait(facts, item),
+            # The car stopped by itself below the charge limit the integration knows.
+            "extra_done": bool(plan_input is not None and plan_input.done and not item.not_accepting
+                               and facts.soc is not None and facts.car_limit is not None
+                               and float(facts.target) <= float(facts.soc) < float(facts.car_limit) - cp.EXTRA_MIN_PCT),
+            # What the plan still charges (the minimum and the charging above it) and its
+            # cost; None where there is no plan to price. Charged so far is in the
+            # controller's charging_costs.
+            "planned_kwh": None if hide_money or car is None else round(
+                float(car.energy_kwh or 0.0) + float(car.top_up_kwh or 0.0), 1),
+            "planned_cost": None if hide_money or saving is None else saving.get("planned_cost"),
         }
+
+    def _extra_wait(self, facts: CarFacts, item: OutletPayloadInput) -> str | None:
+        waits, missing = self._extra_waits_until, self._extra_first_missing
+        if waits is None or missing is None or item.deadline is None or facts.soc is None:
+            return None
+        if facts.car_limit is None or float(facts.car_limit) <= max(float(facts.soc), float(facts.target)) + 1e-6:
+            return None
+        return iso_minute(waits) if dt_util.as_utc(item.deadline) > missing else None
 
     @staticmethod
     def _extra_soc(facts: CarFacts, car: cp.CarPlan | None) -> float | None:
-        if car is None or not car.top_up or facts.soc is None or not facts.kwh_per_pct:
+        if car is None or not car.top_up or facts.soc is None:
             return None
-        base = max(float(facts.soc), float(car.projected_soc) if car.projected_soc is not None else float(facts.soc))
-        limit = float(facts.car_limit) if facts.car_limit is not None else 100.0
-        return round(min(limit, base + float(car.top_up_kwh or 0.0) / float(facts.kwh_per_pct)), 1)
+        return car.extra_soc
 
     def _planned_savings(self, now: datetime, tz: tzinfo, plan: cp.Plan | None,
                          windows: Mapping[str, Mapping[str, Any]], ctx: PayloadContext) -> dict[str, dict[str, Any]]:
@@ -1642,10 +1784,10 @@ class IntelligentCharging:
 
         The baseline starts where the open realised window's baseline starts (its
         plug-in, or the deadline roll that opened it), so the planned and the
-        realised figures describe the same comparison. Top-up is excluded from
-        both sides: the baseline energy is the Intelligent minimum energy delivered
-        in the window plus the remaining planned minimum, and it is compared with
-        the Intelligent (non-top-up) cost so far plus the remaining planned cost.
+        realised figures describe the same comparison. Since 0.0.11.0 the charging
+        above the minimum is part of it on both sides: the baseline energy is what
+        the plan delivered in the window plus everything still planned, and it is
+        compared with the plan's cost so far plus the remaining planned cost.
         """
         if plan is None:
             return {}
@@ -1670,7 +1812,7 @@ class IntelligentCharging:
                 delivered = max(0.0, float(window.get("intelligent_kwh") or 0.0))
                 intelligent_so_far = float(window.get("intelligent_cost") or 0.0)
             else:
-                delivered = max(0.0, float(window.get("energy_kwh") or 0.0) - float(window.get("top_up_kwh") or 0.0))
+                delivered = max(0.0, float(window.get("energy_kwh") or 0.0))
                 intelligent_so_far = float(window.get("cost") or 0.0)
             cost_so_far = float(window.get("cost") or 0.0)
             if facts.soc is not None and facts.soc_source in ("vehicle", "last_known") and window:
@@ -1705,9 +1847,10 @@ class IntelligentCharging:
                     plugged = max(plugged, item.deadline - cm.REALISED_BASELINE_LOOKBACK)
             plugged = min(plugged, now)
             result[outlet] = {"session_cost": session_cost, "saving": None, "delivered": delivered,
-                              "cost_so_far": intelligent_so_far, "window": window, "planned": planned}
+                              "cost_so_far": intelligent_so_far, "window": window, "planned": planned,
+                              "planned_cost": None if car.cost is None or car.partial else money(remaining)}
             sessions.append(cp.BaselineSession(outlet=outlet, plugged_at=plugged,
-                                               energy_kwh=delivered + (car.energy_kwh or 0.0),
+                                               energy_kwh=delivered + planned,
                                                cap_kw=facts.cap_kw))
         if not sessions:
             return result
@@ -1718,7 +1861,7 @@ class IntelligentCharging:
                       for s in self.model.price_slots(start, end, tz, entries=self._price_entries)]
             powers = [cp.PowerSlot(s["start"], s["end"], s["expected_kw"], s["conservative_kw"])
                       for s in self.model.power_slots(start, end, tz, **self._charger_limits())]
-            baseline = cp.baseline_costs(sessions, prices, powers)
+            baseline = self._baseline_costs(sessions, prices, powers)
         except Exception:  # noqa: BLE001 - a baseline failure only hides the saving
             self._log_exception("baseline", "Unable to compute the Intelligent planned saving", now)
             return result
@@ -1735,7 +1878,7 @@ class IntelligentCharging:
                     or car.partial or car.includes_forecast
                     or window.get("mixed") or window.get("partial")):
                 continue
-            entry["saving"] = money(cost - (entry["cost_so_far"] + car.cost))
+            entry["saving"] = money(cost - (entry["cost_so_far"] + car.cost + (car.top_up_cost or 0.0)))
         return result
 
     def _energy_since_reading(self, outlet: str) -> float:

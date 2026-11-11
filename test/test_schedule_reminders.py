@@ -23,7 +23,7 @@ from custom_components.smartevse_dual_charger.const import (
     CONF_SCHEDULE_REMINDER_MINUTES,
 )
 from custom_components.smartevse_dual_charger.schedule_reminders import (
-    ScheduleReminders, active_window_start, validate_notification_options,
+    ScheduleReminders, active_window_start, schedule_intervals, validate_notification_options,
 )
 from custom_components.smartevse_dual_charger.config_flow import SmartEVSEDualChargerOptionsFlow
 
@@ -35,6 +35,29 @@ class ScheduleWindowTests(unittest.TestCase):
         self.tz = patch.object(dt_util, 'DEFAULT_TIME_ZONE', ZoneInfo('Europe/Tallinn'))
         self.tz.start()
         self.addCleanup(self.tz.stop)
+
+    def test_intervals_of_the_weekly_schedule_for_the_saving_comparison(self):
+        tz = ZoneInfo('Europe/Tallinn')
+        at = lambda day, hour, minute=0: datetime(2026, 11, day, hour, minute, tzinfo=tz)
+        nightly = {name: [{'from': time(0), 'to': time(7)}] for name in
+                   ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')}
+        # Monday 18:00 to Wednesday 12:00: two nights, in UTC.
+        self.assertEqual(schedule_intervals(nightly, at(9, 18), at(11, 12), tz),
+                         [(at(10, 0).astimezone(UTC), at(10, 7).astimezone(UTC)),
+                          (at(11, 0).astimezone(UTC), at(11, 7).astimezone(UTC))])
+        # A window that is open at the start is cut there.
+        self.assertEqual(schedule_intervals(nightly, at(10, 3), at(10, 5), tz), [(at(10, 3).astimezone(UTC), at(10, 5).astimezone(UTC))])
+        # Blocks that touch at midnight are one window; the end of the day is time.max or "24:00:00".
+        evening = {'monday': [{'from': time(22), 'to': time.max}], 'tuesday': [{'from': '00:00:00', 'to': '06:00:00'},
+                                                                                {'from': '23:00:00', 'to': '24:00:00'}]}
+        self.assertEqual(schedule_intervals(evening, at(9, 12), at(11, 12), tz),
+                         [(at(9, 22).astimezone(UTC), at(10, 6).astimezone(UTC)),
+                          (at(10, 23).astimezone(UTC), at(11, 0).astimezone(UTC))])
+        self.assertEqual(schedule_intervals({}, at(9, 12), at(11, 12), tz), [])
+        with self.assertRaises(ValueError):
+            schedule_intervals({'monday': [{'from': time(8), 'to': time(7)}]}, at(9, 12), at(11, 12), tz)
+        with self.assertRaises(ValueError):
+            schedule_intervals(None, at(9, 12), at(11, 12), tz)
 
     def test_native_ranges_merge_touching_blocks_across_week_boundary(self):
         # schedule.get_schedule returns native datetime.time objects in process.

@@ -2,15 +2,16 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.10.0`
+Version: `0.0.11.0`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
 It is not a SmartEVSE `PWR SHARE` implementation.
 
 Since 0.0.9.0 it can also plan the charging itself: [Intelligent charging](#intelligent-charging)
-charges each connected car in the cheapest hours that still reach its minimum charge by its
-ready-by time, using a model it learns locally from your chargers, cars and house.
+charges each connected car in the cheapest hours: at least to its minimum charge by its
+ready-by time and then on to the car's own charge limit, using a model it learns locally
+from your chargers, cars and house.
 
 ## Repository Contents
 
@@ -419,7 +420,7 @@ Intelligent charging (0.0.9.0) is a standing plan, like `Charge with schedule`. 
 on `Intelligent charging` once and it stays on through restarts and unplugs. For every
 connected car it then charges in the cheapest 15-minute units that still bring the car
 to at least its **minimum charge** by its **ready-by** time. The minimum is a floor,
-not a target: above it the car keeps charging while electricity is cheap (see below).
+not a target: above it the car goes on charging to its own charge limit (see below).
 
 - It knows how many cars are connected (zero, one or two outlets). Only one charger
   charges at a time, because both share one feeder.
@@ -438,15 +439,29 @@ not a target: above it the car keeps charging while electricity is cheap (see be
 The integration still never writes charging currents. It only chooses which SmartEVSE
 is in `Smart` and which is `Off`; SmartEVSE keeps adapting the current to the feeder.
 
-**Above the minimum** (0.0.10.0): once the minimum is planned, the car keeps charging up
-to its own charge limit in hours whose known price is at or below what the cheap hours
-of a day usually cost. That limit is learned from the price lists: the mean of each
-day's six cheapest hours, then the median over the last days (up to 14; it needs 5).
-On a cheap night the car fills up, on an expensive night it stops at the minimum, and
-until five days of prices are known it stops at the minimum. There is nothing to set:
-the earlier `Intelligent top-up` switch and price were removed and are deleted from
-Home Assistant on upgrade. Extra charging never uses hours without a published price,
-never runs past the ready-by time and never delays another car's minimum.
+**Above the minimum** (0.0.11.0): the minimum is what the plan guarantees. Once it is
+planned, the car goes on charging to its own charge limit (the limit set in the car) in
+the cheapest hours that are left before its ready-by time. There is no price limit and
+nothing to set. The cheapest hours go to the minimums, the next cheapest of the hours
+after them to the charging above them. When the night is too short, every car still
+gets its minimum first.
+
+- It never uses an hour without a published price and never runs past the ready-by time.
+- Minimums come first: a car charges above its minimum only after the hours planned for
+  the other car's minimum, so on a night when both cars need their minimum the extra
+  charging is at the end of the night.
+- While tomorrow's prices are still due (before 15:00) and the ready-by is tomorrow, it
+  waits for them, because the night is usually cheaper than the afternoon. The minimum
+  does not wait when waiting would risk it.
+- A car without a known battery level or charge limit (an unidentified car) gets its
+  session energy only.
+- After the ready-by time a car that stays plugged in is planned for the next day's
+  ready-by in the same way.
+
+The card shows the two parts separately: **Guaranteed** (the minimum, by the ready-by
+time) and **Extra** (how far above it the plan gets). 0.0.10.0 charged above the minimum
+only in hours below a price limit learned from five days of prices; that limit is gone,
+because it kept a car at its minimum on its first nights and on every dear night.
 
 ### What it needs
 
@@ -480,7 +495,7 @@ the rollback. Turn the schedule on first if the cars should still charge overnig
 | `<Vehicle 1> minimum charge`, `<Vehicle 2> minimum charge` | number, %, 10–100 | 80 % | Minimum charge level by the ready-by time. |
 | `Intelligent charging status` | sensor (enum) | | Overall status, see below. |
 | `Intelligent planned cost` | sensor (monetary) | | Planned cost of the connected cars' sessions: cost so far plus remaining planned cost. |
-| `Intelligent planned saving` | sensor (monetary) | | Planned saving against charging at plug-in. Can be negative. |
+| `Intelligent planned saving` | sensor (monetary) | | Planned saving compared with `Charge with schedule` (charging at plug-in without a schedule helper). Can be negative. |
 | `Intelligent next charge` | sensor (timestamp) | | Start of the current or next planned charge (while a block runs, the time it started), or unknown. |
 
 `<Vehicle 1>` and `<Vehicle 2>` are the configured vehicle names, for example
@@ -564,9 +579,21 @@ inputs always give the same plan.
 9. **Order.** When both cars need the same hours, the earlier ready-by charges first.
    `SmartEVSE N first` breaks ties; `SmartEVSE N only` leaves the other outlet out of the
    plan ("Not planned · charge policy").
-10. **Above the minimum.** After the minimum plan is fixed, known-price units at or
-    below the learned cheap price are added, before the car's deadline, up to the
-    car's own charge limit.
+10. **Above the minimum.** After the minimum plan is fixed, the cheapest known-price
+    units left before the car's deadline are added, up to the car's own charge limit.
+    - **Minimums first, in time.** A car charges above its minimum only after the last
+      unit planned for another car's minimum, and not before the ready-by of a car
+      whose minimum cannot be fully planned. The power a car really takes is not known
+      until it has charged in this session; extra charging ahead of its minimum would
+      use up the time it needs when that power turns out lower.
+    - One car after the other: the car that is charging first, then the car whose own
+      minimum ends last, and the next car starts where the one before it ended, so the
+      cars do not take turns.
+    - In time order a car's charging counts as its minimum until the minimum is in and
+      as extra after that.
+    - A separate start for less than five minutes of extra charging is left out.
+    - A car at or above its minimum that twice does not draw in such a block is complete
+      for the session (it stopped below the charge limit the integration reads).
 
 **When not all cars can reach their minimum.** The owner's policy is to maximise the
 number of cars that reach their minimum by their ready-by time. When the two cars each
@@ -721,7 +748,7 @@ disk), the learning stays unsaved in memory and is saved again later. In both ca
 | Reason | Charging | Meaning |
 | --- | --- | --- |
 | `intelligent_charging` | yes | A planned block is running. |
-| `intelligent_top_up` | yes | A car that has its minimum is charging further in a cheap hour. |
+| `intelligent_top_up` | yes | A car that has its minimum is charging on to its own charge limit. |
 | `intelligent_catch_up` | yes | A late or at-risk car is charging as early as possible. |
 | `intelligent_no_price_data` | yes | Charging without price data, as late as safely possible. |
 | `intelligent_waiting_for_planned_slot` | no | Waiting for the next planned block. |
@@ -750,15 +777,36 @@ charging by deadline when they appear:
 Each part (model observation, model estimates, planning) runs in its own error guard;
 the charger control loop never fails because of Intelligent charging.
 
-### Saving: "vs charging at plug-in"
+### Saving: compared with "Charge with schedule"
 
-The saving compares the plan with plugging in and charging straight away:
+The saving compares the plan with what the same energy would have cost if the cars had
+been charged by `Charge with schedule` (0.0.11.0; `baseline_kind: schedule`). Earlier
+versions compared with plugging in and charging straight away, which is not how a
+household with a night schedule ever charged, so the figures were flattering.
 
-- **Baseline**: each car charges continuously from its plug-in time at the expected
-  power, one charger at a time in plug-in order, at the prices known at plug-in. The
-  baseline energy is the energy delivered so far plus the remaining planned energy to
-  the minimum. Energy and cost above the minimum are left out on both sides.
-- **Per deadline window**: the baseline of the first window starts at the plug-in (at
+- **Baseline**: each car charges only while the weekly schedule helper is on, starting
+  when its window opens (or at plug-in inside a window). It follows the schedule
+  settings as they are now:
+  - the schedule's **price option**: with it on, only hours whose published price is at
+    or below the acceptable price count;
+  - the **duty cycle**: while two cars still need charge they change over every duty
+    cycle, and a car that has its energy leaves the rotation;
+  - the **charge policy**: the charger it names starts.
+
+  One charger at a time, at the expected power. The baseline energy is the energy the
+  plan delivered so far plus everything still planned, the charging above the minimum
+  included. Energy that does not fit in tonight's window continues in the next one.
+- The saving is unknown ("no figure") when the schedule would need hours whose price
+  is not published, when the price option leaves too few hours in the known prices, or
+  until the schedule has been read after a restart. It can be small or negative: the
+  schedule usually charges in the night too, and the plan keeps a safety margin.
+- The weekly schedule is read through `schedule.get_schedule` when the helper changes
+  and every ten minutes. Windows that were finished under the earlier comparison are
+  computed again, so History compares every charge with the same thing.
+- Without a configured schedule helper the comparison is charging at plug-in
+  (`baseline_kind: plug_in`): each car charges continuously from its plug-in time, one
+  charger at a time in plug-in order.
+- **Per deadline window**: the comparison of the first window starts at the plug-in (at
   most 25 hours before the deadline). A window opened by a deadline roll (a second night,
   or catch-up after the ready-by time), or after another mode already charged in the
   session, starts its baseline when the window opens. The planned and the realised
