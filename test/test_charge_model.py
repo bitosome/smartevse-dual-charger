@@ -493,9 +493,13 @@ class HouseholdLoadTests(unittest.TestCase):
         self.assertEqual(base.conservative_a, round(max(cm._quantile([3.0, 2.6, 4.7, 2.9, 3.8], 0.8), 3.1), 3))
         self.assertEqual(base.conservative_a, 3.98)
         self.assertEqual(base.source, "learned")
-        # Two entries are not enough: defaults.
+        # Two measured days are not "learned" yet, but they are used as they are (0.0.12.0):
+        # the mean of the means, and the highest P90 plus the margin.
         state["household"]["buckets"]["weekday"]["2"] = [[2.1, 3.0], [1.8, 2.6]]
         self.assertEqual(cm.ChargeModel(state).base_load(L(2026, 11, 10, 2), TZ),
+                         cm.BaseLoad(1.95, 4.0, "default"))
+        # An hour that was never measured has the defaults.
+        self.assertEqual(cm.ChargeModel(state).base_load(L(2026, 11, 10, 4), TZ),
                          cm.BaseLoad(3.0, 5.0, "default"))
 
     def test_conservative_is_at_least_expected_plus_one_amp(self):
@@ -518,7 +522,8 @@ class HouseholdLoadTests(unittest.TestCase):
         mean = math.ceil((41 * 7.5 + 20 * 2.5) / 61 / 0.5) * 0.5
         now_hour = model.base_load(L(2026, 11, 9, 20, 59), TZ)
         self.assertAlmostEqual(now_hour.expected_a, mean, delta=0.05)
-        self.assertAlmostEqual(now_hour.conservative_a, 7.5, delta=0.05)
+        # The hour 20:00 was stored at 21:00 as its first measured day: P90 7.5 A plus the margin.
+        self.assertAlmostEqual(now_hour.conservative_a, 8.5, delta=0.05)
         self.assertAlmostEqual(model.base_load(L(2026, 11, 9, 21, 30), TZ).expected_a, mean, delta=0.05)
         # An hour without a learned bucket uses it as well (instead of 3 A / 5 A) ...
         unlearned = model.base_load(L(2026, 11, 9, 23), TZ)
@@ -678,10 +683,65 @@ class HouseholdLoadTests(unittest.TestCase):
         # Its own class wins once it has three values.
         state["household"]["buckets"]["weekday"]["2"].append([4.0, 5.0])
         self.assertEqual(cm.ChargeModel(state).base_load(L(2026, 11, 10, 2), TZ).expected_a, 2.2)
-        # Two values in all are still not enough.
+        # Two values in all are not "learned", and both are used as they are.
         thin = stored_with(household={"buckets": {"weekday": {"2": [[2.0, 3.0]]}, "weekend": {"2": [[1.8, 2.9]]}},
                                       "days": []})
-        self.assertEqual(cm.ChargeModel(thin).base_load(L(2026, 11, 10, 2), TZ), cm.BaseLoad(3.0, 5.0, "default"))
+        self.assertEqual(cm.ChargeModel(thin).base_load(L(2026, 11, 10, 2), TZ), cm.BaseLoad(1.9, 4.0, "default"))
+
+    def test_evening_load_is_not_carried_into_night_hours_measured_once(self):
+        # Production 2026-11-11, two days after install: every clock hour had one or two
+        # measured days. The evening's cooking load (5.5 A mean, 10.5 A P90) was taken for
+        # every night hour: 7.4 kW expected and 4.9 kW conservative instead of the 9-10 kW
+        # the night really gives, so the safety buffer took all spare time and charging
+        # started at 19:51 in the dearest hour.
+        buckets = {"weekday": {}, "weekend": {}}
+        for hour in range(24):
+            evening = 17 <= hour < 22
+            buckets["weekday"][str(hour)] = [[5.0, 9.5]] if evening else [[2.2, 3.4]]
+        model = cm.ChargeModel(stored_with(household={"buckets": buckets, "days": [["2026-11-10", 24]]}))
+        t = L(2026, 11, 11, 18, 45)  # Wednesday
+        while t < L(2026, 11, 11, 19, 45):
+            model.observe_cycle(t, TZ, outlets={}, mains_phase_currents=(2.0, 3.0, 10.5 if t.minute % 5 == 0 else 4.0))
+            t += timedelta(seconds=60)
+        recent = model.recent_base()
+        self.assertEqual((recent[1], recent[2]), (5.5, 10.5))
+        # Now and the next hour: what the house draws now.
+        self.assertEqual(model.base_load(L(2026, 11, 11, 19, 50), TZ), cm.BaseLoad(5.5, 10.5, "default"))
+        self.assertEqual(model.hour_power(L(2026, 11, 11, 20), TZ).conservative_kw, 0.0)
+        # The night keeps what was measured in those hours yesterday.
+        for hour in (22, 23):
+            self.assertEqual(model.base_load(L(2026, 11, 11, hour), TZ), cm.BaseLoad(2.2, 4.4, "default"))
+        for hour in range(0, 7):
+            self.assertEqual(model.base_load(L(2026, 11, 12, hour), TZ), cm.BaseLoad(2.2, 4.4, "default"))
+        night = model.hour_power(L(2026, 11, 12, 2), TZ)
+        self.assertGreater(night.expected_kw, 9.5)
+        self.assertGreater(night.conservative_kw, 8.0)
+        # The later evening hour keeps its own measured values, not the last hour's.
+        self.assertEqual(model.base_load(L(2026, 11, 11, 21), TZ), cm.BaseLoad(5.0, 10.5, "default"))
+
+    def test_unusual_evening_raises_night_hours_measured_once(self):
+        # The house draws 4 A more than it did at this time yesterday (heat pump, sauna):
+        # the night is raised by that excess, within the 8 A / 9 A bounds.
+        buckets = {"weekday": {str(hour): [[2.0, 3.0]] for hour in range(24)}, "weekend": {}}
+        model = cm.ChargeModel(stored_with(household={"buckets": buckets, "days": [["2026-11-10", 24]]}))
+        t = L(2026, 11, 11, 20)
+        while t < L(2026, 11, 11, 21):
+            model.observe_cycle(t, TZ, outlets={}, mains_phase_currents=(6.0, 2.0, 2.0))
+            t += timedelta(seconds=60)
+        later = model.base_load(L(2026, 11, 12, 2), TZ)
+        self.assertEqual((later.expected_a, later.conservative_a, later.source), (6.0, 8.0, "default"))
+
+    def test_an_hour_is_stored_only_when_its_samples_span_half_of_it(self):
+        # After a restart at 18:53 the seven minutes to 19:00 (a cooking spike, 10 A) were
+        # stored as the 18:00 hour of that day (production 2026-11-11).
+        model = cm.ChargeModel()
+        t = self.observe_hour(model, L(2026, 11, 10, 18, 53), (10.0, 2.0, 2.0), step=10, seconds=420)  # 42 samples
+        model.observe_cycle(t, TZ, outlets={}, mains_phase_currents=(2, 2, 2))
+        self.assertEqual(model.to_dict()["household"]["buckets"]["weekday"], {})
+        # Half an hour or more is stored.
+        t = self.observe_hour(model, L(2026, 11, 10, 20, 29), (4.0, 2.0, 2.0), step=30, seconds=1860)
+        model.observe_cycle(t, TZ, outlets={}, mains_phase_currents=(2, 2, 2))
+        self.assertEqual(list(model.to_dict()["household"]["buckets"]["weekday"]), ["20"])
 
     def test_unusual_evening_raises_later_learned_hours(self):
         # Review 6: after quiet learned nights, a night where the house draws 4 A more

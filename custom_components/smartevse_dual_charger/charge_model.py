@@ -127,6 +127,9 @@ HOUSEHOLD_MIN_SAMPLES = 30
 HOUSEHOLD_BUCKET_LIMIT = 14
 HOUSEHOLD_MIN_BUCKET = 3
 HOUSEHOLD_DAY_MIN_HOURS = 12  # a "committed day" has at least this many committed hours
+# An hour is stored only when its samples span this much of it: a few minutes after a
+# restart (one cooking spike) are not what the house draws in that hour.
+HOUSEHOLD_HOUR_MIN_SPAN = timedelta(minutes=30)
 HOUSEHOLD_DAYS_LIMIT = 31
 HOUSEHOLD_RECENT_WINDOW = timedelta(minutes=60)  # persistence: the last hour of samples
 HOUSEHOLD_RECENT_MIN_SPAN = timedelta(minutes=30)
@@ -1632,8 +1635,9 @@ class ChargeModel:
             ev_phases = (0.0, 0.0, 0.0)
         base = max(max(0.0, m - e) for m, e in zip(mains, ev_phases))
         if accumulator is None:
-            accumulator = self._hour_acc = {"key": key, "samples": []}
+            accumulator = self._hour_acc = {"key": key, "samples": [], "first": now}
         accumulator["samples"].append(base)
+        accumulator["last"] = now
         recent = [(at, value) for at, value in self._recent_base
                   if timedelta(0) <= now - at <= HOUSEHOLD_RECENT_WINDOW]
         recent.append((now, base))
@@ -1677,6 +1681,9 @@ class ChargeModel:
         samples = accumulator["samples"]
         if len(samples) < HOUSEHOLD_MIN_SAMPLES:
             return
+        first, last = accumulator.get("first"), accumulator.get("last")
+        if first is not None and last is not None and last - first < HOUSEHOLD_HOUR_MIN_SPAN:
+            return
         local_day, hour, _offset = accumulator["key"]
         mean = sum(samples) / len(samples)
         p90 = _quantile(samples, HOUR_P90)
@@ -1701,10 +1708,11 @@ class ChargeModel:
                    if hours >= HOUSEHOLD_DAY_MIN_HOURS)
 
     def _hour_items(self, local: datetime) -> tuple[list, bool]:
-        """(values, usable) for a local clock hour. While the hour's own day class has
-        fewer than 3 values, both day classes are pooled if together they have 3: the
-        night load is known from the first nights instead of only after three weekday
-        and three weekend nights."""
+        """(values, learned) for a local clock hour. While the hour's own day class has
+        fewer than 3 values, both day classes are pooled: with 3 together the hour is
+        learned (the night load is known from the first nights instead of only after
+        three weekday and three weekend nights); with fewer the pooled values are
+        still what is known about the hour (see :meth:`_hour_estimate`)."""
         own = self.day_class(local.date())
         buckets = self._state["household"]["buckets"]
         items = buckets[own].get(str(local.hour), [])
@@ -1712,7 +1720,21 @@ class ChargeModel:
             return items, True
         other = buckets["weekend" if own == "weekday" else "weekday"].get(str(local.hour), [])
         pooled = list(items) + list(other)
-        return (pooled, True) if len(pooled) >= HOUSEHOLD_MIN_BUCKET else (items, False)
+        return pooled, len(pooled) >= HOUSEHOLD_MIN_BUCKET
+
+    def _hour_estimate(self, local: datetime) -> tuple[float, float, bool] | None:
+        """(expected A, conservative A, learned) for a local clock hour, or None when
+        nothing was ever measured in it. One or two measured days are used as they
+        are (mean of the means; the highest P90 plus the margin): what the house drew
+        in this hour yesterday says more about it than what it draws right now."""
+        items, learned = self._hour_items(local)
+        if learned:
+            return (*self._hour_stats(items), True)
+        if not items:
+            return None
+        expected = sum(mean for mean, _ in items) / len(items)
+        conservative = max(max(p90 for _, p90 in items), expected) + BASE_CONSERVATIVE_MARGIN_A
+        return expected, conservative, False
 
     @staticmethod
     def _hour_stats(items: list) -> tuple[float, float]:
@@ -1724,17 +1746,23 @@ class ChargeModel:
     def base_load(self, at: datetime, tz: tzinfo) -> BaseLoad:
         """Max-phase household base for the local hour: median of means / max(P80 of P90s, +1 A).
 
+        An hour with one or two measured days uses those (:meth:`_hour_estimate`); an
+        hour never measured uses the 3 A / 5 A defaults.
+
         Persistence (what the house draws now) raises it: for the current and the
-        next local hour the last hour's mean/P90 are a floor; an hour with no learned
-        bucket uses them too (bounded, so an evening peak does not empty the night)
-        instead of the 3 A / 5 A defaults alone.
+        next local hour the last hour's mean/P90 are a floor. A later hour is raised
+        only by what the house draws now ABOVE its usual load at this time (an
+        unusual evening), never by the evening load itself: until 0.0.12.0 every
+        unlearned night hour took the evening's cooking load, and the plan started
+        in the evening peak. Only an hour that was never measured still takes the
+        last hour's load (bounded, so an evening peak does not empty the night).
         """
         local = at.astimezone(tz)
-        items, learned = self._hour_items(local)
-        if learned:
-            expected, conservative = self._hour_stats(items)
+        estimate = self._hour_estimate(local)
+        if estimate is not None:
+            expected, conservative, learned = estimate
         else:
-            expected, conservative = DEFAULT_BASE_EXPECTED_A, DEFAULT_BASE_CONSERVATIVE_A
+            expected, conservative, learned = DEFAULT_BASE_EXPECTED_A, DEFAULT_BASE_CONSERVATIVE_A, False
         recent = self.recent_base()
         if recent is not None:
             last, mean, p90 = recent
@@ -1742,23 +1770,21 @@ class ChargeModel:
             if near:
                 expected = max(expected, mean)
                 conservative = max(conservative, p90, expected + BASE_CONSERVATIVE_MARGIN_A)
-            elif not learned:
+            elif estimate is None:
                 expected = max(expected, min(mean, HOUSEHOLD_RECENT_MAX_EXPECTED_A))
                 conservative = max(conservative, min(p90, HOUSEHOLD_RECENT_MAX_CONSERVATIVE_A),
                                    expected + BASE_CONSERVATIVE_MARGIN_A)
             else:
-                # An unusual night: a later learned hour is raised by what the house draws
-                # now above the learned values of the hour(s) the last hour of samples
-                # covers (weighted by the overlap), within the same 8 A / 9 A bounds.
+                # An unusual night: a later hour is raised by what the house draws now
+                # above the usual values of the hour(s) the last hour of samples covers
+                # (weighted by the overlap), within the 8 A / 9 A bounds.
                 last_local = last.astimezone(tz)
                 share = (last_local.minute * 60 + last_local.second) / 3600.0
-                now_items, now_ok = self._hour_items(last_local)
-                prev_items, prev_ok = self._hour_items((last - timedelta(hours=1)).astimezone(tz))
-                if now_ok and prev_ok:
-                    now_e, now_c = self._hour_stats(now_items)
-                    prev_e, prev_c = self._hour_stats(prev_items)
-                    usual_e = share * now_e + (1.0 - share) * prev_e
-                    usual_c = max(now_c, prev_c)
+                now_usual = self._hour_estimate(last_local)
+                prev_usual = self._hour_estimate((last - timedelta(hours=1)).astimezone(tz))
+                if now_usual is not None and prev_usual is not None:
+                    usual_e = share * now_usual[0] + (1.0 - share) * prev_usual[0]
+                    usual_c = max(now_usual[1], prev_usual[1])
                     excess = mean - usual_e
                     if excess >= BASE_CONSERVATIVE_MARGIN_A:
                         excess_c = max(excess, p90 - usual_c)

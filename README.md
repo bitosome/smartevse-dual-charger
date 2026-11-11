@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.11.0`
+Version: `0.0.12.0`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -629,12 +629,19 @@ that per hour:
   percentile with at least 1 A extra. An hour needs 3 learned values. Weekdays and
   weekends are learned separately, but while one of them has fewer than 3 values for an
   hour, both are used together (0.0.9.1), so the night load is known after about three
-  nights. An hour with fewer than 3 values in all uses 3 A (expected) and 5 A
-  (conservative), and until 7 days are learned conservative power is capped at 8.5 kW.
+  nights. An hour with one or two measured days uses those as they are (0.0.12.0): the
+  mean of the hourly means, and the highest 90th percentile plus 1 A. An hour that was
+  never measured uses 3 A (expected) and 5 A (conservative). Until 7 days are learned
+  conservative power is capped at 8.5 kW. An hour is stored only when its readings span
+  at least half of it (0.0.12.0), so the minutes after a restart are not taken for the
+  whole hour.
 - What the house draws right now counts too: for the current and the next hour the
-  household load of the last hour is a floor, and an hour without learned values uses
-  it instead of the 3 A / 5 A defaults (at most 8 A / 9 A there, so an evening peak does
-  not empty the night). This floor is re-read at the start of each 15-minute planning
+  household load of the last hour is a floor. Only an hour that was never measured uses
+  it later in the night too (at most 8 A / 9 A there, so an evening peak does not empty
+  the night). Until 0.0.12.0 every hour with fewer than 3 values did, so in the first
+  days the evening's cooking load was assumed for the whole night: the plan saw about
+  7.4 kW (5 kW conservative) where the night gives 9–10 kW, kept all spare time as
+  safety buffer and started charging in the evening peak. This floor is re-read at the start of each 15-minute planning
   unit, in 0.5 A steps rounded up, so a spiky house does not change the plan in the
   middle of a unit. It expires after 45 minutes without mains readings.
 - An unusual night (0.0.9.1): when the house draws at least 1 A more than it usually
