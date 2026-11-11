@@ -840,7 +840,7 @@ EXPECTED_CHARGER_KEYS = {
     "limited_by_car", "ready_by", "deadline", "status", "feasible", "estimated", "projected_soc", "need_kwh",
     "blocks", "next_start", "session_cost", "saving", "includes_forecast", "partial", "overrun",
     "not_accepting", "car_timer", "queue_after", "top_up", "top_up_cost", "extra_soc", "extra_waits_until",
-    "extra_done", "planned_kwh", "planned_cost",
+    "extra_done", "planned_kwh", "planned_cost", "extra_price_limit",
 }
 EXPECTED_VEHICLE_KEYS = {"name", "ready_by", "minimum", "suggested_ready_by", "usually_leaves",
                          "learned_sessions", "model"}
@@ -1132,22 +1132,34 @@ class PayloadTests(TzMixin, unittest.IsolatedAsyncioTestCase):
     def test_car_at_its_minimum_goes_on_charging_while_the_other_is_full(self):
         # Owner, 2026-11-11 morning: the XC40 is at its limit (90 %) and the EX30 reached
         # its 70 % minimum (its own limit is 100 %), both ready by 07:00. The minimum is a
-        # floor: the EX30 goes on charging until its ready-by; no learned price limit is
-        # needed for that.
+        # floor: the EX30 goes on charging; no learned price limit is needed for that.
+        # 0.0.13.0: it does so in the hours that are cheap for this night (at or below the
+        # average of the 12 hours before 07:00, plus 5 %: 0.3153 here). 05:00 costs 0.2827.
         self.deadlines = {"smartevse_1": L(11, 10, 7), "smartevse_2": L(11, 10, 7)}
-        put(self.states, EX30_BATTERY, 70.0, at=L(11, 10, 6, 15), unit_of_measurement="%")
-        now = L(11, 10, 6, 16)
+        put(self.states, EX30_BATTERY, 70.0, at=L(11, 10, 5, 15), unit_of_measurement="%")
+        now = L(11, 10, 5, 16)
         decision, (payload, _) = self.cycle(now, xc40=90.0)
         self.assertEqual((decision.allowed, decision.outlet, decision.reason),
                          (True, "smartevse_2", "intelligent_top_up"))
         xc40, ex30 = payload["chargers"]["smartevse_1"], payload["chargers"]["smartevse_2"]
         self.assertEqual((xc40["status"], xc40["blocks"], xc40["extra_soc"]), ("reached", [], None))
         self.assertEqual((ex30["status"], ex30["need_kwh"], ex30["top_up"]), ("reached", 0.0, True))
+        # To 06:00: the last hour before the ready-by time costs 0.3575, the second dearest
+        # of the night, so optional energy is not bought there.
         self.assertEqual([(block["end"], block["top_up"]) for block in ex30["blocks"]],
-                         [("2026-11-10T05:00:00+00:00", True)])  # to its ready-by, 07:00
+                         [("2026-11-10T04:00:00+00:00", True)])
         self.assertGreater(ex30["extra_soc"], 75.0)
         self.assertLess(ex30["extra_soc"], 100.0)  # 44 minutes are not enough for 30 %
         self.assertIsNone(ex30["extra_waits_until"])
+        window = [0.3909, 0.3574, 0.2418, 0.2843, 0.2396, 0.3105, 0.2994, 0.2780, 0.2635, 0.2983, 0.2827, 0.3575]
+        limit = round(sum(window) / 12 * 1.05, 4)
+        self.assertEqual((ex30["extra_price_limit"], payload["top_up"]["price"]), (limit, limit))
+        self.assertEqual(payload["top_up"]["source"], "car_limit")
+        # In that last hour the car stays where it is.
+        put(self.states, EX30_BATTERY, 78.0, at=L(11, 10, 6, 15), unit_of_measurement="%")
+        decision, (payload, _) = self.cycle(L(11, 10, 6, 16), xc40=90.0)
+        self.assertEqual((decision.allowed, decision.reason), (False, "intelligent_targets_reached"))
+        self.assertEqual(payload["chargers"]["smartevse_2"]["blocks"], [])
 
     async def test_saving_is_compared_with_charge_with_schedule(self):
         # Owner, 2026-11-11: "saved vs charging at plug-in" is not how the cars were ever
@@ -1220,6 +1232,20 @@ class PayloadTests(TzMixin, unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.adapter._schedule_definition)
         await self.adapter.async_refresh_schedule(self.now + timedelta(minutes=14, seconds=10))
         self.assertEqual(calls.count("broken"), 2)
+        # 0.0.13.0: a schedule too short to deliver the energy by the ready-by time (one hour
+        # before 07:00) is compared at the price it would have paid until then. Before, the
+        # rest went to the next night, whose prices are not published: no figure.
+        short = {day: [{"from": time(6, 0), "to": time(7, 0)}] for day in definition}
+        definition.clear()
+        definition.update(short)
+        hass.services.async_call = async_call
+        put(self.states, entity, "on")
+        await self.adapter.async_refresh_schedule(self.now + timedelta(minutes=16))
+        self.adapter.set_schedule_settings(price_limit=None, duty_minutes=60, first="smartevse_1")
+        _, (tight, _) = self.cycle(self.now + timedelta(minutes=16, seconds=10))
+        self.assertIsNotNone(tight["chargers"]["smartevse_1"]["saving"])
+        # The second car never gets a turn in that hour: nothing to compare its charge with.
+        self.assertIsNone(tight["chargers"]["smartevse_2"]["saving"])
 
     def test_planned_baseline_starts_at_the_windows_baseline_start(self):
         # Review round 3: a late plug-in (06:30, deadline tomorrow 07:00) was anchored at

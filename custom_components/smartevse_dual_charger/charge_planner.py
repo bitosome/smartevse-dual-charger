@@ -29,7 +29,7 @@ Identical inputs always give an identical plan.
 import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 UTC = timezone.utc
 
@@ -183,8 +183,13 @@ class Commitment:
 class PlannerConfig:
     # Charging above the minimum (0.0.11.0): the minimum is a floor, so a car keeps
     # charging to its own limit in the cheapest known-price units left before its
-    # ready-by time. There is no price limit.
+    # ready-by time.
     above_minimum: bool = False
+    # Outlet -> price (0.0.13.0): a car charges above its minimum only in units at or
+    # below it. The adapter works it out from the published prices (the average of the
+    # 12 hours before the car's ready-by time); nothing is set by hand. A car without
+    # an entry has no limit.
+    extra_price_limits: Mapping[str, float] | None = None
     # While the prices of a car's window are still due (tomorrow's list), its charging
     # above the minimum waits for them: this is when they are expected.
     extra_prices_expected_at: datetime | None = None
@@ -357,6 +362,9 @@ class BaselineSession:
     # The physical charger, when ``outlet`` is only a key (the realised ledger keys
     # sessions by window): the charge policy names the charger that starts.
     charger: str | None = None
+    # The car's ready-by time. The schedule baseline stops there (0.0.13.0): energy the
+    # schedule could not deliver by then is priced like the energy it did deliver.
+    deadline: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -723,6 +731,9 @@ class _Context:
         pending = _utc(pending) if isinstance(pending, datetime) else None
         self.extra_waits = pending is not None and pending > self.now
         self.extra_on = bool(getattr(self.config, "above_minimum", False))
+        limits = getattr(self.config, "extra_price_limits", None) or {}
+        self.extra_limits = {outlet: float(value) for outlet, value in limits.items()
+                             if _finite(value) is not None}
         end = self.units[-1].end if self.units else self.now
         for unit in self.units:
             if self.no_price:
@@ -1496,9 +1507,13 @@ class _Pass:
         def kw_t(i):
             return min(self.units[i].kw_e, k_t)
 
-        def qualifies(i):
+        def qualifies(i, car):
             unit = self.units[i]
-            return unit.kind == PRICE_KNOWN and kw_t(i) > 0
+            if unit.kind != PRICE_KNOWN or kw_t(i) <= 0:
+                return False
+            # Optional energy is bought only where it is cheap for this night.
+            limit = self.ctx.extra_limits.get(car.outlet)
+            return limit is None or unit.price is None or unit.price <= limit + 1e-9
 
         def give(i, car, energy):
             kw = kw_t(i)
@@ -1543,7 +1558,7 @@ class _Pass:
             and blocked[commit.outlet] < 0
             and not self.units[0].usable_all
             and self.usable(0, commit)
-            and qualifies(0)
+            and qualifies(0, commit)
         ):
             give(0, commit, need[commit.outlet])
         # One car after the other: the car that is charging first (it continues), then
@@ -1560,7 +1575,7 @@ class _Pass:
             candidates = [
                 i for i, unit in enumerate(self.units)
                 if i >= first and unit.usable_all and self.residual[i] > _MIN_EPS
-                and unit.end <= car.deadline and qualifies(i)
+                and unit.end <= car.deadline and qualifies(i, car)
             ]
             caps = {i: kw_t(i) * self.residual[i] / 60.0 for i in candidates}
             flow = _Nested([car], [need[car.outlet]])
@@ -2106,6 +2121,13 @@ def schedule_baseline_costs(
     None when any of its energy falls in a period without a usable price, when the
     price option meets a price that is not published, or when the windows given end
     before the energy is delivered.
+
+    A session with a ``deadline`` (the car's ready-by time) is compared like for like
+    (0.0.13.0): the schedule charges it only until then. When it could not deliver all
+    the energy by the deadline, the cost is what it paid per kWh until then, for the
+    whole energy; None when it delivered nothing. Before, the rest was moved to the
+    next night's window, whose prices are usually not published yet, so a big night
+    had no saving at all, or one against a plan that misses the ready-by time.
     """
     prices = _prepare_prices(price_slots)
     powers = _prepare_powers(power_slots)
@@ -2136,19 +2158,34 @@ def schedule_baseline_costs(
         if soc is None or k is None or k <= 0:
             soc, k, taper = 0.0, 1.0, NO_TAPER
         car = {"session": session, "left": energy, "cap": cap, "soc": _clamp(soc, 0.0, 100.0), "k": k, "taper": taper,
-               "plugged": _utc(session.plugged_at), "cost": 0.0, "priced": True,
-               "charger": session.charger or session.outlet}
+               "plugged": _utc(session.plugged_at), "cost": 0.0, "priced": True, "energy": energy,
+               "charger": session.charger or session.outlet,
+               "deadline": _utc(session.deadline) if session.deadline is not None else None}
         if energy <= _EPS:
             settle(car, 0.0)
         elif cap <= 0:
             settle(car, None)
         else:
             cars.append(car)
+    def short(car):
+        """The ready-by time came first: the whole energy at the price paid until then."""
+        delivered = car["energy"] - car["left"]
+        if delivered <= _EPS or not car["priced"]:
+            return None
+        return car["cost"] * car["energy"] / delivered
+
     step = timedelta(minutes=1)
     active = None
     since = None
     moment = min((car["plugged"] for car in cars), default=None)
     while cars and moment is not None:
+        for car in [car for car in cars if car["deadline"] is not None and moment >= car["deadline"]]:
+            settle(car, short(car))
+            cars.remove(car)
+            if active is car:
+                active = None
+        if not cars:
+            break
         window = next((w for w in windows if w[1] > moment), None)
         if window is None:
             break
@@ -2174,7 +2211,7 @@ def schedule_baseline_costs(
             active = next(car for car in ready if car is not active)
             since = moment
         car = active
-        end = min(moment + step, window[1])
+        end = min(moment + step, window[1], car["deadline"] or window[1])
         hours = (end - moment).total_seconds() / 3600.0
         kw, _ = _power_at(powers, moment)
         full = min(kw, car["cap"]) * hours
@@ -2196,5 +2233,6 @@ def schedule_baseline_costs(
             active = None
         moment = end
     for car in cars:
-        settle(car, None)
+        # No schedule window is left: a car with a ready-by time got what it got.
+        settle(car, short(car) if car["deadline"] is not None and window is None else None)
     return {outlet: _money(cost) for outlet, cost in results.items()}

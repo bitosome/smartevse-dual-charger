@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.12.0`
+Version: `0.0.13.0`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -447,6 +447,14 @@ after them to the charging above them. When the night is too short, every car st
 gets its minimum first.
 
 - It never uses an hour without a published price and never runs past the ready-by time.
+- **Only where the night is cheap** (0.0.13.0): optional energy is bought only in hours at
+  or below the average published price of the 12 hours before the car's ready-by time,
+  plus 5 %. The planner works this out from the prices by itself: there is nothing to
+  set and nothing to learn. The evening peak is never used for it, and on a night that
+  is dear throughout the car still charges in its cheaper half. The limit is fixed to
+  the ready-by time, so it does not move while the night passes. It is published as
+  `top_up.price` and per charger as `extra_price_limit`; the card paints those hours
+  green in the price chart. The guaranteed minimum is not affected by it.
 - Minimums come first: a car charges above its minimum only after the hours planned for
   the other car's minimum, so on a night when both cars need their minimum the extra
   charging is at the end of the night.
@@ -462,6 +470,8 @@ The card shows the two parts separately: **Guaranteed** (the minimum, by the rea
 time) and **Extra** (how far above it the plan gets). 0.0.10.0 charged above the minimum
 only in hours below a price limit learned from five days of prices; that limit is gone,
 because it kept a car at its minimum on its first nights and on every dear night.
+0.0.11.0 and 0.0.12.0 had no limit at all, which bought optional energy at the evening
+peak whenever a car's window was short or dear.
 
 ### What it needs
 
@@ -802,10 +812,16 @@ household with a night schedule ever charged, so the figures were flattering.
 
   One charger at a time, at the expected power. The baseline energy is the energy the
   plan delivered so far plus everything still planned, the charging above the minimum
-  included. Energy that does not fit in tonight's window continues in the next one.
-- The saving is unknown ("no figure") when the schedule would need hours whose price
-  is not published, when the price option leaves too few hours in the known prices, or
-  until the schedule has been read after a restart. It can be small or negative: the
+  included.
+- **Like for like at the ready-by time** (0.0.13.0): the schedule is given until the
+  car's ready-by time, as the plan is. When it could not deliver all the energy by then
+  (a big night, a short window), the whole energy is priced at what the schedule paid
+  per kWh until then. Until 0.0.12.0 the rest was moved to the next night's window,
+  whose prices are usually not published yet, so a big night had no figure at all.
+- The saving is unknown ("no figure") when the schedule would deliver nothing before the
+  ready-by time, when it would need hours whose price is not published, when the price
+  option meets a price that is not published, or until the schedule has been read after
+  a restart. It can be small or negative: the
   schedule usually charges in the night too, and the plan keeps a safety margin.
 - The weekly schedule is read through `schedule.get_schedule` when the helper changes
   and every ten minutes. Windows that were finished under the earlier comparison are

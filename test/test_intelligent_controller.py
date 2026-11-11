@@ -772,10 +772,11 @@ class CycleTests(TzTestCase):
         self.assertIsInstance(next_charge, datetime)
         self.assertIsNotNone(next_charge.tzinfo)
         # The cheap 01:00-04:00 window takes the minimum (53 -> 80 %) and most of the
-        # charging above it (to the car's 90 %); the rest runs right before it.
-        self.assertEqual(next_charge, L(11, 10, 0, 33))
+        # charging above it (towards the car's 90 %). 0.0.13.0: the rest is not bought in
+        # the dearer hour before it, so the car ends a little below its limit.
+        self.assertEqual(next_charge, L(11, 10, 1))
         charger = data["intelligent"]["chargers"]["smartevse_1"]
-        self.assertEqual((charger["projected_soc"], charger["extra_soc"]), (80.0, 90.0))
+        self.assertEqual((charger["projected_soc"], charger["extra_soc"]), (80.0, 86.5))
         self.assertEqual([block["top_up"] for block in charger["blocks"]], [False, True])
         charger = data["intelligent"]["chargers"]["smartevse_1"]
         self.assertEqual((charger["vehicle"], charger["soc"], charger["deadline"]),
@@ -1113,8 +1114,12 @@ class ReviewRegressionTests(TzTestCase):
         self.assertEqual(charger["status"], "reached")
         self.assertTrue(charger["top_up"])
         self.assertEqual(charger["extra_soc"], 90.0)  # up to the car's own limit
-        self.assertEqual(data["intelligent"]["top_up"],
-                         {"enabled": True, "price": None, "source": "car_limit", "waits_until": None})
+        # 0.0.13.0: only in hours at or below the night's average price (plus 5 %).
+        top_up = data["intelligent"]["top_up"]
+        self.assertEqual({key: top_up[key] for key in ("enabled", "source", "waits_until")},
+                         {"enabled": True, "source": "car_limit", "waits_until": None})
+        self.assertEqual(top_up["price"], charger["extra_price_limit"])
+        self.assertTrue(0.20 < top_up["price"] < 0.45)
         self.assertTrue(all(block["top_up"] for block in charger["blocks"]))
         self.assertEqual(charger["blocks"][0]["start"], L(11, 10, 1).isoformat())
         c._async_post.reset_mock()

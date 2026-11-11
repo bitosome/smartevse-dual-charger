@@ -136,6 +136,11 @@ SCHEDULE_REFRESH = timedelta(minutes=10)
 SCHEDULE_RETRY = timedelta(minutes=1)
 SCHEDULE_READ_TIMEOUT = 10
 SCHEDULE_BASELINE_HORIZON = timedelta(hours=72)
+# Charging above the minimum is allowed in hours at or below the average published price
+# of this many hours before the car's ready-by time.
+EXTRA_PRICE_WINDOW = timedelta(hours=12)
+# ... plus this much, so that a nearly flat night is not cut into single hours.
+EXTRA_PRICE_TOLERANCE = 0.05
 EMERGENCY_MARGIN = 1.10
 EMERGENCY_OVERHEAD = timedelta(minutes=10)
 
@@ -593,6 +598,7 @@ class IntelligentCharging:
         self._schedule_settings: dict[str, Any] = {}
         self._extra_waits_until: datetime | None = None
         self._extra_first_missing: datetime | None = None
+        self._extra_price_limits: dict[str, float] = {}
         self._limits: dict[str, float | None] = {}
         self._capacities: dict[str, float | None] = {}
         self._plan: cp.Plan | None = None
@@ -938,7 +944,7 @@ class IntelligentCharging:
         cap = max((p.expected_kw for p in powers), default=FALLBACK_CAP_KW) or FALLBACK_CAP_KW
         baseline = [cp.BaselineSession(outlet=s["key"], plugged_at=s["plugged_at"],
                                        energy_kwh=float(s.get("energy_kwh") or 0.0), cap_kw=cap,
-                                       charger=s.get("outlet"))
+                                       charger=s.get("outlet"), deadline=s.get("deadline"))
                     for s in sessions]
         return self._baseline_costs(baseline, prices, powers)
 
@@ -1281,8 +1287,10 @@ class IntelligentCharging:
             commit = cp.Commitment(commitment[0], commitment[1])
         self._prices_expected_at = self._expected_prices(now, cars)
         self._extra_waits_until = self._extra_prices_expected(now, cars) if above_minimum else None
+        self._extra_price_limits = self._extra_limits(cars) if above_minimum else {}
         config = cp.PlannerConfig(above_minimum=above_minimum, prices_expected_at=self._prices_expected_at,
-                                  extra_prices_expected_at=self._extra_waits_until)
+                                  extra_prices_expected_at=self._extra_waits_until,
+                                  extra_price_limits=self._extra_price_limits)
         plan = None
         failed = False
         try:
@@ -1307,6 +1315,40 @@ class IntelligentCharging:
                 and cp.floor15(shown.now) == cp.floor15(now)):
             self._display_plan = plan
         return decision
+
+    def _extra_limits(self, cars: Sequence[cp.CarRequest]) -> dict[str, float]:
+        """Outlet -> the price up to which a car charges above its minimum (0.0.13.0).
+
+        Optional energy is bought only where it is cheap for this night: at or below
+        the average published price of the 12 hours before the car's ready-by time
+        (plus 5 %, so a nearly flat night is not cut into single hours).
+        The window is fixed to the ready-by time, so the limit does not move while
+        the night passes; it changes only when prices are published. Nothing is
+        learned and nothing is set by hand. A car with no published price in its
+        window has no entry (and nothing to charge extra in).
+        """
+        limits: dict[str, float] = {}
+        tz = default_time_zone()
+        for car in cars:
+            if car.excluded or car.done:
+                continue
+            end = cp._utc(car.deadline)
+            start = end - EXTRA_PRICE_WINDOW
+            try:
+                slots = self.model.price_slots(cm.local_hour_start(start, tz), end, tz, entries=self._price_entries)
+            except Exception:  # noqa: BLE001 - without it the car has no limit
+                continue
+            total = seconds = 0.0
+            for slot in slots:
+                if slot.get("kind") != cp.PRICE_KNOWN or slot.get("price") is None:
+                    continue
+                span = (min(end, cp._utc(slot["end"])) - max(start, cp._utc(slot["start"]))).total_seconds()
+                if span > 0:
+                    total += float(slot["price"]) * span
+                    seconds += span
+            if seconds > 0:
+                limits[car.outlet] = round(total / seconds * (1.0 + EXTRA_PRICE_TOLERANCE), 6)
+        return limits
 
     def _extra_prices_expected(self, now: datetime, cars: Sequence[cp.CarRequest]) -> datetime | None:
         """When the first missing price of the plan window should be published, or None.
@@ -1463,6 +1505,7 @@ class IntelligentCharging:
         self._planner_error = None
         self._extra_waits_until = None
         self._extra_first_missing = None
+        self._extra_price_limits = {}
 
     # -- 4. payload ------------------------------------------------------------------------
 
@@ -1550,7 +1593,7 @@ class IntelligentCharging:
             "unit": cp.floor15(now).isoformat(),
             "ctx": [ctx.enabled, ctx.overridden, ctx.governing, ctx.charge_allowed, ctx.controller_state,
                     ctx.charge_reason, ctx.active_outlet, iso_minute(ctx.active_since),
-                    ctx.top_up_enabled, iso_minute(self._extra_waits_until),
+                    ctx.top_up_enabled, iso_minute(self._extra_waits_until), self._extra_price_limits,
                     self.baseline_kind, self._schedule_settings, self._schedule_definition],
             "settings": {key: dict(value) for key, value in ctx.settings.items()},
             "outlets": outlets,
@@ -1592,6 +1635,9 @@ class IntelligentCharging:
         })
         if plan is not None:
             payload["top_up"]["waits_until"] = iso_minute(self._extra_waits_until)
+            if self._extra_price_limits:
+                # The highest of the cars' limits: the hours the card paints as cheap.
+                payload["top_up"]["price"] = round(max(self._extra_price_limits.values()), 4)
         realised = self._realised(tz, now)
         payload["sessions"] = [
             {
@@ -1752,6 +1798,9 @@ class IntelligentCharging:
             "extra_soc": self._extra_soc(facts, car) if not unavailable else None,
             # Set while the charging above the minimum waits for prices that are due.
             "extra_waits_until": None if unavailable or hide_money else self._extra_wait(facts, item),
+            # Charging above the minimum only in hours at or below this price (0.0.13.0).
+            "extra_price_limit": (round(self._extra_price_limits[outlet], 4)
+                                  if outlet in self._extra_price_limits else None),
             # The car stopped by itself below the charge limit the integration knows.
             "extra_done": bool(plan_input is not None and plan_input.done and not item.not_accepting
                                and facts.soc is not None and facts.car_limit is not None
@@ -1851,7 +1900,7 @@ class IntelligentCharging:
                               "planned_cost": None if car.cost is None or car.partial else money(remaining)}
             sessions.append(cp.BaselineSession(outlet=outlet, plugged_at=plugged,
                                                energy_kwh=delivered + planned,
-                                               cap_kw=facts.cap_kw))
+                                               cap_kw=facts.cap_kw, deadline=item.deadline))
         if not sessions:
             return result
         try:

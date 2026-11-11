@@ -2363,6 +2363,8 @@ class ChargeModel:
                              "vehicle": record["vehicle"],
                              "plugged_at": anchor,
                              "start": start,
+                             # The window's ready-by time: the schedule baseline stops there.
+                             "deadline": _aware(record.get("deadline")),
                              "energy_kwh": round(self._planned_parts(record)["priced_kwh"], 4)})
             snapshot = record["snapshot"]
             for index, kw in enumerate(snapshot["kw"]):
