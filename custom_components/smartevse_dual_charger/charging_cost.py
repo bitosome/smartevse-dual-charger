@@ -15,6 +15,16 @@ KEYS = ("smartevse_1", "smartevse_2")
 MAX_GAP_SECONDS = 120
 HISTORY_LIMIT = 100  # Per outlet, including the current session.
 _STATUSES = {"charging", "paused", "complete", "finished", "unavailable"}
+# The parts of a charge (0.0.14.0): what made the charger charge while the energy was metered.
+PART_GUARANTEED = "guaranteed"  # Intelligent charging, up to the car's minimum
+PART_EXTRA = "extra"            # Intelligent charging, above the minimum
+PART_SCHEDULE = "schedule"      # Charge with schedule
+PART_FORCE = "force"            # Force charge (now, timer, by price)
+PART_OTHER = "other"            # charging the controller did not ask for
+PART_KINDS = (PART_GUARANTEED, PART_EXTRA, PART_SCHEDULE, PART_FORCE, PART_OTHER)
+PARTS_LIMIT = 48  # per session; the oldest two of the same kind are joined beyond it
+# A part goes on when the next metered interval starts where it ended (pauses split it).
+PART_JOIN_SECONDS = 1.0
 _CURRENCIES = {"EUR", "USD", "GBP", "SEK", "NOK", "DKK"}
 
 
@@ -156,9 +166,51 @@ class ChargingLedger:
         if issue not in record["issues"]:
             record["issues"].append(issue)
 
+    @staticmethod
+    def _part(record, kind, start: str, end: str, energy: float, cost: float | None):
+        """Add one metered interval to the parts of a session: a time range, what made
+        the charger charge in it, its energy and (when priced) its cost. Consecutive
+        intervals of one kind are one part; a pause or another kind starts a new one."""
+        if energy <= 0:
+            return
+        kind = kind if kind in PART_KINDS else PART_OTHER
+        parts = record.get("parts")
+        if not isinstance(parts, list):
+            parts = record["parts"] = []
+        last = parts[-1] if parts else None
+        joined = False
+        if isinstance(last, dict) and last.get("kind") == kind:
+            try:
+                gap = (datetime.fromisoformat(start) - datetime.fromisoformat(last["end"])).total_seconds()
+                joined = abs(gap) <= PART_JOIN_SECONDS
+            except (KeyError, TypeError, ValueError):
+                joined = False
+        if joined:
+            last["end"] = end
+            last["energy_kwh"] = float(last.get("energy_kwh") or 0.0) + energy
+            if cost is None or last.get("cost") is None:
+                last["cost"] = None
+            else:
+                last["cost"] = float(last["cost"]) + cost
+        else:
+            parts.append({"kind": kind, "start": start, "end": end, "energy_kwh": energy, "cost": cost})
+        while len(parts) > PARTS_LIMIT:
+            # Join the oldest neighbours of one kind (their pause is lost), else the two oldest.
+            at = next((i for i in range(len(parts) - 1) if parts[i].get("kind") == parts[i + 1].get("kind")), 0)
+            first, second = parts[at], parts.pop(at + 1)
+            first["end"] = second.get("end", first.get("end"))
+            first["energy_kwh"] = float(first.get("energy_kwh") or 0.0) + float(second.get("energy_kwh") or 0.0)
+            first["cost"] = (None if first.get("cost") is None or second.get("cost") is None
+                             else float(first["cost"]) + float(second["cost"]))
+
     def observe(self, now: datetime, statuses: dict, power: float | None,
-                price: float | None, currency: str | None, sources: list[str]):
-        """Close the preceding measured interval, then retain the new sample."""
+                price: float | None, currency: str | None, sources: list[str],
+                kind: str | None = None):
+        """Close the preceding measured interval, then retain the new sample.
+
+        ``kind`` says what made the charger charge in the interval that is closed now
+        (one of PART_KINDS); the energy is added to that part of the session.
+        """
         timestamp = now.isoformat()
         previous = self.data.get("sample")
         gap = self.restored
@@ -183,6 +235,7 @@ class ChargingLedger:
                     else:
                         energy = previous["power_kw"] * seconds / 3600
                         record["energy_kwh"] += energy
+                        cost = None
                         if previous["price"] is None or previous["currency"] is None:
                             record["unpriced_kwh"] += energy
                             if energy: self._issue(record, "price_unavailable")
@@ -191,8 +244,10 @@ class ChargingLedger:
                             if energy: self._issue(record, "currency_changed")
                         else:
                             record["currency"] = previous["currency"]
-                            record["cost"] += energy * previous["price"]
+                            cost = energy * previous["price"]
+                            record["cost"] += cost
                             record["priced_kwh"] += energy
+                        self._part(record, kind, previous["at"], timestamp, energy, cost)
                 if not records and gap:
                     # Keep uncertainty on any retained paused session too.
                     for ident in self.data["active"].values():
@@ -254,5 +309,14 @@ class ChargingLedger:
                 for name in ["cost", "energy_kwh", "priced_kwh", "unpriced_kwh"]:
                     r[name] = round(r[name], 6)
                 r["partial"] = bool(r["issues"])
+                # Sessions recorded before 0.0.14.0 have no parts: an empty list.
+                parts = r.get("parts") if isinstance(r.get("parts"), list) else []
+                r["parts"] = [
+                    {"kind": part.get("kind") if part.get("kind") in PART_KINDS else PART_OTHER,
+                     "start": part.get("start"), "end": part.get("end"),
+                     "energy_kwh": round(float(part.get("energy_kwh") or 0.0), 4),
+                     "cost": None if part.get("cost") is None else round(float(part["cost"]), 4)}
+                    for part in parts if isinstance(part, dict) and _valid_time(part.get("start")) and _valid_time(part.get("end"))
+                ]
             result["chargers"][key] = {"session": records[0] if records else None, "history": records}
         return result

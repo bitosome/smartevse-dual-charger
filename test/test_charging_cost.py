@@ -22,6 +22,61 @@ class LedgerTests(unittest.TestCase):
         self.states[key].update(connected=True,charging=True);self.observe()
     def record(self,key='smartevse_1'):
         return self.ledger.snapshot()['chargers'][key]['session']
+    def test_parts_of_a_charge_are_recorded_by_what_made_it_charge(self):
+        # 0.0.14.0: history shows the parts a charge went through. Each metered interval
+        # goes to the part named for it; consecutive intervals of one kind are one part,
+        # a pause or another kind starts a new one.
+        def run(minutes, kind, price=.2):
+            for _ in range(minutes):
+                self.now += timedelta(seconds=60)
+                self.ledger.observe(self.now, self.states, 7.2, price, 'EUR', self.sources, kind=kind)
+        self.start()
+        t0 = self.now
+        at = lambda minutes: (t0 + timedelta(minutes=minutes)).isoformat()
+        run(20, 'guaranteed')
+        run(10, 'extra')
+        self.states['smartevse_1']['charging'] = False
+        run(1, 'extra')                # the last metered minute before the pause
+        run(30, None)                  # paused: nothing metered, no part
+        self.states['smartevse_1']['charging'] = True
+        run(1, None)                   # charging again from here
+        run(10, 'force')
+        run(5, 'nonsense')
+        run(5, None, price=None)       # the price of the next minutes is unknown
+        run(5, None)
+        record = self.record()
+        parts = record['parts']
+        self.assertEqual([(part['kind'], part['start'], part['end']) for part in parts], [
+            ('guaranteed', at(0), at(20)), ('extra', at(20), at(31)), ('force', at(62), at(72)), ('other', at(72), at(87))])
+        kwh = lambda minutes: 7.2 * minutes / 60
+        self.assertAlmostEqual(parts[0]['energy_kwh'], kwh(20), places=4); self.assertAlmostEqual(parts[0]['cost'], kwh(20) * .2, places=4)
+        self.assertAlmostEqual(parts[1]['energy_kwh'], kwh(11), places=4)
+        self.assertAlmostEqual(parts[2]['energy_kwh'], kwh(10), places=4)
+        # An unknown kind and no kind are "other"; an unpriced interval leaves the part without a cost.
+        self.assertAlmostEqual(parts[3]['energy_kwh'], kwh(15), places=4); self.assertIsNone(parts[3]['cost'])
+        # The parts add up to the session.
+        self.assertAlmostEqual(sum(part['energy_kwh'] for part in parts), record['energy_kwh'], places=3)
+        # They survive a restart, and a session recorded before 0.0.14.0 has an empty list.
+        restored = m.ChargingLedger(json.loads(json.dumps(self.ledger.data)))
+        self.assertEqual(restored.snapshot()['chargers']['smartevse_1']['session']['parts'], parts)
+        old = json.loads(json.dumps(self.ledger.data)); old['records'][0].pop('parts')
+        self.assertEqual(m.ChargingLedger(old).snapshot()['chargers']['smartevse_1']['session']['parts'], [])
+        # Damaged parts are left out of the snapshot and do not stop the accounting.
+        old['records'][0]['parts'] = [{'kind': 'extra'}, 'x', {'kind': 'extra', 'start': at(0), 'end': at(1), 'energy_kwh': 1, 'cost': None}]
+        damaged = m.ChargingLedger(old)
+        self.assertEqual(len(damaged.snapshot()['chargers']['smartevse_1']['session']['parts']), 1)
+        damaged.observe(self.now + timedelta(seconds=60), self.states, 7.2, .2, 'EUR', self.sources, kind='extra')
+
+    def test_parts_are_bounded_per_session(self):
+        self.start()
+        for index in range(m.PARTS_LIMIT * 2 + 6):
+            self.now += timedelta(seconds=60)
+            self.ledger.observe(self.now, self.states, 7.2, .2, 'EUR', self.sources, kind='guaranteed' if index % 2 else 'extra')
+        record = self.record()
+        self.assertEqual(len(record['parts']), m.PARTS_LIMIT)
+        self.assertAlmostEqual(sum(part['energy_kwh'] for part in record['parts']), record['energy_kwh'], places=3)
+        self.assertAlmostEqual(sum(part['cost'] for part in record['parts']), record['cost'], places=3)
+
     def test_tariff_changes_do_not_reprice_previous_energy(self):
         self.start();self.observe(60,price=.4);self.observe(60)
         self.assertAlmostEqual(self.record()['cost'],.072)

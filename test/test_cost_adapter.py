@@ -35,6 +35,26 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         status=ControllerSensor(entry,SENSOR_DESCRIPTIONS[0])
         self.assertEqual(status.extra_state_attributes['charging_costs'],data)
         self.assertIn('charging_costs',status._unrecorded_attributes)
+    async def test_the_controller_names_the_part_of_the_charge(self):
+        # 0.0.14.0: the energy metered until the next cycle belongs to what made the
+        # charger charge in this one.
+        from custom_components.smartevse_dual_charger.const import ControllerState as CS
+        kind = SmartEVSEDualChargerController._part_kind
+        self.assertEqual(kind(True, CS.INTELLIGENT, 'intelligent_charging'), 'guaranteed')
+        self.assertEqual(kind(True, CS.INTELLIGENT, 'intelligent_catch_up'), 'guaranteed')
+        self.assertEqual(kind(True, CS.INTELLIGENT, 'intelligent_top_up'), 'extra')
+        self.assertEqual(kind(True, CS.SCHEDULE, 'schedule'), 'schedule')
+        self.assertEqual(kind(True, CS.PRICE, 'price'), 'schedule')
+        self.assertEqual(kind(True, CS.FORCE, 'force_charge'), 'force')
+        self.assertEqual(kind(True, CS.TIMER, 'timer'), 'force')
+        self.assertEqual(kind(False, CS.INTELLIGENT, 'intelligent_waiting_for_planned_slot'), 'other')
+        self.assertEqual(kind(True, CS.IDLE, None), 'other')
+        # The ledger gets it: one minute of charging under Force charge.
+        self.c._charge_part_kind = 'force'
+        await self.sample(); await self.sample(60)
+        parts = self.c.charging_costs()['chargers']['smartevse_1']['session']['parts']
+        self.assertEqual([(part['kind'], part['energy_kwh'], part['cost']) for part in parts], [('force', .12, .024)])
+
     async def test_save_failure_visible_and_does_not_stop_controller(self):
         self.c._cost_store.async_save.side_effect=OSError('test failure')
         with self.assertLogs('custom_components.smartevse_dual_charger',level='ERROR'):await self.sample()

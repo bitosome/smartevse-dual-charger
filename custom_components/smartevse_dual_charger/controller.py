@@ -89,6 +89,7 @@ from .const import (
     INTELLIGENT_SETTINGS_KEYS,
     LOGGER,
     REASON_INTELLIGENT_OUTLET_UNAVAILABLE,
+    REASON_INTELLIGENT_TOP_UP,
     REASON_INTELLIGENT_WAITING,
     SCHEDULE_NOTIFICATION_ID,
     STORAGE_KEY,
@@ -97,7 +98,16 @@ from .const import (
 )
 from .charge_planner import floor15
 from .charge_model import reached_with_hysteresis
-from .charging_cost import ChargingLedger, power_kw, tariff
+from .charging_cost import (
+    PART_EXTRA,
+    PART_FORCE,
+    PART_GUARANTEED,
+    PART_OTHER,
+    PART_SCHEDULE,
+    ChargingLedger,
+    power_kw,
+    tariff,
+)
 from .intelligent import (
     IntelligentCharging,
     IntelligentDecision,
@@ -346,6 +356,7 @@ class SmartEVSEDualChargerController:
         self._cost_store = StrictStore(hass, 1, f"{STORAGE_KEY}.{entry_data['entry_id']}.charging_costs")
         self._cost_ledger = None
         self._cost_error = None
+        self._charge_part_kind: str | None = None
         # Intelligent charging covers the schedule for reminders (§6.1).
         self._schedule_reminders = ScheduleReminders(
             hass, entry_data["entry_id"], entry_data.get(CONF_SCHEDULE_ENTITY), options,
@@ -882,6 +893,9 @@ class SmartEVSEDualChargerController:
             controller_error = self._vehicle_data_warning()
         self._mutable["last_controller_state"] = controller_state.value
         self._mutable["last_charge_reason"] = charge_reason
+        # What makes a charger charge until the next cycle: the part of the session the
+        # energy metered in that interval belongs to (history shows the parts of a charge).
+        self._charge_part_kind = self._part_kind(charge_allowed, controller_state, charge_reason)
         intelligent_payload, intelligent_flat = self._intelligent_payload(
             now=now,
             governing=intelligent_governing,
@@ -2692,6 +2706,21 @@ class SmartEVSEDualChargerController:
         data["power_entity"] = self._entry_data.get(CONF_EV_METER_IMPORT_ACTIVE_POWER_ENTITY)
         return data
 
+    @staticmethod
+    def _part_kind(charge_allowed: bool, controller_state: Any, charge_reason: str | None) -> str:
+        if not charge_allowed:
+            return PART_OTHER
+        if charge_reason == REASON_INTELLIGENT_TOP_UP:
+            return PART_EXTRA
+        state = str(getattr(controller_state, "value", controller_state) or "")
+        if state == ControllerState.INTELLIGENT.value:
+            return PART_GUARANTEED
+        if state in (ControllerState.SCHEDULE.value, ControllerState.PRICE.value):
+            return PART_SCHEDULE
+        if state in (ControllerState.FORCE.value, ControllerState.TIMER.value):
+            return PART_FORCE
+        return PART_OTHER
+
     async def _observe_charging_costs(self, *statuses, now):
         if self._cost_ledger is None:
             return
@@ -2704,7 +2733,8 @@ class SmartEVSEDualChargerController:
                 "available": s.available, "connected": s.connected,
                 "charging": s.state == "Charging", "complete": self._session_complete(s.key),
                 "vehicle": self._connected_ev_label(s.key),
-            } for s in statuses}, power, price, currency, [power_id, price_id])
+            } for s in statuses}, power, price, currency, [power_id, price_id],
+                kind=getattr(self, "_charge_part_kind", None))
             await self._cost_store.async_save(self._cost_ledger.data)
             self._cost_error = None
         except Exception:

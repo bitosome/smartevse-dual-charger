@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.13.0`
+Version: `0.0.14.0`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -453,8 +453,9 @@ gets its minimum first.
   set and nothing to learn. The evening peak is never used for it, and on a night that
   is dear throughout the car still charges in its cheaper half. The limit is fixed to
   the ready-by time, so it does not move while the night passes. It is published as
-  `top_up.price` and per charger as `extra_price_limit`; the card paints those hours
-  green in the price chart. The guaranteed minimum is not affected by it.
+  `top_up.price` and per charger as `extra_price_limit`. The guaranteed minimum is not
+  affected by it. (Green bars in the card's chart are the price integration's cheap
+  hours, as on the electricity price card, not this limit.)
 - Minimums come first: a car charges above its minimum only after the hours planned for
   the other car's minimum, so on a night when both cars need their minimum the extra
   charging is at the end of the night.
@@ -1231,3 +1232,20 @@ History writes are atomic and propagate disk/serialization failures to the card.
 Accounting failures remain separate from charger control. Corrupt nested history
 or checkpoints are rejected without overwriting the stored ledger. A charge
 first observed after a restart or telemetry gap is explicitly a partial estimate.
+
+## The parts of a charge (0.0.14.0)
+
+Each session in the charging history now also records the parts it went through:
+`charging_costs.chargers.<charger>.history[].parts`, a list of
+`{kind, start, end, energy_kwh, cost}`.
+
+- `kind` is what made the charger charge while that energy was metered: `guaranteed`
+  (Intelligent charging up to the minimum), `extra` (Intelligent charging above the
+  minimum), `schedule` (Charge with schedule), `force` (Force charge, its timer or its
+  price option) or `other` (charging the controller did not ask for).
+- Consecutive metered intervals of one kind are one part; a pause or another kind starts
+  a new one. The parts add up to the session's energy. A part's `cost` is null when some
+  of its energy had no price.
+- A session holds at most 48 parts; beyond that the oldest neighbours are joined.
+- Sessions recorded before 0.0.14.0 have an empty list. The store format is unchanged
+  (an added field), so an older version can still read it.
