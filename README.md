@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.14.0`
+Version: `0.0.15.0`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -587,6 +587,10 @@ inputs always give the same plan.
    needs the rest of that unit; the hand-off then happens inside the unit. A start inside
    a unit gets at least 6 minutes there and happens up to a minute early, so the next
    cycle still finds enough of the unit left.
+   **A car that is charging charges on** (0.0.15.0): the plan is rebuilt every cycle, and
+   a car that is charging is paused only when the pause saves more than €0.10 (what a
+   start is worth) compared with charging on over it. See
+   [A running charge charges on](#a-running-charge-charges-on-00150).
 9. **Order.** When both cars need the same hours, the earlier ready-by charges first.
    `SmartEVSE N first` breaks ties; `SmartEVSE N only` leaves the other outlet out of the
    plan ("Not planned · charge policy").
@@ -1249,3 +1253,38 @@ Each session in the charging history now also records the parts it went through:
 - A session holds at most 48 parts; beyond that the oldest neighbours are joined.
 - Sessions recorded before 0.0.14.0 have an empty list. The store format is unchanged
   (an added field), so an older version can still read it.
+
+## A running charge charges on (0.0.15.0)
+
+Found on the night of 2026-11-14. The prices fell hour by hour until the morning
+(0.143, 0.131, 0.115, 0.112, 0.109, 0.102 €/kWh) and the car was stopped at :44 of
+three hours in a row and started again at :08 of the next: 01:51–02:44, 03:08–03:44,
+04:08–04:44, 05:07–06:14. Nothing was broken. The plan is rebuilt every cycle; while the
+car charges, the time kept free before the ready-by time (the safety buffer, step 7)
+shrinks with the energy that is still needed, later and cheaper quarter-hours become
+free, and the cheapest plan moves the rest of the charge there. Each of those pauses
+saved a few cents.
+
+Since 0.0.15.0 a pause has to be worth a start:
+
+- For a car that is charging now, the cheapest plan is compared with the plan in which
+  the car charges on over its next break (then over the one after it, and so on). The
+  car charges on over a break when that costs at most **€0.10** more than the cheapest
+  plan (`PAUSE_MIN_SAVING_EUR`, the same amount a start is worth when short blocks are
+  merged). A break that saves more stays: a price peak in the middle of the night
+  still pauses the car.
+- Charging on must really remove a pause. A break that would only move to a later hour
+  is not paid for.
+- The same holds for charging above the minimum, and only through hours that charging
+  may use (the night's price limit for extra charging still applies).
+- Nothing changes for a car that is not charging: its plan is the cheapest one, as
+  before. Nothing changes without prices, when a car is late or catching up, or when
+  charging on would leave another car without the time for its minimum.
+- The safety buffer is unchanged. The recorded nights show why it is needed: on three
+  of the ten nights before this change the charging averaged 8.7–8.9 kW; the plan of
+  2026-11-14 expected about 10.2 kW.
+
+What it costs: on the night above the car would have charged once, 02:08–05:16 in a
+replay, for about €0.10 more than with the three pauses (€3.91 against €3.81), and it
+would have reached its minimum an hour earlier. With extra charging planned (minimum
+80 %, car limit 100 %) the replay goes from three starts to one for €0.02 more.

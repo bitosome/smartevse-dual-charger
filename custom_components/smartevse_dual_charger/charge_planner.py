@@ -37,6 +37,9 @@ UTC = timezone.utc
 UNIT_MINUTES = 15
 MIN_START_MINUTES = 5
 START_PENALTY_EUR = 0.10
+# A charge that is running is paused only when the cheaper plan saves more than this
+# (0.0.15.0): a pause is one more start, so it has to be worth what a start is.
+PAUSE_MIN_SAVING_EUR = START_PENALTY_EUR
 EXPECTED_MARGIN = 0.03
 EXPECTED_OVERHEAD_MIN = 3
 CONSERVATIVE_MARGIN = 0.10
@@ -1057,6 +1060,12 @@ class _Pass:
             # All units rank equal: latest first, which is contiguous by itself.
             self._continue_running()
             candidates = [i for i in candidates if self.residual[i] > _MIN_EPS]
+        elif self._keep_running(candidates):
+            return
+        self._choose(candidates)
+
+    def _choose(self, candidates: list[int]) -> None:
+        """The cheapest units among ``candidates`` for what the cars still need."""
         self._plan_late(candidates)
         late = [car for car in self.late_order if self.late_need.get(car.outlet, 0.0) > _EPS]
         cars = sorted(self.ontime + late, key=_Car.edf)
@@ -1142,6 +1151,87 @@ class _Pass:
             others = [c for c in self.ontime if c is not car]
             if not self.feasible(others):
                 self.residual, self.allocs, car.rem_e, car.rem_c = saved
+
+    def _plannable_from(self, car: _Car) -> datetime:
+        """Where a charge in progress can first be planned: now, or the next unit when
+        the rest of this one is too short to plan (the charge is carried over it)."""
+        if not self.n:
+            return self.now
+        unit = self.units[0]
+        if unit.usable_all or (car is self.commit_car and unit.usable_committed):
+            return self.now
+        return unit.end
+
+    def _keep_running(self, candidates: list[int]) -> bool:
+        """With prices: a car that is charging now is not paused for a small saving.
+
+        The cheapest plan is compared with plans in which that car charges on from now
+        up to where its next block begins: first over its first break, then over the
+        next one, and so on. A plan with fewer breaks is taken while it stays within
+        ``PAUSE_MIN_SAVING_EUR`` of the cheapest one: a pause is one more start, and a
+        night of falling prices otherwise stops the car every hour to move a few
+        minutes of charging to a slightly cheaper hour (found on 2026-11-14). A break
+        that saves more (a price peak) stays, and so does one that would only move.
+        Only for a car that is really charging (not one that merely holds the unit),
+        with every car on time; the other cars must still get their minimum. Returns
+        True when it has planned the units itself.
+        """
+        if self.late or any(c.overrun and c.rem_e > _EPS and not c.excluded for c in self.cars):
+            return False
+        cars = sorted((c for c in self.ontime if c.drawing and c.rem_e > _EPS), key=lambda c: c.tie)
+        if not cars:
+            return False
+        car = cars[0]
+        others = [c for c in self.ontime if c is not car]
+
+        def planned() -> bool:
+            return all(c.rem_e <= _REL_TOL * max(1.0, c.e_e) + 1e-6 for c in self.ontime)
+
+        def cost() -> float:
+            return sum(self.units[i].rank * a.energy / self.by_outlet[a.outlet].scale_e
+                       for i in range(self.n) for a in self.allocs[i] if a.kind != KIND_TOP_UP)
+
+        def breaks() -> tuple[int, int | None]:
+            """How often the car's charging is interrupted from now on, and the unit in
+            which it resumes after the first break."""
+            mine = [b for b in self._time_blocks().get(car.outlet, []) if not b.get("virtual")]
+            if mine and mine[0]["start"] <= self._plannable_from(car) + timedelta(seconds=1):
+                mine = mine[1:]  # the charging in progress goes on in this block
+            return len(mine), (min(i for i, _ in mine[0]["items"]) if mine else None)
+
+        start = self._snapshot()
+        self._choose(candidates)
+        if not planned():
+            return True
+        best, limit = self._snapshot(), cost() + PAUSE_MIN_SAVING_EUR + 1e-12
+        fewest, resume = breaks()
+        through = 0
+        while resume is not None and resume > through:
+            through = resume
+            self._restore(start)
+            start = self._snapshot()  # _restore hands over the saved lists: keep a copy to restore again
+            closed = True
+            for i in range(through):
+                if car.rem_e <= _EPS:
+                    break
+                if i == 0 and not self.usable(0, car):
+                    continue  # the last seconds of the running unit: the charge goes on into the next
+                if i in self.reserved or not self.usable(i, car):
+                    closed = False
+                    break
+                self.take(i, car, min(self.cap_e(i), car.rem_e), KIND_MINIMUM)
+            if not closed or not self.feasible(others):
+                break
+            self._choose([i for i in candidates if self.residual[i] > _MIN_EPS])
+            if not planned() or cost() > limit:
+                break
+            count, resume = breaks()
+            if count < fewest:
+                # Only a plan with one break less is taken: charging on to a break that
+                # has merely moved would cost money and still stop the car.
+                best, fewest = self._snapshot(), count
+        self._restore(best)
+        return True
 
     def _anchors(self) -> set:
         anchors = {i for i in range(self.n) if self.allocs[i]}
@@ -1567,6 +1657,59 @@ class _Pass:
         # The next car starts where the one before it ended, so the cars do not take
         # turns inside the extra charging.
         running = self._running()
+
+        def save():
+            return list(self.residual), [list(a) for a in self.allocs], dict(need)
+
+        def load(saved) -> None:
+            self.residual, self.allocs = list(saved[0]), [list(a) for a in saved[1]]
+            need.update(saved[2])
+
+        def extra(car):
+            return [(i, a) for i in range(self.n) for a in self.allocs[i]
+                    if a.outlet == car.outlet and a.kind == KIND_TOP_UP]
+
+        def plan_extra(car, candidates, through) -> bool:
+            """Give ``car`` its extra charging: first every unit before ``through`` (it
+            charges on from now), then the cheapest of the other candidates. False when a
+            unit before ``through`` is not the car's to use."""
+            allowed = set(candidates)
+            for i in range(through):
+                if need[car.outlet] <= _EPS:
+                    break
+                if i == 0 and not self.units[0].usable_all:
+                    continue  # the last seconds of the running unit
+                if any(a.outlet != car.outlet for a in self.allocs[i]):
+                    return False
+                if self.residual[i] <= _MIN_EPS:
+                    continue  # its own minimum fills this unit
+                if i not in allowed:
+                    return False
+                give(i, car, need[car.outlet])
+            rest = [i for i in candidates if self.residual[i] > _MIN_EPS]
+            caps = {i: kw_t(i) * self.residual[i] / 60.0 for i in rest}
+            flow = _Nested([car], [need[car.outlet]])
+            chosen = _greedy(self.units, rest, caps, flow, self._anchors(), False)
+            for i in sorted(chosen):
+                give(i, car, min(chosen[i], need[car.outlet]))
+            return True
+
+        def breaks(car) -> tuple[int, int | None]:
+            """How often ``car``'s charging is interrupted from now on, and the unit in
+            which it resumes after the first break."""
+            runs: list[list] = []  # [end, first unit]
+            for i, alloc, start, end in _place(self.units, self.allocs, running):
+                if alloc.outlet != car.outlet or end <= start:
+                    continue
+                if runs and (start - runs[-1][0]).total_seconds() <= 1.0:
+                    runs[-1][0] = max(runs[-1][0], end)
+                elif not runs and start <= self._plannable_from(car) + timedelta(seconds=1):
+                    runs.append([end, None])  # the charging in progress goes on
+                else:
+                    runs.append([end, i])
+            later = [first for _, first in runs if first is not None]
+            return len(later), (later[0] if later else None)
+
         taken = -1
         for car in sorted(cars, key=lambda c: (c.outlet not in running, -last_minimum_unit(c), c.edf())):
             if need[car.outlet] <= _EPS:
@@ -1577,12 +1720,34 @@ class _Pass:
                 if i >= first and unit.usable_all and self.residual[i] > _MIN_EPS
                 and unit.end <= car.deadline and qualifies(i, car)
             ]
-            caps = {i: kw_t(i) * self.residual[i] / 60.0 for i in candidates}
-            flow = _Nested([car], [need[car.outlet]])
-            chosen = _greedy(self.units, candidates, caps, flow, self._anchors(), False)
-            for i in sorted(chosen):
-                if give(i, car, min(chosen[i], need[car.outlet])) > 0:
-                    taken = max(taken, i)
+            before = save()
+            plan_extra(car, candidates, 0)
+            if car.drawing and not self.late:
+                # A car that is charging charges on (0.0.15.0, as for its minimum): a
+                # break in or before its extra charging is closed while that costs at
+                # most PAUSE_MIN_SAVING_EUR more than the cheapest hours, and only
+                # through hours it may use (the night's price limit still holds).
+                def paid() -> float:
+                    return sum((self.units[i].price or 0.0) * a.energy for i, a in extra(car))
+
+                best = save()
+                energy = sum(a.energy for _, a in extra(car))
+                limit = paid() + PAUSE_MIN_SAVING_EUR + 1e-12
+                fewest, resume = breaks(car)
+                through = 0
+                while resume is not None and resume > through:
+                    through = resume
+                    load(before)
+                    if not plan_extra(car, candidates, through):
+                        break
+                    mine = extra(car)
+                    if sum(a.energy for _, a in mine) < energy - _REL_TOL * max(1.0, energy) - 1e-6 or paid() > limit:
+                        break
+                    count, resume = breaks(car)
+                    if count < fewest:
+                        best, fewest = save(), count
+                load(best)
+            taken = max([taken] + [i for i, _ in extra(car)])
         self._drop_short_extra_blocks()
 
     def _drop_short_extra_blocks(self) -> None:

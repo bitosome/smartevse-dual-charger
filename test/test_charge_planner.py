@@ -786,6 +786,172 @@ class TailMergeTests(unittest.TestCase):
         self.assertIsNone(idle.current_outlet)
 
 
+class KeepRunningTests(unittest.TestCase):
+    """A running charge is paused only for a saving worth a start (0.0.15.0).
+
+    The prices are the production night of 2026-11-14 (falling from 01:00 to 08:00),
+    when the plan stopped the car at :44 of three hours in a row to move a quarter of
+    an hour to a slightly cheaper one.
+    """
+
+    T0 = L(11, 10, 0)
+    FALLING = [0.1348, 0.1435, 0.1312, 0.1151, 0.1115, 0.1089, 0.1024, 0.1004, 0.1484]
+    READY = L(11, 10, 7)
+
+    def prices(self, **changed):
+        values = list(self.FALLING)
+        for hour, price in changed.items():
+            values[int(hour[1:])] = price
+        return hourly(self.T0, values)
+
+    def running(self, now, soc, prices):
+        return plan(now, [car(XC40, soc, 90, self.READY, drawing=True)], prices=prices,
+                    commitment=m.Commitment('smartevse_1', m.floor15(now) + Q))
+
+    def test_a_running_car_charges_on_through_a_small_saving(self):
+        # 04:40, an hour of charging left: the cheapest hours begin 40 minutes later
+        # and are less than a cent per kWh cheaper.
+        now = L(11, 10, 4, 40)
+        p = self.running(now, 75, self.prices())
+        blocks = p.car('smartevse_1').blocks
+        self.assertEqual(p.current_outlet, 'smartevse_1')
+        self.assertEqual(len(blocks), 1)
+        self.assertLessEqual(blocks[0].start, now)
+        # The same car, not charging: the cheapest plan starts later.
+        idle = plan(now, [car(XC40, 75, 90, self.READY)], prices=self.prices())
+        self.assertIsNone(idle.current_outlet)
+        self.assertGreater(idle.car('smartevse_1').blocks[0].start, now + 2 * Q)
+        # Charging on costs about what a start is worth at most. The limit is applied to
+        # the planned energy, margin included; the cost shown is that of the energy the
+        # car is expected to take, so the two differ by a few cents.
+        with patched(PAUSE_MIN_SAVING_EUR=-1.0):
+            cheapest = self.running(now, 75, self.prices())
+        self.assertGreater(len(cheapest.car('smartevse_1').blocks), 1)
+        self.assertLessEqual(p.total_cost - cheapest.total_cost, m.PAUSE_MIN_SAVING_EUR + 0.03)
+
+    def test_a_running_car_is_paused_for_a_real_saving(self):
+        # 02:40, the same hour of charging left: the cheapest hours are three hours away
+        # and save more than a start is worth, so the car is paused as before.
+        now = L(11, 10, 2, 40)
+        p = self.running(now, 75, self.prices())
+        with patched(PAUSE_MIN_SAVING_EUR=-1.0):
+            cheapest = self.running(now, 75, self.prices())
+        self.assertEqual([(b.start, b.end) for b in p.car('smartevse_1').blocks],
+                         [(b.start, b.end) for b in cheapest.car('smartevse_1').blocks])
+        self.assertGreater(p.car('smartevse_1').blocks[-1].start, L(11, 10, 5))
+
+    def test_a_price_peak_still_pauses_a_running_car(self):
+        now = L(11, 10, 2, 40)
+        p = self.running(now, 60, self.prices(h3=0.30))
+        blocks = p.car('smartevse_1').blocks
+        self.assertGreater(len(blocks), 1)
+        for block in blocks:
+            self.assertFalse(block.start < L(11, 10, 4) and block.end > L(11, 10, 3), blocks)
+
+    def test_a_small_break_before_a_price_peak_is_closed_and_the_peak_is_not(self):
+        # 03:00 is the peak. The cheapest plan also leaves out the end of 01:00; a car
+        # that is charging then charges on to the peak and pauses there only.
+        now = L(11, 10, 1, 40)
+        with patched(PAUSE_MIN_SAVING_EUR=-1.0):
+            cheapest = self.running(now, 55, self.prices(h3=0.30))
+        self.assertEqual(len(cheapest.car('smartevse_1').blocks), 3)
+        p = self.running(now, 55, self.prices(h3=0.30))
+        blocks = p.car('smartevse_1').blocks
+        self.assertEqual(len(blocks), 2)
+        self.assertLessEqual(blocks[0].start, now)
+        self.assertGreater(blocks[0].end, L(11, 10, 2))
+        self.assertLessEqual(blocks[0].end, L(11, 10, 3))
+        self.assertGreaterEqual(blocks[1].start, L(11, 10, 4))
+
+    def test_the_minimum_is_still_fully_planned(self):
+        for minute in range(0, 60, 7):
+            now = L(11, 10, 2, minute)
+            p = self.running(now, 60, self.prices())
+            own = p.car('smartevse_1')
+            self.assertTrue(own.feasible)
+            self.assertFalse(own.late)
+            self.assertGreaterEqual(own.projected_soc, 89.5, minute)
+            self.assertLessEqual(max(b.end for b in own.blocks), self.READY)
+
+    def test_the_night_is_one_charge(self):
+        cars = [(XC40, 48, 90, self.READY)]
+        sim = Sim(cars, L(11, 10, 0), L(11, 10, 7, 30), self.prices(), true_kw=lambda t, outlet: 10.6)
+        self.assertEqual(sim.state['smartevse_1']['starts'], 1)
+        self.assertGreaterEqual(sim.soc_at('smartevse_1', self.READY), 90 - 1e-6)
+        with patched(PAUSE_MIN_SAVING_EUR=-1.0):
+            before = Sim(cars, L(11, 10, 0), L(11, 10, 7, 30), self.prices(), true_kw=lambda t, outlet: 10.6)
+        self.assertGreater(before.state['smartevse_1']['starts'], 1)
+        self.assertGreaterEqual(before.soc_at('smartevse_1', self.READY), 90 - 1e-6)
+
+    def test_a_slow_night_still_reaches_the_minimum(self):
+        sim = Sim([(XC40, 48, 90, self.READY)], L(11, 10, 0), L(11, 10, 7, 30), self.prices(),
+                  true_kw=lambda t, outlet: 8.7)
+        self.assertEqual(sim.state['smartevse_1']['starts'], 1)
+        self.assertGreaterEqual(sim.soc_at('smartevse_1', self.READY), 90 - 1e-6)
+
+    def test_the_other_car_keeps_its_time(self):
+        # The EX30 has to leave at 04:00. The XC40, charging now, may not charge on
+        # through the hours the EX30 needs.
+        now = L(11, 10, 1, 40)
+        cars = [car(XC40, 60, 90, self.READY, drawing=True), car(EX30, 60, 80, L(11, 10, 4))]
+        p = plan(now, cars, prices=self.prices(), commitment=m.Commitment('smartevse_1', m.floor15(now) + Q))
+        other = p.car('smartevse_2')
+        self.assertTrue(other.feasible)
+        self.assertFalse(other.late)
+        self.assertGreaterEqual(other.projected_soc, 79.5)
+        self.assertLessEqual(max(b.end for b in other.blocks), L(11, 10, 4))
+        self.assertGreaterEqual(p.car('smartevse_1').projected_soc, 89.5)
+
+    def test_a_car_that_only_holds_the_unit_is_not_kept(self):
+        # Committed for this unit but not charging (it was just stopped): the cheapest plan.
+        now = L(11, 10, 2, 40)
+        held = plan(now, [car(XC40, 60, 90, self.READY)], prices=self.prices(),
+                    commitment=m.Commitment('smartevse_1', m.floor15(now) + Q))
+        self.assertGreater(len(held.car('smartevse_1').blocks), 1)
+
+    EXTRA = dict(above_minimum=True, extra_price_limits={'smartevse_1': 0.17})
+
+    def extra(self, now, prices, drawing=True):
+        # Above its minimum (70 %) and below its own limit (90 %): only extra charging is left.
+        return plan(now, [car(XC40, 75, 70, self.READY, drawing=drawing, reached=True)], prices=prices,
+                    config=m.PlannerConfig(**self.EXTRA),
+                    commitment=m.Commitment('smartevse_1', m.floor15(now) + Q) if drawing else None)
+
+    def test_extra_charging_goes_on_through_a_small_saving(self):
+        now = L(11, 10, 4, 40)
+        p = self.extra(now, self.prices())
+        blocks = p.car('smartevse_1').blocks
+        self.assertEqual(p.current_outlet, 'smartevse_1')
+        self.assertEqual(len(blocks), 1)
+        self.assertTrue(blocks[0].top_up)
+        self.assertLessEqual(blocks[0].start, now)
+        idle = self.extra(now, self.prices(), drawing=False)
+        self.assertIsNone(idle.current_outlet)
+        self.assertGreater(idle.car('smartevse_1').blocks[0].start, now + 4 * Q)
+        self.assertAlmostEqual(p.car('smartevse_1').top_up_kwh, idle.car('smartevse_1').top_up_kwh, places=1)
+        self.assertLessEqual(p.total_top_up_cost - idle.total_top_up_cost, m.PAUSE_MIN_SAVING_EUR + 0.01)
+
+    def test_extra_charging_waits_for_a_real_saving(self):
+        # At 02:40 the cheapest hours are far cheaper than charging on: the pause stays.
+        now = L(11, 10, 2, 40)
+        p = self.extra(now, self.prices())
+        self.assertGreater(p.car('smartevse_1').blocks[-1].start, L(11, 10, 5))
+        self.assertTrue(all(b.end <= now + Q or b.start > L(11, 10, 5) for b in p.car('smartevse_1').blocks))
+
+    def test_extra_charging_does_not_go_on_into_an_hour_above_the_price_limit(self):
+        now = L(11, 10, 4, 40)
+        p = self.extra(now, self.prices(h5=0.20))
+        for block in p.car('smartevse_1').blocks:
+            self.assertFalse(block.start < L(11, 10, 6) and block.end > L(11, 10, 5), block)
+        self.assertGreater(len(p.car('smartevse_1').blocks), 1)
+
+    def test_no_price_mode_is_unchanged(self):
+        now = L(11, 10, 2, 40)
+        p = plan(now, [car(XC40, 60, 90, self.READY, drawing=True)], prices=self.prices(),
+                 config=m.PlannerConfig(no_price_mode=True))
+        self.assertEqual(len(p.car('smartevse_1').blocks), 1)
+
+
 class ReviewRegressionTests(unittest.TestCase):
     """Second design review: commitment, R11 late cars, ties and in-unit starts."""
 
