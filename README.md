@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.15.0`
+Version: `0.0.16.0`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -577,9 +577,11 @@ inputs always give the same plan.
    to an already chosen block wins, then the earlier one. A unit is only taken while it
    adds energy some on-time car can still use before its deadline. For one charger and
    per-car deadlines this greedy choice is exactly the cheapest plan.
-7. **Safety buffer.** Extra units close to each deadline cover the gap between expected
-   and conservative power, as long as they do not take time another car needs. A car
-   whose buffer could not be completed shows `tight`.
+7. **Safety buffer.** Extra units close to each deadline cover half of the gap between
+   expected and conservative power (0.0.16.0; all of it before, and still all of it
+   without prices), as long as they do not take time another car needs. A car whose
+   buffer could not be completed shows `tight`. See
+   [A smaller safety buffer](#a-smaller-safety-buffer-00160).
 8. **Blocks.** Consecutive units become blocks. A short block (under 30 minutes) is
    moved next to the car's other block when that costs at most €0.10 more, to avoid an
    extra start. Once a unit has started, it stays with its car until the unit ends,
@@ -1280,11 +1282,48 @@ Since 0.0.15.0 a pause has to be worth a start:
 - Nothing changes for a car that is not charging: its plan is the cheapest one, as
   before. Nothing changes without prices, when a car is late or catching up, or when
   charging on would leave another car without the time for its minimum.
-- The safety buffer is unchanged. The recorded nights show why it is needed: on three
-  of the ten nights before this change the charging averaged 8.7–8.9 kW; the plan of
-  2026-11-14 expected about 10.2 kW.
+- The safety buffer was left as it was in 0.0.15.0 and made smaller in 0.0.16.0 (below).
 
 What it costs: on the night above the car would have charged once, 02:08–05:16 in a
 replay, for about €0.10 more than with the three pauses (€3.91 against €3.81), and it
 would have reached its minimum an hour earlier. With extra charging planned (minimum
 80 %, car limit 100 %) the replay goes from three starts to one for €0.02 more.
+
+## A smaller safety buffer (0.0.16.0)
+
+The owner's decision of 2026-11-14. The time kept free before a car's ready-by time
+covers **half** of the gap between the conservative and the expected need
+(`BUFFER_SHARE = 0.5`); until 0.0.15.0 it covered all of it. The conservative need
+itself is unchanged (learned worst-case energy per percent, 10 %, 10 minutes, the
+conservative power of each hour), and so are the `tight` and `at_risk` statuses, which
+now refer to the smaller buffer. Without prices the whole gap is still kept free:
+there is no cheaper hour to gain.
+
+Why: the buffer sits on the last hours before the ready-by time, which are often the
+cheapest of the night, and it made the car start early in dearer hours. On the night
+of 2026-11-14 it was about 75 minutes for a charge of three and a half hours.
+
+What it means, from a replay of that night (48 → 90 %, expected 10.2 kW, conservative
+8.5 kW):
+
+| Real charging power | Start | Minimum reached | At the ready-by time (07:00) |
+| --- | --- | --- | --- |
+| 10.6 kW (that night) | 02:38 (was 02:08) | 05:46 | 90 % |
+| 8.7 kW (the slowest of the ten recorded nights) | 02:38 | 06:27 | 90 % |
+| 8.0 kW | 02:38 | 06:47 | 90 % |
+| 7.5 kW | 02:38 | not before 07:00 | 89.4 % |
+| 7.0 kW | 02:38 | not before 07:00 | 86.6 % |
+
+With the whole buffer the car reached 90 % in all five cases (at 7.0 kW by 06:52). The
+replay of that night costs €3.80 with 0.0.16.0, against €3.91 with 0.0.15.0 and €3.81
+with the three pauses of 0.0.14.0.
+
+Side effects:
+
+- A plan made before charging starts can have more separate blocks, because one more
+  cheap late hour is free to choose. A car that is charging still charges on over a
+  break that is not worth a start (0.0.15.0).
+- The minimum is planned later, so on a night when only the late hours are below the
+  price limit for extra charging, less extra charging fits before the ready-by time.
+- When one car cannot reach its minimum, it gets more of the time: the on-time car
+  keeps less of it free.

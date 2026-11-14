@@ -37,6 +37,13 @@ UTC = timezone.utc
 UNIT_MINUTES = 15
 MIN_START_MINUTES = 5
 START_PENALTY_EUR = 0.10
+# The share of the gap between the conservative and the expected need that is kept free
+# before a car's ready-by time (0.0.16.0, the owner's decision of 2026-11-14; it was all
+# of it). Half of it still covers the slowest of the ten nights recorded until then
+# (charging at 8.7 kW on average where 10.2 kW was expected), and leaves more of the
+# last hours before the ready-by time, often the cheapest, to charge in. On a slower
+# night than those the car can be a few percent short at its ready-by time.
+BUFFER_SHARE = 0.5
 # A charge that is running is paused only when the cheaper plan saves more than this
 # (0.0.15.0): a pause is one more start, so it has to be worth what a start is.
 PAUSE_MIN_SAVING_EUR = START_PENALTY_EUR
@@ -1023,12 +1030,14 @@ class _Pass:
 
     # Step 5
     def buffer(self) -> None:
+        # Without prices there is no cheaper hour to gain: the whole gap is kept free.
+        share = 1.0 if self.ctx.no_price else BUFFER_SHARE
         for car in sorted(self.ontime, key=_Car.edf, reverse=True):
             pool = [i for i in range(self.n) if i not in self.reserved and self.usable(i, car)]
             sum_e = sum(self.cap_e(i) for i in pool)
             sum_c = sum(self.cap_c(i) for i in pool)
             rho = sum_c / sum_e if sum_e > _EPS else 1.0
-            deficit = car.rem_c - rho * car.rem_e
+            deficit = share * (car.rem_c - rho * car.rem_e)
             if deficit <= _EPS:
                 continue
             got = 0.0
@@ -1199,8 +1208,15 @@ class _Pass:
                 mine = mine[1:]  # the charging in progress goes on in this block
             return len(mine), (min(i for i, _ in mine[0]["items"]) if mine else None)
 
+        def settle(units: list[int]) -> None:
+            # With the short blocks merged as step 9 will merge them (no car is late
+            # here, so nothing comes in between): the breaks counted are the ones the
+            # finished plan has.
+            self._choose(units)
+            self.merge_tails()
+
         start = self._snapshot()
-        self._choose(candidates)
+        settle(candidates)
         if not planned():
             return True
         best, limit = self._snapshot(), cost() + PAUSE_MIN_SAVING_EUR + 1e-12
@@ -1222,7 +1238,7 @@ class _Pass:
                 self.take(i, car, min(self.cap_e(i), car.rem_e), KIND_MINIMUM)
             if not closed or not self.feasible(others):
                 break
-            self._choose([i for i in candidates if self.residual[i] > _MIN_EPS])
+            settle([i for i in candidates if self.residual[i] > _MIN_EPS])
             if not planned() or cost() > limit:
                 break
             count, resume = breaks()

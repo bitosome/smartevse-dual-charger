@@ -530,7 +530,7 @@ class VersionTests(unittest.TestCase):
     def test_version_matches_manifest_and_readme(self):
         manifest = json.loads((PACKAGE / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(VERSION, manifest["version"])
-        self.assertEqual(VERSION, "0.0.15.0")
+        self.assertEqual(VERSION, "0.0.16.0")
         # Review round 3: no after_dependency on the price integration — HA refuses to set
         # up an integration whose after_dependency failed, which would stop Schedule/Force
         # too. The registry-based derivation works in any setup order.

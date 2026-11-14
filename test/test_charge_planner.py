@@ -334,10 +334,16 @@ class RealPriceScenarioTests(unittest.TestCase):
             soc, cost = execute(p, request, price_slots())
             self.assertAlmostEqual(soc, 80.0, places=6)
             self.assertAlmostEqual(cost, c.cost, delta=0.01)
-        # XC40 (priority) runs as one block, the hand-off idle sits between the cars.
-        self.assertEqual(len(p.car('smartevse_1').blocks), 1)
+        # XC40 (priority) charges first; one hand-off between the cars. Since 0.0.16.0
+        # the smaller buffer leaves 05:00 free, which is cheaper than 22:00, so each car
+        # has two blocks (with the whole buffer the XC40 ran as one).
+        self.assertLessEqual(len(p.car('smartevse_1').blocks), 2)
         self.assertLessEqual(len(p.car('smartevse_2').blocks), 2)
-        self.assertAlmostEqual(p.total_cost, 12.87, delta=0.03)
+        self.assertLessEqual(p.total_cost, 12.87 + 0.03)
+        with patched(BUFFER_SHARE=1.0):
+            whole = plan(L(11, 9, 18, 30), requests)
+        self.assertEqual(len(whole.car('smartevse_1').blocks), 1)
+        self.assertAlmostEqual(whole.total_cost, 12.87, delta=0.03)
         self.assertNoOverlap(p)
         owners = [s.outlet for s in p.segments]
         self.assertEqual(sum(1 for a, b in zip(owners, owners[1:]) if a != b), 1)
@@ -511,8 +517,9 @@ class OnTimeSelectionTests(unittest.TestCase):
         self.assertEqual((ex.status, ex.feasible), ('at_risk', False))
         # R11: the late car gets as much as it can by 06:00 with the XC40 (and its
         # buffer) still on time, not only what the XC40's price plan leaves over
-        # (that gave 53.6 %).
-        self.assertAlmostEqual(ex.projected_soc, 57.2, delta=1.0)
+        # (that gave 53.6 %). 57.2 % with the whole buffer; 60.9 % since 0.0.16.0, as the
+        # XC40 keeps half of it free.
+        self.assertAlmostEqual(ex.projected_soc, 60.9, delta=1.0)
         # The late car gets the remaining time as early as possible: it charges now.
         self.assertEqual((p.current_outlet, p.reason), ('smartevse_2', m.REASON_CATCH_UP))
         self.assertTrue(all(s.end <= L(11, 10, 6) for s in segs(p, 'smartevse_2')))
@@ -624,14 +631,37 @@ class BufferTests(unittest.TestCase):
         prices = hourly(t0, [0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.12, 0.1, 0.05])
         p = plan(t0, [car(XC40, 50, 77, L(11, 10, 7))], prices=prices)
         last = max(s.end for s in p.segments)
-        self.assertLessEqual(last, L(11, 10, 6))
+        # 0.0.16.0: half of the gap between the conservative and the expected need.
+        self.assertEqual(m.BUFFER_SHARE, 0.5)
+        self.assertLessEqual(last, L(11, 10, 6, 30))
         self.assertEqual(p.car('smartevse_1').status, 'planned')
         self.assertFalse(p.car('smartevse_1').tight)
+        with patched(BUFFER_SHARE=1.0):  # all of it, as until 0.0.15.0
+            whole = plan(t0, [car(XC40, 50, 77, L(11, 10, 7))], prices=prices)
+        self.assertLessEqual(max(s.end for s in whole.segments), L(11, 10, 6))
+        self.assertLess(max(s.end for s in whole.segments), last)
+
+    def test_no_price_mode_keeps_the_whole_buffer(self):
+        dl = L(11, 10, 7)
+        p = plan(L(11, 9, 18, 30), [car(XC40, 53, 80, dl)], prices=[])
+        with patched(BUFFER_SHARE=1.0):
+            whole = plan(L(11, 9, 18, 30), [car(XC40, 53, 80, dl)], prices=[])
+        self.assertEqual([(b.start, b.end) for b in p.car('smartevse_1').blocks],
+                         [(b.start, b.end) for b in whole.car('smartevse_1').blocks])
+
+    def test_half_the_buffer_still_covers_a_slow_night(self):
+        # The slowest recorded nights charged at about 8.7 kW where the plan expects 11.
+        dl = L(11, 10, 7)
+        for true_kw, least in ((8.7, 80.0), (8.0, 80.0), (7.0, 76.0)):
+            sim = Sim([(XC40, 30, 80, dl)], L(11, 9, 18, 30), dl + timedelta(minutes=1), price_slots(),
+                      true_kw=lambda t, o, kw=true_kw: kw, step=2)
+            self.assertGreaterEqual(sim.soc_at('smartevse_1', dl), least - 1e-6, true_kw)
 
     def test_tight_night_keeps_part_of_the_buffer(self):
         prices = price_slots(KNOWN + NIGHT_11_11)
         dl = L(11, 11, 7)
-        p = plan(L(11, 10, 22), [car(XC40, 20, 80, dl), car(EX30, 45, 80, dl)], prices=prices)
+        with patched(BUFFER_SHARE=1.0):  # the whole buffer does not fit: it is clamped
+            p = plan(L(11, 10, 22), [car(XC40, 20, 80, dl), car(EX30, 45, 80, dl)], prices=prices)
         statuses = {c.status for c in p.cars}
         self.assertTrue(statuses <= {'planned', 'tight'})
         self.assertIn('tight', statuses)
@@ -639,6 +669,13 @@ class BufferTests(unittest.TestCase):
             self.assertGreaterEqual(min_energy(p, c.outlet), c.need_expected_kwh - 2e-3)
         free = 9 * 60 - sum(s.minutes for s in p.segments)
         self.assertGreater(free, 15)  # a reduced buffer is still kept
+        # 0.0.16.0: half the buffer fits this night, so no car is tight.
+        p = plan(L(11, 10, 22), [car(XC40, 20, 80, dl), car(EX30, 45, 80, dl)], prices=prices)
+        self.assertTrue({c.status for c in p.cars} <= {'planned', 'charging'})
+        for c in p.cars:
+            self.assertFalse(c.tight)
+            self.assertGreaterEqual(min_energy(p, c.outlet), c.need_expected_kwh - 2e-3)
+        self.assertGreater(9 * 60 - sum(s.minutes for s in p.segments), 15)
 
     def test_tight_night_survives_power_drops(self):
         prices = price_slots(KNOWN + NIGHT_11_11)
@@ -772,7 +809,11 @@ class TailMergeTests(unittest.TestCase):
         self.assertEqual(len(p.car('smartevse_1').blocks), 1)
 
     def test_partly_used_unit_does_not_split_a_run(self):
-        p = plan(L(11, 9, 18, 30), [car(XC40, 53, 80, L(11, 10, 7)), car(EX30, 40, 80, L(11, 10, 7))])
+        # With the whole buffer: the two cars then need 22:00 too, and the unit the
+        # XC40 uses only partly must not split its run. (With half the buffer 05:00 is
+        # free and cheaper than 22:00, which is a different plan.)
+        with patched(BUFFER_SHARE=1.0):
+            p = plan(L(11, 9, 18, 30), [car(XC40, 53, 80, L(11, 10, 7)), car(EX30, 40, 80, L(11, 10, 7))])
         xc = p.car('smartevse_1').blocks
         self.assertEqual(len(xc), 1)
         self.assertEqual(loc(xc[0].start), '21:00')
@@ -853,9 +894,9 @@ class KeepRunningTests(unittest.TestCase):
         # that is charging then charges on to the peak and pauses there only.
         now = L(11, 10, 1, 40)
         with patched(PAUSE_MIN_SAVING_EUR=-1.0):
-            cheapest = self.running(now, 55, self.prices(h3=0.30))
+            cheapest = self.running(now, 50, self.prices(h3=0.30))
         self.assertEqual(len(cheapest.car('smartevse_1').blocks), 3)
-        p = self.running(now, 55, self.prices(h3=0.30))
+        p = self.running(now, 50, self.prices(h3=0.30))
         blocks = p.car('smartevse_1').blocks
         self.assertEqual(len(blocks), 2)
         self.assertLessEqual(blocks[0].start, now)
@@ -1020,7 +1061,11 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(p.car('smartevse_2').projected_soc, 95.0)
         self.assertEqual(p.car('smartevse_1').status, 'at_risk')
         first = [s for s in p.segments if s.outlet == 'smartevse_1']
-        self.assertLessEqual(sum(s.minutes for s in first), 15)
+        # 11 minutes with the whole buffer of the on-time car, 36 with half of it (0.0.16.0).
+        self.assertLessEqual(sum(s.minutes for s in first), 40)
+        with patched(BUFFER_SHARE=1.0):
+            whole = m.build_plan(self.utc(9, 22, 10), prices, powers, [hopeless, tight])
+        self.assertLessEqual(sum(s.minutes for s in whole.segments if s.outlet == 'smartevse_1'), 15)
         alone = m.build_plan(self.utc(9, 22, 10), prices, powers, [tight])
         self.assertEqual(alone.car('smartevse_2').projected_soc, p.car('smartevse_2').projected_soc)
 
@@ -1098,7 +1143,9 @@ class MixedCarPowerTests(unittest.TestCase):
         minutes = lambda p: sum(seg.minutes for seg in segs(p, 'smartevse_2', top_up=False))
         self.assertFalse(both.car('smartevse_2').late)
         self.assertEqual(both.car('smartevse_2').status, 'planned')
-        self.assertAlmostEqual(minutes(both), minutes(alone), delta=5.0)  # buffer and tail merging
+        # Buffer, tail merging and three minutes for each further start (alone it starts
+        # three times since 0.0.16.0: the smaller buffer leaves a cheap late hour free).
+        self.assertAlmostEqual(minutes(both), minutes(alone), delta=7.0)
         # The cold car gets the minutes its own power needs, and both reach 70 %.
         for outlet in ('smartevse_1', 'smartevse_2'):
             self.assertGreaterEqual(both.car(outlet).projected_soc, 70.0)
