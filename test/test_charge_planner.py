@@ -1426,6 +1426,33 @@ class TopUpTests(unittest.TestCase):
         self.assertEqual(need.car('smartevse_1').projected_soc, 80.0)
 
 
+    def test_a_start_too_short_to_make_does_not_hold_back_the_other_car(self):
+        # The morning of 2026-11-15: the XC40 stopped 0.6 % below its car limit (three
+        # minutes of charging). Its extra charging was planned first, the EX30's began
+        # where it ended, and the three minutes were then left out as too short for a
+        # start: every cycle the EX30 was to start "in three minutes", for an hour and
+        # a half. Now the EX30 charges from the first moment.
+        prices = hourly(L(11, 15, 5), [0.0770, 0.0772, 0.0732])  # 05:00, 06:00, 07:00
+        powers = power_slots(L(11, 15, 0), hours=24, expected=8.5, conservative=8.5)
+        cars = [car(XC40, 89.4, 65, L(11, 15, 7, 30), reached=True),
+                car(EX30, 62, 60, L(11, 15, 8), reached=True)]
+        config = m.PlannerConfig(above_minimum=True)
+        for now in (L(11, 15, 6), L(11, 15, 6, 8), L(11, 15, 7), L(11, 15, 7, 16)):
+            with self.subTest(now=loc(now)):
+                p = plan(now, cars, prices=prices, powers=powers, config=config)
+                self.assertEqual(p.current_outlet, 'smartevse_2')
+                self.assertFalse(segs(p, 'smartevse_1'))
+                blocks = p.car('smartevse_2').blocks
+                self.assertEqual((loc(blocks[0].start), loc(blocks[-1].end)), (loc(now), '08:00'))
+        # A car with real extra charging left still goes first, and the other follows it.
+        cars = [car(XC40, 80, 65, L(11, 15, 7, 30), reached=True),
+                car(EX30, 62, 60, L(11, 15, 8), reached=True)]
+        p = plan(L(11, 15, 6), cars, prices=prices, powers=powers, config=config)
+        first, second = segs(p, 'smartevse_1', top_up=True), segs(p, 'smartevse_2', top_up=True)
+        self.assertTrue(first and second)
+        self.assertGreaterEqual(min(s.start for s in second), max(s.end for s in first))
+
+
 class PriceKindTests(unittest.TestCase):
     def test_waits_for_tomorrows_prices_when_that_is_safe(self):
         # Round 5 (owner): EX30 10->100 % plugged in at 08:00, tomorrow not published yet

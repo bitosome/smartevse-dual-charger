@@ -572,35 +572,37 @@ class PlanTests(TzMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocks[0].start, L(11, 9, 21))  # 0.2418 is the cheapest hour tonight
         self.assertTrue(all(block.end <= self.deadline for block in blocks))
 
-    def test_waits_for_tomorrows_prices_and_replans_when_they_arrive(self):
-        # Round 5 (owner): at 11:00 tomorrow's prices are not published. The plan avoids
-        # the known hours before 15:00, puts nothing into forecast hours the known hours
-        # do not need, and is rebuilt as soon as the prices arrive.
+    def test_plans_in_the_known_hours_and_replans_when_tomorrows_prices_arrive(self):
+        # 0.0.17.0 (owner, 2026-11-15): at 11:00 tomorrow's prices are not published. The
+        # plan uses the hours with a known price (it does not wait for 15:00), puts
+        # nothing into an hour without a price that the known hours do not need, and is
+        # rebuilt as soon as the prices arrive.
         price_states(self.states, tomorrow=False)
         self.deadline = L(11, 10, 7)
         now = L(11, 9, 11)
         self.plan_xc40(now=now)
-        self.assertEqual(self.adapter._prices_expected_at, L(11, 9, 15))
         plan = self.adapter._plan
         segments = plan.segments
         self.assertTrue(segments)
-        self.assertTrue(all(seg.start >= L(11, 9, 15) for seg in segments))
+        self.assertFalse(plan.no_price_mode)
         self.assertTrue(all(seg.price_kind == "known" for seg in segments))
-        # Published at 14:40: the next cycle plans with them and stops waiting.
+        self.assertTrue(all(seg.end <= L(11, 10, 1) for seg in segments))  # the known hours end at 01:00
+        payload, _ = self.adapter.build_payload(now, context(outlets={
+            "smartevse_1": OutletPayloadInput(deadline=self.deadline)}))
+        self.assertIsNone(payload["prices_expected_at"])
+        # Published at 14:40: the next cycle plans with them.
         price_states(self.states, tomorrow=True)
         later = L(11, 9, 14, 40)
         self.plan_xc40(now=later)
-        self.assertIsNone(self.adapter._prices_expected_at)
         self.assertEqual(self.adapter._known_until, L(11, 11, 1))
         replanned = self.adapter._plan.car("smartevse_1").blocks
         self.assertEqual(replanned[0].start, L(11, 9, 21))  # tonight's cheapest hours
-        self.assertNotEqual([(b.start, b.end) for b in replanned],
-                            [(b.start, b.end) for b in plan.car("smartevse_1").blocks])
 
-    def test_charging_above_the_minimum_waits_for_tomorrows_prices(self):
-        # 0.0.11.0: XC40 at 85 % (minimum 80, car limit 90) at 11:00, ready-by tomorrow
-        # 07:00 and tomorrow's list not published. Its minimum is in, so nothing has to
-        # happen now: the charging above it waits for the night's prices.
+    def test_charging_above_the_minimum_uses_the_known_hours(self):
+        # 0.0.17.0: XC40 at 85 % (minimum 80, car limit 90) at 11:00, ready-by tomorrow
+        # 07:00 and tomorrow's list not published. The charging above the minimum is
+        # planned in the hours that are known now instead of waiting for the night's
+        # prices (the owner's morning of 2026-11-15: cheap known hours went unused).
         price_states(self.states, tomorrow=False)
         self.deadline = L(11, 10, 7)
         put(self.states, XC40_BATTERY, 85.0, at=L(11, 9, 10, 58), unit_of_measurement="%")
@@ -609,17 +611,16 @@ class PlanTests(TzMixin, unittest.IsolatedAsyncioTestCase):
                                                                   plugged_at=L(11, 9, 10, 56))},
                              settings=SETTINGS, controller_state="intelligent")
         inputs = {"smartevse_1": PlanInput("smartevse_1", self.deadline)}
-        decision = self.adapter.plan(now, inputs)
-        self.assertEqual((decision.allowed, decision.reason), (False, "intelligent_targets_reached"))
-        self.assertIsNone(self.adapter._prices_expected_at)  # nobody needs a minimum
-        self.assertEqual(self.adapter._extra_waits_until, L(11, 9, 15))
-        self.assertEqual(self.adapter._plan.segments, ())
+        self.adapter.plan(now, inputs)
+        segments = self.adapter._plan.segments
+        self.assertTrue(segments)
+        self.assertTrue(all(seg.top_up and seg.price_kind == "known" for seg in segments))
         payload, _ = self.adapter.build_payload(now, context(outlets={
             "smartevse_1": OutletPayloadInput(deadline=self.deadline)}))
         charger = payload["chargers"]["smartevse_1"]
         self.assertEqual((charger["status"], charger["extra_soc"], charger["extra_waits_until"]),
-                         ("reached", None, "2026-11-09T13:00:00+00:00"))
-        self.assertEqual(payload["top_up"]["waits_until"], "2026-11-09T13:00:00+00:00")
+                         ("reached", 90.0, None))
+        self.assertIsNone(payload["top_up"]["waits_until"])
         # Published: the cheapest hour of the night takes it.
         price_states(self.states, tomorrow=True)
         later = L(11, 9, 14, 40)
@@ -627,70 +628,34 @@ class PlanTests(TzMixin, unittest.IsolatedAsyncioTestCase):
                                                                     plugged_at=L(11, 9, 10, 56))},
                              settings=SETTINGS, controller_state="intelligent")
         self.adapter.plan(later, inputs)
-        self.assertIsNone(self.adapter._extra_waits_until)
         car = self.adapter._plan.car("smartevse_1")
         self.assertEqual((car.extra_soc, [block.top_up for block in car.blocks]), (90.0, [True]))
         self.assertEqual(car.blocks[0].start, L(11, 9, 23))  # 0.2396, the cheapest hour
-        # Late prices (15:01, still missing): the known hours are used, never a forecast.
+
+    def test_a_window_without_prices_takes_its_limit_from_the_known_hours(self):
+        # 0.0.17.0: ready-by 18:00 tomorrow, tomorrow's list not published. The 12 hours
+        # before the ready-by time have no price yet, and the plan does not wait for
+        # them: the hours known now are judged against their own average, so the car
+        # does not charge above its minimum in any known hour whatever it costs.
         price_states(self.states, tomorrow=False)
-        late = L(11, 9, 15, 1)
-        self.adapter.observe(late, outlets={"smartevse_1": outlet("smartevse_1", vehicle="vehicle_1",
-                                                                   plugged_at=L(11, 9, 10, 56))},
+        self.deadline = L(11, 10, 18)
+        put(self.states, XC40_BATTERY, 82.0, at=L(11, 9, 10, 58), unit_of_measurement="%")
+        now = L(11, 9, 11)
+        self.adapter.observe(now, outlets={"smartevse_1": outlet("smartevse_1", vehicle="vehicle_1",
+                                                                  plugged_at=L(11, 9, 10, 56))},
                              settings=SETTINGS, controller_state="intelligent")
-        self.adapter.plan(late, inputs)
-        self.assertIsNone(self.adapter._extra_waits_until)
+        self.adapter.plan(now, {"smartevse_1": PlanInput("smartevse_1", self.deadline)})
+        known = [slot.price for slot in self.adapter._price_slots if slot.kind == "known"]
+        limit = self.adapter._extra_price_limits["smartevse_1"]
+        self.assertTrue(min(known) < limit < max(known))
         segments = self.adapter._plan.segments
         self.assertTrue(segments)
-        self.assertTrue(all(seg.top_up and seg.price_kind == "known" for seg in segments))
-
-    def test_only_cars_that_need_charge_make_the_plan_wait_for_prices(self):
-        # Review 6: a car sitting at its minimum with a ready-by tomorrow made the other
-        # car, whose own hours all have prices, avoid its cheapest hours before 15:00.
-        price_states(self.states, tomorrow=False)
-        now = L(11, 9, 9)
-
-        def request(outlet, soc, target, deadline, **extra):
-            fields = dict(outlet=outlet, vehicle="vehicle_1", settings_key="vehicle_1", name="x", soc=soc,
-                          soc_source="vehicle", target_soc=target, car_limit=100.0, deadline=deadline,
-                          kwh_per_pct=0.75, kwh_per_pct_conservative=0.8, cap_kw=10.7, cap_low_kw=10.2,
-                          budget_kwh=None, done=False, overrun=False, drawing=False, priority=0)
-            fields.update(extra)
-            return intel.cp.CarRequest(**fields)
-
-        self.plan_xc40(now=now)  # reads the price lists
-        needs_tonight = request("smartevse_1", 40.0, 80.0, L(11, 9, 18))
-        needs_tomorrow = request("smartevse_2", 40.0, 80.0, L(11, 10, 7))
-        idle = request("smartevse_2", 85.0, 80.0, L(11, 10, 7), reached=True)
-        expected = self.adapter._expected_prices
-        self.assertEqual(expected(now, [needs_tomorrow]), L(11, 9, 15))
-        self.assertIsNone(expected(now, [needs_tonight]))            # its window is fully priced
-        self.assertIsNone(expected(now, [needs_tonight, idle]))      # the idle car does not count
-        self.assertIsNone(expected(now, [needs_tonight, needs_tomorrow]))  # nobody waits
-        self.assertIsNone(expected(now, [idle]))
-        self.assertIsNone(expected(now, [request("smartevse_2", 40.0, 80.0, L(11, 10, 7), excluded=True)]))
-        self.assertIsNone(expected(L(11, 9, 15, 1), [needs_tomorrow]))  # late: no waiting
-
-    def test_the_midnight_hour_belongs_to_the_previous_days_list(self):
-        # Day-ahead lists run 01:00 -> 01:00. A missing 00:00-01:00 hour is not in the
-        # list published this afternoon, so the plan must not wait for it.
-        price_states(self.states, tomorrow=True)
-        self.plan_xc40(now=L(11, 9, 10))
-        slots = self.adapter._price_slots
-        hour = L(11, 10, 0)
-        self.adapter._price_slots = [intel.cp.PriceSlot(s.start, s.end, None, "unknown") if s.start == hour else s
-                                     for s in slots]
-        car = intel.cp.CarRequest(outlet="smartevse_1", vehicle="vehicle_1", settings_key="vehicle_1", name="x",
-                                  soc=40.0, soc_source="vehicle", target_soc=80.0, car_limit=100.0,
-                                  deadline=L(11, 10, 7), kwh_per_pct=0.75, kwh_per_pct_conservative=0.8,
-                                  cap_kw=10.7, cap_low_kw=10.2, budget_kwh=None, done=False, overrun=False,
-                                  drawing=False, priority=0)
-        self.assertIsNone(self.adapter._expected_prices(L(11, 9, 10), [car]))
+        self.assertTrue(all(seg.top_up and seg.price_kind == "known" and seg.price <= limit for seg in segments))
 
     def test_late_prices_are_not_waited_for(self):
         # After 15:00 the missing prices are late: no waiting, unpriced hours last.
         price_states(self.states, tomorrow=False)
         self.plan_xc40(now=L(11, 9, 18))
-        self.assertIsNone(self.adapter._prices_expected_at)
         self.assertTrue(all(seg.price_kind == "known" for seg in self.adapter._plan.segments
                             if seg.start < L(11, 10, 1)))
 

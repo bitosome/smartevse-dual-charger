@@ -11,7 +11,7 @@ from datetime import UTC, datetime, time, timedelta
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 from homeassistant.core import CoreState, HomeAssistant, State
@@ -167,9 +167,10 @@ class Harness:
         with patch.object(dt_util, "utcnow", return_value=now), \
                 patch.object(dt_util, "DEFAULT_TIME_ZONE", TZ), \
                 patch.object(controller_module.persistent_notification, "async_create") as create, \
-                patch.object(controller_module.persistent_notification, "async_dismiss"):
+                patch.object(controller_module.persistent_notification, "async_dismiss") as dismiss:
             data = await self.c.async_run_cycle(reason="test")
         self.create = create
+        self.dismiss = dismiss
         return data
 
     def posts(self):
@@ -216,6 +217,33 @@ class PrecedenceTests(unittest.TestCase):
                          (False, ControllerState.INTELLIGENT, "intelligent_waiting_for_planned_slot"))
         waiting = IntelligentDecision(allowed=False, reason="intelligent_targets_reached")
         self.assertEqual(self.gate(c, waiting), (False, ControllerState.INTELLIGENT, "intelligent_targets_reached"))
+
+    def test_no_known_prices_charge_with_the_schedule(self):
+        # 0.0.17.0: nothing to plan with -> Intelligent charges like "Charge with schedule".
+        blind = IntelligentDecision(allowed=True, reason="intelligent_no_price_data", outlet="smartevse_1",
+                                    no_known_prices=True)
+        c = make_controller(adapter=False, intelligent_enabled=True, schedule_enabled=False)
+        self.assertEqual(self.gate(c, blind), (True, ControllerState.SCHEDULE, "schedule"))
+        self.assertEqual(self.gate(c, blind, window=False),
+                         (False, ControllerState.IDLE, "waiting_for_schedule_window"))
+        # The schedule's price option applies while a current price exists ...
+        c._mutable.update(schedule_price=True, acceptable_price=0.10)
+        self.assertEqual(self.gate(c, blind, price=0.30),
+                         (False, ControllerState.IDLE, "waiting_for_acceptable_price"))
+        self.assertEqual(self.gate(c, blind, price=0.05),
+                         (True, ControllerState.SCHEDULE, "schedule_acceptable_price"))
+        # ... and is left out without one, so the cars still charge in the window.
+        self.assertEqual(self.gate(c, blind, price=None), (True, ControllerState.SCHEDULE, "schedule"))
+        # Force still comes first, and a plan with prices is used as before.
+        c._mutable["force_charge"] = True
+        self.assertEqual(self.gate(c, blind), (True, ControllerState.FORCE, "force_charge"))
+        c._mutable["force_charge"] = False
+        priced = IntelligentDecision(allowed=False, reason="intelligent_waiting_for_planned_slot")
+        self.assertEqual(self.gate(c, priced),
+                         (False, ControllerState.INTELLIGENT, "intelligent_waiting_for_planned_slot"))
+        # Without a schedule entity the plan's own no-price charging stays.
+        c._entry_data["schedule_entity"] = None
+        self.assertEqual(self.gate(c, blind), (True, ControllerState.INTELLIGENT, "intelligent_no_price_data"))
 
     def test_schedule_reminders_treat_intelligent_as_covering_the_schedule(self):
         hass = MagicMock()
@@ -879,6 +907,82 @@ class CycleTests(TzTestCase):
         c._mutable["force_charge"] = False
         data = await harness.cycle(L(11, 9, 18, 0, 10))
         self.assertEqual(data["controller_state"], "intelligent")
+
+    async def no_prices(self, **mutable):
+        """An XC40 plugged in at 17:57 while no price list has any price."""
+        states = base_states()
+        for day in ("yesterday", "today", "tomorrow"):
+            put(states, f"sensor.real_electricity_price_hourly_prices_{day}", "unknown", hourly_prices=[])
+        put(states, PRICE_ENTITY, "unavailable")
+        c = make_controller(states, intelligent_enabled=True, **mutable)
+        harness = Harness(c)
+        await harness.cycle(L(11, 9, 17, 55))
+        harness.statuses["smartevse_1"] = status("smartevse_1")
+        put(c.states, XC40_CONNECTION, "disconnected", at=L(11, 9, 17, 50))
+        await harness.cycle(L(11, 9, 17, 56))
+        put(c.states, XC40_CONNECTION, "connected", at=L(11, 9, 17, 57))
+        return c, harness
+
+    async def test_without_known_prices_charging_follows_the_schedule_and_the_owner_is_told(self):
+        c, harness = await self.no_prices()
+        # The first ten minutes after a start the price lists may still be loading.
+        data = await harness.cycle(L(11, 9, 17, 57))
+        self.assertEqual(data["controller_state"], "intelligent")
+        harness.create.assert_not_called()
+        # After that: the schedule decides. Its window is closed, so nothing charges.
+        data = await harness.cycle(L(11, 9, 18, 10))
+        self.assertEqual((data["controller_state"], data["charge_reason"], data["charge_allowed"]),
+                         ("idle", "waiting_for_schedule_window", False))
+        self.assertEqual(data["controller_error"], "intelligent_no_prices_using_schedule")
+        self.assertEqual((data["intelligent_status"], data["intelligent"]["overridden_by"]),
+                         ("overridden", "schedule"))
+        harness.create.assert_called_once()
+        self.assertEqual(harness.create.call_args.kwargs["notification_id"],
+                         "smartevse_dual_charger_intelligent_no_prices")
+        self.assertIn("Charge with schedule", harness.create.call_args.args[1])
+        # The window opens: the car charges as in "Charge with schedule"; no second notice.
+        put(c.states, "schedule.charge_schedule", "on")
+        c._async_post.reset_mock()
+        data = await harness.cycle(L(11, 9, 22, 0, 10))
+        self.assertEqual((data["controller_state"], data["charge_reason"], data["charge_allowed"]),
+                         ("schedule", "schedule", True))
+        self.assertEqual(data["active_smartevse_raw"], "smartevse_1")
+        self.assertIn((f"{URL_1}/settings", {"mode": 3}), harness.posts())
+        harness.create.assert_not_called()
+        self.assertEqual(c._charge_part_kind, "schedule")
+        # Prices are back: the plan governs again and the notice is dismissed.
+        fresh = base_states()
+        for day in ("yesterday", "today", "tomorrow"):
+            entity_id = f"sensor.real_electricity_price_hourly_prices_{day}"
+            c.states[entity_id] = fresh[entity_id]
+        put(c.states, PRICE_ENTITY, 0.40, unit_of_measurement="€/kWh")
+        harness.statuses["smartevse_1"] = status("smartevse_1", state="Charging", mode="Smart")
+        data = await harness.cycle(L(11, 9, 22, 0, 20))
+        self.assertEqual(data["controller_state"], "intelligent")
+        self.assertIsNone(data["intelligent"]["overridden_by"])
+        self.assertNotEqual(data["controller_error"], "intelligent_no_prices_using_schedule")
+        harness.create.assert_not_called()
+        self.assertIn(call(c.hass, "smartevse_dual_charger_intelligent_no_prices"), harness.dismiss.call_args_list)
+
+    async def test_without_prices_and_without_a_schedule_the_plan_charges_by_deadline(self):
+        c, harness = await self.no_prices()
+        c._entry_data["schedule_entity"] = None
+        await harness.cycle(L(11, 9, 17, 57))
+        data = await harness.cycle(L(11, 9, 18, 10))
+        self.assertEqual(data["controller_state"], "intelligent")
+        self.assertEqual(data["controller_error"], "intelligent_price_data_unavailable")
+        self.assertIsNone(data["intelligent"]["overridden_by"])
+        harness.create.assert_called_once()
+        self.assertIn("as late as safely possible", harness.create.call_args.args[1])
+
+    async def test_force_charge_comes_before_the_schedule_fallback(self):
+        c, harness = await self.no_prices()
+        await harness.cycle(L(11, 9, 17, 57))
+        await harness.cycle(L(11, 9, 18, 10))
+        c._mutable["force_charge"] = True
+        data = await harness.cycle(L(11, 9, 18, 10, 10))
+        self.assertEqual((data["controller_state"], data["intelligent"]["overridden_by"]), ("force", "force"))
+        self.assertIn(call(c.hass, "smartevse_dual_charger_intelligent_no_prices"), harness.dismiss.call_args_list)
 
     async def test_disabled_intelligent_still_learns_and_publishes_disabled(self):
         c = make_controller(schedule_enabled=True)

@@ -9,7 +9,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "smartevse_dual_charger"
 NAME = "SmartEVSE Dual Charger"
-VERSION = "0.0.16.0"
+VERSION = "0.0.17.0"
 
 LOGGER = logging.getLogger(__package__)
 
@@ -104,6 +104,8 @@ CONF_VEHICLE_2_BATTERY_CAPACITY_KWH = "vehicle_2_battery_capacity_kwh"
 DEFAULT_BATTERY_CAPACITY_KWH = 0
 
 SCHEDULE_NOTIFICATION_ID = f"{DOMAIN}_schedule_disabled"
+# Intelligent charging has no known price to plan with and follows the schedule (0.0.17.0).
+INTELLIGENT_NO_PRICES_NOTIFICATION_ID = f"{DOMAIN}_intelligent_no_prices"
 
 # --- Intelligent charging ---------------------------------------------------
 INTELLIGENT_STORAGE_KEY = f"{STORAGE_KEY}.{{entry_id}}.intelligent"
@@ -177,6 +179,8 @@ INTELLIGENT_ALLOWED_REASONS = frozenset({
 
 # Warning-level controller_error values (non-blocking).
 ERROR_INTELLIGENT_PRICE_DATA_UNAVAILABLE = "intelligent_price_data_unavailable"
+# No hour with a known price: charging follows "Charge with schedule" (0.0.17.0).
+ERROR_INTELLIGENT_NO_PRICES_SCHEDULE = "intelligent_no_prices_using_schedule"
 ERROR_INTELLIGENT_PLANNER_FAILED = "intelligent_planner_failed"
 ERROR_INTELLIGENT_MODEL_UNAVAILABLE = "intelligent_model_unavailable"
 ERROR_VEHICLE_TIMER_BLOCKS_CHARGING = "{smartevse_key}_vehicle_timer_blocks_charging"

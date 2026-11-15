@@ -123,9 +123,6 @@ CROSS_CHECK_ENERGY_TOLERANCE = 1.4
 PROBE_MINUTES = 10
 # Fallback power when the model cannot estimate it (never used in normal runs).
 FALLBACK_EXPECTED_KW = 9.0
-# Real Electricity Price usually has tomorrow's day-ahead prices by 14:00-15:00 local
-# time. Until then the plan waits for them where that is still safe (round 5).
-PRICE_PUBLICATION_LOCAL = time(15, 0)
 FALLBACK_CONSERVATIVE_KW = 7.5
 FALLBACK_CAP_KW = 10.7
 # What the saving is compared with: the same energy charged by "Charge with schedule"
@@ -363,7 +360,7 @@ def emergency_outlet(now: datetime, cars: Sequence[cp.CarRequest]) -> str | None
     return best[1] if best else None
 
 
-def empty_payload(*, enabled: bool, overridden: bool = False,
+def empty_payload(*, enabled: bool, overridden: bool = False, overridden_by: str = "force",
                   settings: Mapping[str, Mapping[str, Any]] | None = None,
                   vehicle_names: Mapping[str, str] | None = None, top_up_enabled: bool = False,
                   entities: Mapping[str, Any] | None = None,
@@ -394,7 +391,8 @@ def empty_payload(*, enabled: bool, overridden: bool = False,
         "enabled": bool(enabled),
         "status": status,
         "reason": None,
-        "overridden_by": "force" if enabled and overridden else None,
+        # "force", or "schedule" while no price is known and charging follows the schedule.
+        "overridden_by": overridden_by if enabled and overridden else None,
         "connected_count": 0,
         "currency": currency,
         "known_until": None,
@@ -414,8 +412,8 @@ def empty_payload(*, enabled: bool, overridden: bool = False,
         "sessions": [],
         # Charging above the minimum: since 0.0.11.0 every car goes on to its own limit
         # in the cheapest known-price hours before its ready-by time. There is no price
-        # limit ("price" stays for older cards); "waits_until" is set while that charging
-        # waits for prices that are still due.
+        # limit ("price" stays for older cards). "waits_until" is always None since
+        # 0.0.17.0: that charging no longer waits for prices that are still due.
         "top_up": {"enabled": bool(top_up_enabled), "price": None, "source": "car_limit", "waits_until": None},
         "entities": dict(entities) if entities is not None else build_entities(lambda _domain, _key: None),
     }
@@ -527,6 +525,9 @@ class IntelligentDecision:
     outlet: str | None = None
     block_start: datetime | None = None
     controller_error: str | None = None  # warning level, never blocking
+    # No hour from now on has a known price (0.0.17.0): the controller charges with the
+    # schedule instead of this plan and tells the owner.
+    no_known_prices: bool = False
 
 
 @dataclass(frozen=True)
@@ -553,6 +554,7 @@ class PayloadContext:
     settings: Mapping[str, Mapping[str, Any]]  # {"vehicle_1": {"ready_by", "minimum"}, ...}
     top_up_enabled: bool
     outlets: Mapping[str, OutletPayloadInput]
+    overridden_by: str = "force"
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +590,6 @@ class IntelligentCharging:
         self._price_entries: list[dict[str, Any]] = []
         self._currency: str | None = None
         self._known_until: datetime | None = None
-        self._prices_expected_at: datetime | None = None
         # The saving is compared with "Charge with schedule": the weekly definition of
         # the schedule helper and the schedule settings of the controller.
         self._schedule_definition: dict[str, Any] | None = None
@@ -596,8 +597,6 @@ class IntelligentCharging:
         self._schedule_read_ok = False
         self._schedule_marker: Any = None
         self._schedule_settings: dict[str, Any] = {}
-        self._extra_waits_until: datetime | None = None
-        self._extra_first_missing: datetime | None = None
         self._extra_price_limits: dict[str, float] = {}
         self._limits: dict[str, float | None] = {}
         self._capacities: dict[str, float | None] = {}
@@ -1285,12 +1284,11 @@ class IntelligentCharging:
         commit = None
         if commitment is not None and commitment[1] > now:
             commit = cp.Commitment(commitment[0], commitment[1])
-        self._prices_expected_at = self._expected_prices(now, cars)
-        self._extra_waits_until = self._extra_prices_expected(now, cars) if above_minimum else None
+        # 0.0.17.0 (the owner's decision of 2026-11-15): the plan uses every hour with a
+        # known price. Nothing waits for prices that are still due, neither the minimum
+        # nor the charging above it; the plan is rebuilt when they arrive.
         self._extra_price_limits = self._extra_limits(cars) if above_minimum else {}
-        config = cp.PlannerConfig(above_minimum=above_minimum, prices_expected_at=self._prices_expected_at,
-                                  extra_prices_expected_at=self._extra_waits_until,
-                                  extra_price_limits=self._extra_price_limits)
+        config = cp.PlannerConfig(above_minimum=above_minimum, extra_price_limits=self._extra_price_limits)
         plan = None
         failed = False
         try:
@@ -1324,8 +1322,14 @@ class IntelligentCharging:
         (plus 5 %, so a nearly flat night is not cut into single hours).
         The window is fixed to the ready-by time, so the limit does not move while
         the night passes; it changes only when prices are published. Nothing is
-        learned and nothing is set by hand. A car with no published price in its
-        window has no entry (and nothing to charge extra in).
+        learned and nothing is set by hand.
+
+        A window without any published price (a ready-by time after noon tomorrow,
+        before tomorrow's list arrives) takes the average of the hours known before
+        the ready-by time instead (0.0.17.0): the plan no longer waits for that list,
+        so without a limit every known hour would count as cheap. A car with no
+        known price at all before its ready-by time has no entry (and nothing to
+        charge extra in).
         """
         limits: dict[str, float] = {}
         tz = default_time_zone()
@@ -1346,63 +1350,17 @@ class IntelligentCharging:
                 if span > 0:
                     total += float(slot["price"]) * span
                     seconds += span
+            if seconds <= 0:
+                for known in self._price_slots:
+                    if known.kind != cp.PRICE_KNOWN or known.price is None:
+                        continue
+                    span = (min(end, cp._utc(known.end)) - cp._utc(known.start)).total_seconds()
+                    if span > 0:
+                        total += float(known.price) * span
+                        seconds += span
             if seconds > 0:
                 limits[car.outlet] = round(total / seconds * (1.0 + EXTRA_PRICE_TOLERANCE), 6)
         return limits
-
-    def _extra_prices_expected(self, now: datetime, cars: Sequence[cp.CarRequest]) -> datetime | None:
-        """When the first missing price of the plan window should be published, or None.
-
-        Charging above the minimum is optional, so it waits for prices that are still
-        due instead of using the hours known now (the planner applies this per car:
-        only a car whose own window has a missing price waits). Unlike
-        ``_expected_prices`` this does not depend on what the cars still need.
-        """
-        self._extra_first_missing = None
-        deadlines = [cp._utc(car.deadline) for car in cars if not (car.excluded or car.done)]
-        if not deadlines:
-            return None
-        self._extra_first_missing = self._first_missing_price(now, max(deadlines))
-        return self._publication(now, self._extra_first_missing)
-
-    def _first_missing_price(self, now: datetime, horizon: datetime) -> datetime | None:
-        missing = [s.start for s in self._price_slots if s.kind != cp.PRICE_KNOWN and s.start < horizon]
-        covered = max((s.end for s in self._price_slots), default=None)
-        if covered is None or covered < horizon:
-            missing.append(covered or now)
-        return min(missing) if missing else None
-
-    @staticmethod
-    def _publication(now: datetime, first: datetime | None) -> datetime | None:
-        """Day-ahead lists run 01:00 -> 01:00 local and arrive by 15:00 the day before
-        they start; None when that time has passed (the prices are late)."""
-        if first is None:
-            return None
-        tz = default_time_zone()
-        day = (first - timedelta(hours=1)).astimezone(tz).date() - timedelta(days=1)
-        expected = datetime.combine(day, PRICE_PUBLICATION_LOCAL, tzinfo=tz).astimezone(UTC)
-        return expected if expected > now else None
-
-    def _expected_prices(self, now: datetime, cars: Sequence[cp.CarRequest]) -> datetime | None:
-        """When the first missing price should be published, or None when the plan must
-        not wait for it.
-
-        Only cars that still need their minimum count (a car that is done, reached or
-        left out by policy never makes another car wait). If any of them has a fully
-        priced window (its ready-by is not after the first missing hour), nothing
-        waits: its cheapest hours may well be before the publication. Day-ahead lists
-        run 01:00 -> 01:00 local and arrive by 15:00 the day before they start; when
-        that time has passed the prices are late and the plan no longer waits.
-        """
-        deadlines = [cp._utc(car.deadline) for car in cars
-                     if not (car.excluded or car.done or car.reached)
-                     and (car.soc is None or car.soc < car.target_soc)]
-        if not deadlines:
-            return None
-        first = self._first_missing_price(now, max(deadlines))
-        if first is None or min(deadlines) <= first:
-            return None
-        return self._publication(now, first)
 
     def _decide(self, now: datetime, plan: cp.Plan | None, cars: Sequence[cp.CarRequest],
                 inputs: Mapping[str, PlanInput], failed: bool) -> IntelligentDecision:
@@ -1489,8 +1447,17 @@ class IntelligentCharging:
             error = ERROR_INTELLIGENT_MODEL_UNAVAILABLE
         if not cars:
             reason = REASON_INTELLIGENT_NO_EV
+        # Nothing to plan with: no hour from now on has a known price while a car may
+        # still charge. Not after a planner failure and not right after a start, when
+        # the price list is still loading.
+        no_known_prices = (
+            plan.no_price_mode and not failed and not self._in_startup_grace(now)
+            and any(not car.excluded and not car.done for car in cars)
+            and not any(slot.kind == cp.PRICE_KNOWN and slot.end > now for slot in self._price_slots)
+        )
         return IntelligentDecision(allowed=outlet is not None, reason=reason, outlet=outlet,
-                                   block_start=block_start, controller_error=error)
+                                   block_start=block_start, controller_error=error,
+                                   no_known_prices=no_known_prices)
 
     def _in_startup_grace(self, now: datetime) -> bool:
         return self._started_at is not None and now - self._started_at < STARTUP_GRACE
@@ -1503,8 +1470,6 @@ class IntelligentCharging:
         self._plan_inputs = {}
         self._decision = None
         self._planner_error = None
-        self._extra_waits_until = None
-        self._extra_first_missing = None
         self._extra_price_limits = {}
 
     # -- 4. payload ------------------------------------------------------------------------
@@ -1593,7 +1558,8 @@ class IntelligentCharging:
             "unit": cp.floor15(now).isoformat(),
             "ctx": [ctx.enabled, ctx.overridden, ctx.governing, ctx.charge_allowed, ctx.controller_state,
                     ctx.charge_reason, ctx.active_outlet, iso_minute(ctx.active_since),
-                    ctx.top_up_enabled, iso_minute(self._extra_waits_until), self._extra_price_limits,
+                    ctx.overridden_by,
+                    ctx.top_up_enabled, self._extra_price_limits,
                     self.baseline_kind, self._schedule_settings, self._schedule_definition],
             "settings": {key: dict(value) for key, value in ctx.settings.items()},
             "outlets": outlets,
@@ -1619,14 +1585,16 @@ class IntelligentCharging:
     def _payload(self, now: datetime, tz: tzinfo, ctx: PayloadContext, static: Mapping[str, Any]) -> dict[str, Any]:
         plan = self._display_plan if ctx.enabled else None
         connected = [outlet for outlet in OUTLETS if outlet in self._facts]
-        payload = empty_payload(enabled=ctx.enabled, overridden=ctx.overridden, settings=ctx.settings,
+        payload = empty_payload(enabled=ctx.enabled, overridden=ctx.overridden,
+                                overridden_by=ctx.overridden_by, settings=ctx.settings,
                                 vehicle_names=self._vehicle_names(), top_up_enabled=ctx.top_up_enabled,
                                 entities=static["entities"],
                                 currency=self._currency)
         payload.update({
             "connected_count": len(connected),
             "known_until": iso_minute(self._known_until) if plan is not None else None,
-            "prices_expected_at": iso_minute(self._prices_expected_at) if plan is not None else None,
+            # Always None since 0.0.17.0: the plan no longer waits for prices that are due.
+            "prices_expected_at": None,
             "baseline_kind": self.baseline_kind,
             "model_error": self.model_error,
             "planner_error": self._planner_error if ctx.enabled else None,
@@ -1634,7 +1602,6 @@ class IntelligentCharging:
             "household": static["household"],
         })
         if plan is not None:
-            payload["top_up"]["waits_until"] = iso_minute(self._extra_waits_until)
             if self._extra_price_limits:
                 # The highest of the cars' limits: the hours the card paints as cheap.
                 payload["top_up"]["price"] = round(max(self._extra_price_limits.values()), 4)
@@ -1796,8 +1763,9 @@ class IntelligentCharging:
             # Level the plan reaches with the extra charging in cheap hours (None when
             # nothing extra is planned or the battery level is unknown).
             "extra_soc": self._extra_soc(facts, car) if not unavailable else None,
-            # Set while the charging above the minimum waits for prices that are due.
-            "extra_waits_until": None if unavailable or hide_money else self._extra_wait(facts, item),
+            # Always None since 0.0.17.0 (nothing waits for prices that are due); kept for
+            # cards that read it.
+            "extra_waits_until": None,
             # Charging above the minimum only in hours at or below this price (0.0.13.0).
             "extra_price_limit": (round(self._extra_price_limits[outlet], 4)
                                   if outlet in self._extra_price_limits else None),
@@ -1812,14 +1780,6 @@ class IntelligentCharging:
                 float(car.energy_kwh or 0.0) + float(car.top_up_kwh or 0.0), 1),
             "planned_cost": None if hide_money or saving is None else saving.get("planned_cost"),
         }
-
-    def _extra_wait(self, facts: CarFacts, item: OutletPayloadInput) -> str | None:
-        waits, missing = self._extra_waits_until, self._extra_first_missing
-        if waits is None or missing is None or item.deadline is None or facts.soc is None:
-            return None
-        if facts.car_limit is None or float(facts.car_limit) <= max(float(facts.soc), float(facts.target)) + 1e-6:
-            return None
-        return iso_minute(waits) if dt_util.as_utc(item.deadline) > missing else None
 
     @staticmethod
     def _extra_soc(facts: CarFacts, car: cp.CarPlan | None) -> float | None:

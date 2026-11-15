@@ -2,7 +2,7 @@
 
 Home Assistant custom integration for two standalone SmartEVSE chargers sharing one feeder.
 
-Version: `0.0.16.0`
+Version: `0.0.17.0`
 
 This project is for the setup where Home Assistant decides which charger may run, while each SmartEVSE still does its own feeder protection in built-in `Smart` mode.
 
@@ -459,9 +459,9 @@ gets its minimum first.
 - Minimums come first: a car charges above its minimum only after the hours planned for
   the other car's minimum, so on a night when both cars need their minimum the extra
   charging is at the end of the night.
-- While tomorrow's prices are still due (before 15:00) and the ready-by is tomorrow, it
-  waits for them, because the night is usually cheaper than the afternoon. The minimum
-  does not wait when waiting would risk it.
+- It uses every hour with a known price (0.0.17.0). Until 0.0.16.0 it waited for
+  tomorrow's prices while they were still due (before 15:00), which left cheap known
+  hours unused on the day after a charge.
 - A car without a known battery level or charge limit (an unidentified car) gets its
   session energy only.
 - After the ready-by time a car that stays plugged in is planned for the next day's
@@ -531,7 +531,8 @@ prices exists.
 | `reached` | Every connected car has its minimum, or needs nothing more in this session (for example a session completed below its target). |
 | `at_risk` | At least one car cannot reach its minimum by its ready-by time, or is past it. |
 | `not_accepting` | A planned car is not drawing power. |
-| `no_price_data` | No known prices: charging as late as safely possible before the deadline. |
+| `no_price_data` | No known prices and no charging schedule set up: charging as late as safely possible before the deadline. |
+| `overridden` | Force charge is on, or no hour has a known price and charging follows "Charge with schedule" (`overridden_by` is `force` or `schedule`). |
 
 The full plan is published as the `intelligent` attribute of the `Controller state`
 sensor (status, per-charger plan blocks, per-car target, projected battery level,
@@ -548,18 +549,14 @@ inputs always give the same plan.
 1. **Time grid.** 15-minute units from now to the latest ready-by time. The unit that
    is already running is used only if at least 5 minutes remain (1 minute for the car
    that is already charging in it).
-2. **Prices.** Each unit gets the price of its hour. Units are used in three tiers:
-   - hours with a **known price**, cheapest first (negative prices are valid);
+2. **Prices.** Each unit gets the price of its hour. Units are used in two tiers:
+   - hours with a **known price**, cheapest first (negative prices are valid). Every
+     known hour is used (0.0.17.0): the plan does not wait for prices that are still due;
    - hours **without a known price** (not published yet, or missing), only for energy
      the known hours cannot deliver before the ready-by, and as late as safely possible.
-     The learned price forecast is shown as an estimate but never chooses these hours;
-   - while tomorrow's prices are still **expected** (15:00 local on the day before; Real
-     Electricity Price usually has them by 14:00-15:00), known hours before that time
-     come last: they are used only when waiting for the prices would miss a minimum.
-   The plan is rebuilt every refresh, so it changes as soon as new prices arrive. After
-   15:00 missing prices are late, and the plan no longer waits for them. Only cars that
-   still need their minimum can make the plan wait, and nothing waits when one of them
-   has prices for its whole window (0.0.9.1).
+     The learned price forecast is shown as an estimate but never chooses these hours.
+   The plan is rebuilt every refresh, so it changes as soon as new prices arrive. When
+   no hour has a known price there is nothing to plan with: see "No price data".
 3. **Energy need.** From the battery level to the effective target, which is the
    minimum charge capped at the car's own charge limit. The need includes a charging
    taper above 93 % and margins: 3 % plus 3 minutes per expected start, and a
@@ -623,12 +620,24 @@ gets more energy, which changes their planned cost and saving. Among the late ca
 that can still reach its minimum without the safety margin is served first, then the
 earlier ready-by.
 
-**No price data.** When no known price covers the planning window (after falling back
-to the last good price list the integration saved), every unit ranks equal. The plan
-then covers the conservative need as late as possible before the deadline and stops at
-the minimum, and `controller_error` is `intelligent_price_data_unavailable`. For the first
-10 minutes after Home Assistant starts, missing prices only delay charging unless the time
-left is barely enough.
+**No price data.** When no hour from now on has a known price (after falling back to
+the last good price list the integration saved) while a car may still charge, there is
+nothing to plan with (0.0.17.0). Intelligent charging then charges like **Charge with
+schedule**: the schedule's time windows, its price option, duty cycle and charge
+policy. A persistent notification ("EV charging: no electricity prices") says so and
+goes away when a known price is back. `controller_error` is
+`intelligent_no_prices_using_schedule`, the controller state is `schedule`, and the
+`intelligent` payload has `status: overridden` with `overridden_by: schedule`. While no
+current price is available either, the schedule's price option is not applied (the time
+window alone decides), so the cars still charge. Planning resumes by itself with the
+first known price.
+
+Without a charging schedule entity the earlier behaviour stays: every unit ranks equal,
+the plan covers the conservative need as late as possible before the deadline and stops
+at the minimum, `controller_error` is `intelligent_price_data_unavailable`, and the
+notification says that instead. For the first 10 minutes after Home Assistant starts,
+missing prices only delay charging unless the time left is barely enough; nothing
+switches to the schedule and nothing is notified in that time.
 
 ### Smart-mode power prediction
 
@@ -789,7 +798,10 @@ Reasons are stable while nothing changes, so a reason change does not restart a 
 Warning-level `controller_error` values never block charging. Intelligent charging keeps
 charging by deadline when they appear:
 
-- `intelligent_price_data_unavailable`: no known prices; the no-price plan is used.
+- `intelligent_no_prices_using_schedule`: no hour has a known price; charging follows
+  "Charge with schedule" and a persistent notification is shown (0.0.17.0).
+- `intelligent_price_data_unavailable`: no known prices and no charging schedule set up;
+  the no-price plan is used.
 - `intelligent_planner_failed`: the planner failed; the no-price plan is used, never
   "charge now at any price".
 - `intelligent_model_unavailable`: the learned model could not be loaded or saved;
@@ -1082,6 +1094,7 @@ Vehicle mapping and vehicle data warnings are non-blocking. They are exposed so 
 
 Intelligent charging adds warning-level values. They never block charging; the plan keeps charging by deadline:
 
+- `intelligent_no_prices_using_schedule`
 - `intelligent_price_data_unavailable`
 - `intelligent_planner_failed`
 - `intelligent_model_unavailable`
@@ -1327,3 +1340,36 @@ Side effects:
   price limit for extra charging, less extra charging fits before the ready-by time.
 - When one car cannot reach its minimum, it gets more of the time: the on-time car
   keeps less of it free.
+
+## Every known hour is used; no prices means the schedule (0.0.17.0)
+
+The owner's decisions of 2026-11-15, after a morning on which both cars stayed plugged
+in and stopped charging although cheap hours were known.
+
+**The second car's extra charging was held back.** The XC40 had 0.6 % left to its
+charge limit, about three minutes of charging. The extra charging of one car follows on
+from the other's, so those three minutes decided where the EX30 could begin; they were
+then left out as too short for a start, but the EX30's start stayed behind them. Every
+10 seconds its start was "in three minutes", for an hour and a half, until the XC40's
+ready-by time passed: the EX30 charged 07:30–08:00 instead of from 06:00. A start that
+is too short to be made is now left out before the next car is planned.
+
+**Nothing waits for prices that are still due.** After the ready-by time a car that
+stays plugged in is planned for the next day. Until 0.0.16.0 the plan then waited for
+tomorrow's prices (due by 15:00), because the night is usually cheaper than the
+afternoon; on 15 November the hours 10:00–15:00 cost 0.066–0.081 €/kWh, cheaper than
+most of the night before, and were not used. The plan now uses every hour with a known
+price, for the minimum and for the charging above it, and is rebuilt when tomorrow's
+prices arrive. What it costs: energy bought in a known hour before 15:00 can turn out
+dearer than the night that is published afterwards. The price limit for extra charging
+still holds (the average known price of the 12 hours before the ready-by time plus
+5 %); before 15:00 it is worked out from the known evening hours of that window. A
+window with no published price at all (a ready-by time after noon tomorrow) takes the
+average of the hours known before the ready-by time instead.
+
+**No hour with a known price: charge with the schedule and say so.** See "No price
+data" above. The earlier "as late as safely possible" charging remains only for an
+installation without a charging schedule.
+
+Not changed: the extra charging of the second car still begins where the first car's
+ends, and only after the hours planned for the other car's minimum.

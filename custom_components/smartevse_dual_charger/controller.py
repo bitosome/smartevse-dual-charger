@@ -82,9 +82,11 @@ from .const import (
     DEFAULT_WLED_LED_OFFSET,
     DEFAULT_MINIMUM_CHARGE,
     DEFAULT_READY_BY,
+    ERROR_INTELLIGENT_NO_PRICES_SCHEDULE,
     ERROR_INTELLIGENT_PLANNER_FAILED,
     INTELLIGENT_ALLOWED_REASONS,
     INTELLIGENT_MINIMUM_KEYS,
+    INTELLIGENT_NO_PRICES_NOTIFICATION_ID,
     INTELLIGENT_READY_BY_KEYS,
     INTELLIGENT_SETTINGS_KEYS,
     LOGGER,
@@ -794,6 +796,13 @@ class SmartEVSEDualChargerController:
             intelligent=intelligent_decision,
         )
 
+        # No hour with a known price (0.0.17.0): the plan is not used, charging follows
+        # "Charge with schedule" and the owner is told.
+        no_known_prices = bool(intelligent_governing and intelligent_decision is not None
+                               and intelligent_decision.no_known_prices)
+        schedule_fallback = no_known_prices and controller_state != ControllerState.INTELLIGENT
+        self._handle_no_prices_notification(active=no_known_prices, schedule=schedule_fallback)
+
         # Intelligent charging covers the schedule for notifications (§6.1).
         await self._handle_schedule_notification(
             schedule_window_active=schedule_window_active,
@@ -884,6 +893,8 @@ class SmartEVSEDualChargerController:
             now=now,
             ev_meter_power=ev_meter_power,
         )
+        if controller_error is None and schedule_fallback:
+            controller_error = ERROR_INTELLIGENT_NO_PRICES_SCHEDULE
         if controller_error is None and intelligent_governing and intelligent_decision is not None:
             # Warning level only: prices missing, planner fallback, model, car timer.
             controller_error = intelligent_decision.controller_error
@@ -898,7 +909,9 @@ class SmartEVSEDualChargerController:
         self._charge_part_kind = self._part_kind(charge_allowed, controller_state, charge_reason)
         intelligent_payload, intelligent_flat = self._intelligent_payload(
             now=now,
-            governing=intelligent_governing,
+            # While the schedule stands in for the plan, the plan is shown as overridden.
+            governing=intelligent_governing and not schedule_fallback,
+            overridden_by="schedule" if schedule_fallback else "force",
             charge_allowed=charge_allowed,
             controller_state=controller_state,
             charge_reason=charge_reason,
@@ -1580,6 +1593,11 @@ class SmartEVSEDualChargerController:
         if (self._mutable.get("last_controller_state") == ControllerState.INTELLIGENT.value
                 and isinstance(previous_reason, str) and previous_reason.startswith("intelligent_")):
             return ControllerState.INTELLIGENT.value, previous_reason
+        if (self._mutable.get("last_controller_state") == ControllerState.SCHEDULE.value
+                and isinstance(previous_reason, str)):
+            # The schedule stood in for the plan (no known prices): that energy is the
+            # schedule's, not the plan's.
+            return ControllerState.SCHEDULE.value, previous_reason
         return ControllerState.INTELLIGENT.value, "intelligent_charging"
 
     def _intelligent_outlet_inputs(self, statuses: dict[str, SmartEVSEStatus]) -> dict[str, OutletInput]:
@@ -1956,6 +1974,7 @@ class SmartEVSEDualChargerController:
         controller_state: ControllerState,
         charge_reason: str,
         active_smartevse: str,
+        overridden_by: str = "force",
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """The ``intelligent`` payload and flat sensor values (never raises)."""
         enabled = bool(self._mutable.get("intelligent_enabled"))
@@ -1991,6 +2010,7 @@ class SmartEVSEDualChargerController:
                     settings=settings,
                     top_up_enabled=top_up_enabled,
                     outlets=outlets,
+                    overridden_by=overridden_by,
                 )
                 return intelligent.build_payload(now, context)
             except Exception:  # noqa: BLE001
@@ -2008,6 +2028,7 @@ class SmartEVSEDualChargerController:
         payload = empty_payload(
             enabled=enabled,
             overridden=overridden,
+            overridden_by=overridden_by,
             settings=settings,
             vehicle_names={key: self._configured_vehicle_name(key) for key in ("vehicle_1", "vehicle_2")},
             top_up_enabled=top_up_enabled,
@@ -2305,17 +2326,28 @@ class SmartEVSEDualChargerController:
             if price_value <= acceptable_price:
                 return True, ControllerState.PRICE, "acceptable_price"
             return False, ControllerState.IDLE, "waiting_for_acceptable_price"
+        # No hour with a known price (0.0.17.0, the owner's decision of 2026-11-15): there
+        # is nothing to plan with, so Intelligent charges like "Charge with schedule"
+        # until prices are known again. Without a schedule entity the plan's own
+        # "as late as safely possible" charging stays.
+        schedule_fallback = False
         if self._mutable.get("intelligent_enabled"):
             if intelligent is None:
                 return False, ControllerState.INTELLIGENT, REASON_INTELLIGENT_WAITING
-            allowed = bool(intelligent.allowed and intelligent.outlet)
-            reason = intelligent.reason if allowed or not intelligent.allowed else REASON_INTELLIGENT_WAITING
-            return allowed, ControllerState.INTELLIGENT, reason
-        if self._mutable["schedule_enabled"]:
+            schedule_fallback = bool(intelligent.no_known_prices and self._entry_data.get(CONF_SCHEDULE_ENTITY))
+            if not schedule_fallback:
+                allowed = bool(intelligent.allowed and intelligent.outlet)
+                reason = intelligent.reason if allowed or not intelligent.allowed else REASON_INTELLIGENT_WAITING
+                return allowed, ControllerState.INTELLIGENT, reason
+        if self._mutable["schedule_enabled"] or schedule_fallback:
             if not self._entry_data.get(CONF_SCHEDULE_ENTITY):
                 return False, ControllerState.IDLE, "schedule_entity_unavailable"
             if not schedule_window_active:
                 return False, ControllerState.IDLE, "waiting_for_schedule_window"
+            if schedule_fallback and price_value is None:
+                # The schedule's price option cannot be judged without a price: the
+                # window alone decides, so the cars still charge.
+                return True, ControllerState.SCHEDULE, "schedule"
             if self._mutable["schedule_price"]:
                 if not self._entry_data.get(CONF_PRICE_SENSOR_ENTITY):
                     return False, ControllerState.IDLE, "price_sensor_unavailable"
@@ -2883,6 +2915,33 @@ class SmartEVSEDualChargerController:
             led_count=int(self._entry_data.get(CONF_WLED_LED_COUNT, DEFAULT_WLED_LED_COUNT)),
             led_offset=int(self._entry_data.get(CONF_WLED_LED_OFFSET, DEFAULT_WLED_LED_OFFSET)),
         )
+
+    def _handle_no_prices_notification(self, *, active: bool, schedule: bool) -> None:
+        """Tell the owner while Intelligent charging has no known price to plan with.
+
+        Created once when that begins (and again when what it says changes), dismissed
+        when a known price is back, Intelligent is switched off or Force takes over.
+        """
+        state = (active, schedule)
+        if getattr(self, "_no_prices_notified", None) == state:
+            return
+        self._no_prices_notified = state
+        if not active:
+            persistent_notification.async_dismiss(self.hass, INTELLIGENT_NO_PRICES_NOTIFICATION_ID)
+            return
+        instead = (
+            'Charging follows "Charge with schedule" (its time windows and settings) until prices are known again.'
+            if schedule else
+            "No charging schedule is set up, so the cars charge as late as safely possible before their ready-by times."
+        )
+        persistent_notification.async_create(
+            self.hass,
+            "Intelligent charging has no hour with a known electricity price, so it cannot plan the cheapest hours. "
+            f"{instead} This notice goes away when prices are available.",
+            title="EV charging: no electricity prices",
+            notification_id=INTELLIGENT_NO_PRICES_NOTIFICATION_ID,
+        )
+        self._mutable["last_notification"] = dt_util.utcnow().isoformat()
 
     async def _handle_schedule_notification(self, *, schedule_window_active: bool, schedule_enabled: bool) -> None:
         """Create or dismiss the schedule disabled notification."""

@@ -55,9 +55,10 @@ FORECAST_UPLIFT = 0.10  # unused since round 5: forecasts no longer rank units
 UNKNOWN_RANK_ADD = 0.05  # unused since round 5
 # Round 5 (owner decision 2026-11-10): plan in hours with known prices. An hour without
 # a known price (forecast or unknown) is used only for energy the known hours cannot
-# deliver before the deadline, as late as possible. While tomorrow's prices are still
-# expected (PlannerConfig.prices_expected_at), known hours before that time are used
-# only when waiting for the prices would miss the minimum.
+# deliver before the deadline, as late as possible.
+# 0.0.17.0 (owner decision 2026-11-15): every hour with a known price is used; the
+# integration no longer asks the plan to wait for prices that are still due
+# (PlannerConfig.prices_expected_at and extra_prices_expected_at stay None).
 RANK_TIER_UNPRICED = 1000.0
 RANK_TIER_BEFORE_PRICES = 2000.0
 RANK_LATE_STEP = 0.001  # per hour before the plan horizon: later unpriced hours first
@@ -201,11 +202,13 @@ class PlannerConfig:
     # an entry has no limit.
     extra_price_limits: Mapping[str, float] | None = None
     # While the prices of a car's window are still due (tomorrow's list), its charging
-    # above the minimum waits for them: this is when they are expected.
+    # above the minimum waits for them: this is when they are expected. Not set by the
+    # integration since 0.0.17.0 (every known hour is used).
     extra_prices_expected_at: datetime | None = None
     no_price_mode: bool = False
     # When the missing prices are expected to be published (tomorrow's day-ahead
-    # prices); None when nothing is pending or the time has passed.
+    # prices); None when nothing is pending or the time has passed. Not set by the
+    # integration since 0.0.17.0 (every known hour is used).
     prices_expected_at: datetime | None = None
 
 
@@ -1763,16 +1766,20 @@ class _Pass:
                     if count < fewest:
                         best, fewest = save(), count
                 load(best)
+            # A start too short to be made is left out before the next car is planned
+            # (0.0.17.0): the last fraction of a percent of one car must not decide
+            # where the other car's extra charging may begin.
+            self._drop_short_extra_blocks(car)
             taken = max([taken] + [i for i, _ in extra(car)])
         self._drop_short_extra_blocks()
 
-    def _drop_short_extra_blocks(self) -> None:
+    def _drop_short_extra_blocks(self, only: _Car | None = None) -> None:
         """A start for a few minutes of charging above the minimum is not worth it (the
         last fraction of a percent, planned in an hour of its own): a run of units
         that holds only such charging for one car, shorter than a start may be, is
         left out unless that car is charging now."""
         running = self._running()
-        for car in self.cars:
+        for car in (self.cars if only is None else [only]):
             units = [i for i in range(self.n) if any(a.outlet == car.outlet for a in self.allocs[i])]
             run: list[int] = []
             for i in units + [None]:
